@@ -170,22 +170,24 @@ int main (int argc, char *argv[])
 
     if(port) {
 
-        struct sockaddr_in server_addr = {0};
+        struct sockaddr_in6 server_addr = {0};
 
         // Close-on-exec: the homing runner is fork+exec'd from this
         // process and must not inherit the listen socket (a straggling
         // child would keep the port bound across a controller respawn).
-        if((listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) {
+        // One dual-stack socket serves IPv4 and IPv6 senders.
+        if((listen_fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) {
             printf("Fatal: Unable to create socket.\n");
             exit(-5);
         }
 
-        int reuse = 1;
+        int reuse = 1, v6only = 0;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = INADDR_ANY;
-        server_addr.sin_port = htons(port);
+        server_addr.sin6_family = AF_INET6;
+        server_addr.sin6_addr = in6addr_any;
+        server_addr.sin6_port = htons(port);
 
         if(bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
             printf("Fatal: Unable to bind socket.\n");
