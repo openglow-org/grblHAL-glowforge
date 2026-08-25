@@ -513,21 +513,6 @@ void gf_stream_laser (uint8_t power, bool fire)
     pthread_mutex_unlock(&gf.lock);
 }
 
-void gf_stream_laser_power (uint8_t power)
-{
-    if(gf.failed)
-        return;
-
-    power &= 0x7f;
-
-    pthread_mutex_lock(&gf.lock);
-    gf.want_power = power;
-    /* Duty only: this path carries no consent to fire, so it rides the
-     * fire state already in effect and never raises it. */
-    laser_event_locked(power, gf.want_fire);
-    pthread_mutex_unlock(&gf.lock);
-}
-
 void gf_stream_laser_arm (bool state)
 {
     laser_armed = state;

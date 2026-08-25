@@ -38,12 +38,6 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits); // grblHAL bit order
 // first segment, and the end-of-data backstop keeps the lines low.
 void gf_stream_laser (uint8_t power, bool fire);
 
-// Duty update with no change of fire state, for the synchronous spindle
-// path: an S word executed with no motion in progress reaches the driver
-// through set_state, not through the per-segment updates, and dropping
-// its speed would leave the next move cutting at a stale duty.
-void gf_stream_laser_power (uint8_t power);
-
 // Laser dose model. The per-segment value the core computes is rendered
 // by the shipper either as an analog duty (a power byte, period 0 here)
 // or as FIRE-bit density at full duty: a fixed base period of

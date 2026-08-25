@@ -384,10 +384,10 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
     return true;
 }
 
+static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm);
+
 static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
-    (void)spindle;
-
     spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
 
     if(state.on && !cur.on && !laser_ok && !gflaser_arm())
@@ -395,15 +395,21 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
 
     atomic_store(&cur_state_value, state.value);
 
-    /* The synchronous path carries the speed. Per-segment updates cover
-     * a laser block, but an S word executed between blocks - with the
-     * planner drained, so nothing is streaming - only arrives here, and
-     * dropping it leaves the next move cutting at the previous level.
-     * Duty only: fire stays where spindleUpdatePWM and its gates put it. */
-    if(state.on && spindle_pwm.compute_value) {
-        uint_fast16_t pwm = spindle_pwm.compute_value(&spindle_pwm, rpm, false);
-        gf_stream_laser_power((uint8_t)(pwm > PWM_PERIOD ? PWM_PERIOD : pwm));
-    }
+    /* The synchronous path carries the whole laser state, and it is the
+     * only path that does so between blocks. The core takes a set_state
+     * as applied: st_rpm_changed records the level, and the per-segment
+     * update that would re-assert it at the next block is skipped while
+     * the level is unchanged. So an M3 at the level the previous job cut
+     * at (S is modal across M2), or an S word executed with the planner
+     * drained, reaches the stream only from here - fire included, through
+     * the same gates as the per-segment path - and an M5 reaches it as
+     * fire off. The stream re-asserts its wanted state at the first byte
+     * of every run: what is pushed here is what the next run lights with,
+     * and nothing older may be. */
+    uint_fast16_t pwm = spindle_pwm.off_value;
+    if(state.on && spindle_pwm.compute_value)
+        pwm = spindle_pwm.compute_value(&spindle_pwm, rpm, false);
+    spindleUpdatePWM(spindle, pwm);
 }
 
 static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
