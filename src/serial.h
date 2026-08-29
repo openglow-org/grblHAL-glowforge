@@ -30,3 +30,8 @@ void serial_wait (long timeout_us);
 // Client-session generation: bumps on every connect and disconnect, so a
 // consumer can tell that the sender changed between two observations.
 unsigned serial_client_generation (void);
+// An RX overrun happened since the last call: a sender wrote past the
+// free count Bf: reports, the overrunning line was dropped whole and
+// the lines after it are missing. The driver takes this once per event
+// and aborts the job (protocol thread).
+bool serial_rx_overflow_take (void);

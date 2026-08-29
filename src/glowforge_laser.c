@@ -388,9 +388,12 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm);
 
 static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
-    spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
-
-    if(state.on && !cur.on && !laser_ok && !gflaser_arm())
+    /* The arm question is "is the window open", never "was the spindle
+     * off a moment ago": a window that closed without the core turning
+     * the spindle off (a sender change mid-job, a job whose M5 never
+     * arrived) must prompt again at the next laser-on, or the job runs
+     * with no press, no run report and no airflow. */
+    if(state.on && !laser_ok && !gflaser_arm())
         state.on = Off;                 /* refused/aborted: stay dark */
 
     atomic_store(&cur_state_value, state.value);

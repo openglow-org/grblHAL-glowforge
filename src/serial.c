@@ -53,6 +53,8 @@ static int listen_fd = -1;
 static int client_fd = -1;
 static unsigned client_generation = 0;  /* bumps on every connect/disconnect */
 static bool stdin_eof = false;  /* stdio mode: stop polling stdin at EOF */
+static bool rx_discarding = false;  /* dropping the rest of an overrun line */
+static bool rx_overrun = false;     /* an overrun happened, not yet taken */
 
 /* Bytes rx_poll() reads from the client per call; serial_wait() only arms
  * client RX while the ring has room for a full read, so a sender that
@@ -112,6 +114,7 @@ static void serialRxFlush (void)
 {
     rxbuffer.tail = rxbuffer.head;
     rxbuffer.overflow = false;
+    rx_discarding = false;
 }
 
 static void serialRxCancel (void)
@@ -226,15 +229,46 @@ static void rx_byte (uint8_t data)
         return;
     }
 
-    if(!enqueue_realtime_command(data)) {
-        uint_fast16_t bptr = (rxbuffer.head + 1) & (RX_BUFFER_SIZE - 1);
-        if(bptr == rxbuffer.tail)
-            rxbuffer.overflow = 1;
-        else {
-            rxbuffer.data[rxbuffer.head] = data;
-            rxbuffer.head = bptr;
-        }
+    if(enqueue_realtime_command(data))
+        return;                             // real-time: never queued, never dropped
+
+    /* A sender that ignores flow control (Bf: is the contract) has
+     * overrun the ring. The line that overran is dropped WHOLE: what
+     * the ring already holds of it is unwritten back to the last
+     * newline, and the rest is discarded through its own newline, so
+     * the parser never sees a fragment glued to the next line. The
+     * overrun is latched for the driver, which aborts the job: lines
+     * are missing, and a job with lines missing is not the job the
+     * sender wrote. */
+    if(rx_discarding) {
+        if(data == '\n' || data == '\r')
+            rx_discarding = false;
+        return;
     }
+
+    uint_fast16_t bptr = (rxbuffer.head + 1) & (RX_BUFFER_SIZE - 1);
+    if(bptr == rxbuffer.tail) {
+        rxbuffer.overflow = 1;
+        rx_overrun = true;
+        rx_discarding = data != '\n' && data != '\r';
+        while(rxbuffer.head != rxbuffer.tail) {
+            uint_fast16_t last = (rxbuffer.head - 1) & (RX_BUFFER_SIZE - 1);
+            if(rxbuffer.data[last] == '\n' || rxbuffer.data[last] == '\r')
+                break;
+            rxbuffer.head = last;           // unwrite the partial line
+        }
+        return;
+    }
+
+    rxbuffer.data[rxbuffer.head] = data;
+    rxbuffer.head = bptr;
+}
+
+bool serial_rx_overflow_take (void)
+{
+    bool was = rx_overrun;
+    rx_overrun = false;
+    return was;
 }
 
 static void rx_poll (void)

@@ -312,6 +312,17 @@ static void glowforge_process_realtime (uint_fast16_t state)
         system_raise_alarm(Alarm_MotorFault);
     }
 
+    /* The sender overran the RX ring: lines are missing from the job,
+     * so the job stops the way an incoming ^X stops it (controlled
+     * deceleration, latch relocked, alarm), never runs on with a hole in
+     * it, and the sender is told why. */
+    if(serial_rx_overflow_take()) {
+        fflog(LOG_ERR, "serial: RX overrun - the sender ignored flow control; job aborted");
+        report_message("RX overrun: the sender ignored flow control (Bf:); job aborted",
+                       Message_Warning);
+        protocol_enqueue_realtime_command(CMD_RESET);
+    }
+
     gfcool_poll();
     gflaser_poll();
     gfsw_poll();

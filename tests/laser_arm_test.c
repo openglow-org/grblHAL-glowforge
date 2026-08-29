@@ -85,7 +85,8 @@ int gfio_conf_read(const char *k, char *v, size_t n) { (void)k; (void)v; (void)n
 void gf_stream_laser_model(uint32_t period, uint32_t min_ticks) { (void)min_ticks; dose_period_last = period; }
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
-unsigned serial_client_generation(void) { return 1; }
+static unsigned client_gen = 1;     /* bumped to model a sender change */
+unsigned serial_client_generation(void) { return client_gen; }
 static int resets_requested;
 bool protocol_enqueue_realtime_command(uint8_t c) { if (c == 0x18) resets_requested++; return true; }
 /* The reset lands in the next pump: protocol_execute_realtime() returns
@@ -131,6 +132,8 @@ static void reset_state(void)
     latch_locked_last = true;
     laser_ok = false;
     disarm_request = false;
+    atomic_store(&cur_state_value, 0);
+    client_gen = 1;
     hw_active = false;              /* host: no GFSINK */
     sw_present = false;             /* no switch source: no button wait */
     sw_calls = 0;
@@ -240,9 +243,45 @@ int main(void)
     CHECK(resets_requested == 1 && alarms_raised == 0, "interlock open cancels with a soft reset, not an alarm");
     CHECK(strstr(last_message, "interlock") != NULL, "reports the interlock as the reason");
 
+    printf("spindleSetState() arms on every laser-on while the window is closed:\n");
+
+    /* Case H - a window that closed while the core still had the spindle
+       on (a sender change mid-job, or a job whose M5 never arrived) must
+       prompt again at the next laser-on. The spindle-state record stays
+       on across the disarm; the arm decision must not read it. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+    spindle_state_t on = { .on = On };
+    spindleSetState(NULL, on, 1000.0f);
+    CHECK(laser_ok && stream_armed, "the first laser-on arms through the press");
+    CHECK(((spindle_state_t){ .value = atomic_load(&cur_state_value) }).on,
+          "the spindle-state record reads on after the arm");
+    client_gen++;                       /* the sender changed mid-job */
+    gflaser_poll();
+    CHECK(!laser_ok && !stream_armed && latch_locked_last,
+          "the sender change closes the window and relocks the latch");
+    CHECK(((spindle_state_t){ .value = atomic_load(&cur_state_value) }).on,
+          "the spindle-state record still reads on after the disarm");
+    sw_calls = 0;
+    fire_ok_calls = 0;
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+    spindleSetState(NULL, on, 1000.0f);
+    CHECK(sw_calls > 0, "the next laser-on runs the button wait again");
+    CHECK(laser_ok && stream_armed, "the next laser-on arms again through a new press");
+    CHECK(alarms_raised == 0, "no alarm on the re-arm");
+
+    /* Case I - inside an open window a laser-on never re-prompts (S changes
+       and M5/M3 toggles inside a job are not new consent questions). */
+    sw_calls = 0;
+    spindleSetState(NULL, on, 500.0f);
+    CHECK(sw_calls == 0 && laser_ok, "a laser-on inside the open window does not re-prompt");
+
     printf(failures ? "FAIL: %d check(s) failed\n"
-                    : "PASS: the arm re-checks the coolant gate after the wait "
-                      "and the button wait honors the lid and the interlock\n",
+                    : "PASS: the arm re-checks the coolant gate after the wait, "
+                      "the button wait honors the lid and the interlock, and "
+                      "every laser-on against a closed window prompts\n",
            failures);
     return failures ? 1 : 0;
 }

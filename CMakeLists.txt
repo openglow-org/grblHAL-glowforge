@@ -69,7 +69,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # The DRIVER's own sources are warning-free and held to that; the
     # core submodule is upstream code and is not held to -Werror here.
     set_source_files_properties(${DRIVER_SOURCES}
-        tests/switch_map_test.c tests/laser_arm_test.c
+        tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
 
@@ -100,3 +100,10 @@ target_include_directories(switch_map_test PRIVATE src ${CMAKE_CURRENT_BINARY_DI
 add_executable(laser_arm_test tests/laser_arm_test.c)
 target_include_directories(laser_arm_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(laser_arm_test m)
+
+# Host unit test for the RX ring under a sender that ignores flow
+# control: the overrunning line is dropped whole, earlier lines are
+# delivered intact, real-time characters keep passing, and the overrun
+# is reported once. Includes the serial source directly, stubs the core.
+add_executable(serial_test tests/serial_test.c)
+target_include_directories(serial_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})

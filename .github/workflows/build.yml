@@ -20,8 +20,10 @@ jobs:
         run: cmake --build build -j"$(nproc)"
       - name: Switch-map decode truth table
         run: ./build/switch_map_test
-      - name: Operator-arm coolant re-check (G-4)
+      - name: Operator-arm coolant re-check (G-4) and arm on every laser-on
         run: ./build/laser_arm_test
+      - name: RX ring under a sender that ignores flow control
+        run: ./build/serial_test
       # The safety harnesses live in the forgefirm repo (scripts/bench/)
       # and drive the null-sink build over TCP - no hardware, no root.
       - name: Fetch the test harnesses
