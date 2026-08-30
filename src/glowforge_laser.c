@@ -51,14 +51,17 @@
                              to the default, never wait-forever)
     laser_disarm_s           spindle-off grace before the armed window
                              closes (default 60)
-    laser_power_model        density (dose as FIRE-bit density at full
-                             duty, the default) or analog (dose as PWM
-                             duty). $35 means a different thing in each:
-                             a density floor for the first, a duty floor
-                             for the second, and the shipped default is
-                             the density one - selecting analog means
-                             raising $35 to the duty the tube lases at
-                             or low S will not fire.
+    laser_power_model        the boot default dose model: density (dose
+                             as FIRE-bit density at full duty, the
+                             default) or analog (dose as PWM duty).
+    laser_floor_density      the S-range floor under density, percent
+                             of full (default 10): the lowest density
+                             that still marks, so a commanded 1 % is a
+                             real mark rather than pulses too far apart
+                             to re-strike.
+    laser_floor_analog       the S-range floor under analog, percent
+                             duty (default 16): the duty the tube lases
+                             at, so no S lands in the dead band.
     laser_pulse_ticks        density base period in machine ticks
                              (default 20 = 710 us at 28160 Hz)
     laser_pulse_min_ticks    shortest pulse the density model will emit
@@ -66,6 +69,28 @@
                              skipped and its debt carried, so a low
                              level arrives as fewer full-width pulses
                              rather than stubs the supply cannot strike.
+
+  THE FLOOR IS DERIVED, NEVER TYPED. $35 (pwm_min_value) is loaded from
+  the selected model's floor key at every arm and at every switch, in
+  RAM only (the EEPROM copy is never written from here), and the PWM
+  mapping is re-precomputed on the spot. $$ therefore reports the floor
+  in force; a $35 written by a sender is overwritten at the next arm.
+
+  M101 P<model> [Q1] - the dose-model switch, a driver M-code:
+    P0 = analog, P1 = density. Refused (error 253, with the reason
+    reported) unless the spindle is off and the controller is Idle: a
+    model change under fire could pair density's pinned full duty with
+    analog's continuous FIRE, so the switch only ever happens between
+    kernel runs, which end dark, with a power byte leading the next.
+    The switch is program-scoped: it reverts to the boot default at
+    program end (M2/M30) and on a soft reset, so a job's header can
+    declare the model it needs without leaving the machine in it. Q1
+    makes the switch stick until the next switch or a controller
+    restart, for an operator setting the machine up by hand. The
+    planner is drained before the body runs (user_mcode_sync), and the
+    armed window, if open, stays open: an M5 / M101 / M3 sequence
+    inside a job switches models between its sections with no new
+    press.
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -85,6 +110,7 @@
 #include "stepper_stream.h"
 #include "serial.h"
 
+#include "grbl/gcode.h"
 #include "grbl/hal.h"
 #include "grbl/protocol.h"
 #include "grbl/report.h"
@@ -123,13 +149,34 @@
  * fewer full-width pulses rather than stubs. */
 #define PULSE_MIN_TICKS_DEFAULT 3.0f
 
-/* The duty the tube lases at, for the analog fallback: $35 below this
- * puts low S into the dead band. The shipped $35 is the DENSITY floor
- * (boards/glowforge.h), so selecting the analog model means raising it. */
-#define ANALOG_FLOOR_PCT 16.0f
-#define POWER_MODEL_KEY "laser_power_model"
-#define PULSE_TICKS_KEY "laser_pulse_ticks"
-#define PULSE_MIN_KEY   "laser_pulse_min_ticks"
+/* Per-model S-range floors, percent of full, loaded into $35 at every
+ * arm and switch. Density: the lowest density that still marks (bench:
+ * strikes ~5 %, marks ~10 %). Analog: the duty the tube lases at (bench:
+ * strikes 3 %, lases 16 %; 3 to 14 % is a dead band). */
+#define FLOOR_DENSITY_DEFAULT 10.0f
+#define FLOOR_ANALOG_DEFAULT  16.0f
+#define POWER_MODEL_KEY   "laser_power_model"
+#define FLOOR_DENSITY_KEY "laser_floor_density"
+#define FLOOR_ANALOG_KEY  "laser_floor_analog"
+#define PULSE_TICKS_KEY   "laser_pulse_ticks"
+#define PULSE_MIN_KEY     "laser_pulse_min_ticks"
+
+/* The dose-model switch M-code (UserMCode_Generic1, reserved for private
+ * use) and its P values. */
+#define MCODE_MODEL      UserMCode_Generic1
+#define MODEL_P_ANALOG   0.0f
+#define MODEL_P_DENSITY  1.0f
+
+typedef enum {
+    Model_Density = 0,
+    Model_Analog
+} dose_model_t;
+
+typedef enum {
+    Override_None = 0,      /* the boot default (laser_power_model) applies */
+    Override_Program,       /* M101: reverts at program end and on reset */
+    Override_Sticky         /* M101 Q1: holds until the next switch or restart */
+} model_override_t;
 
 /* Spindle state is written by the protocol thread (set_state) and read
  * by the stepper producer's segment updates and the poll below: kept in
@@ -145,6 +192,11 @@ static _Atomic bool arming = false;         /* blocked in the button wait */
 static double disarmed_at;          /* margin for the sample-window lag */
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
+static user_mcode_ptrs_t user_mcode_chain;
+static spindle_ptrs_t *hal_spindle;         /* the registered spindle's table entry */
+static dose_model_t cur_model = Model_Density;   /* the model last applied */
+static model_override_t model_override = Override_None;
+static dose_model_t override_model = Model_Density;
 
 /* Producer-thread fire suppression, reported from the protocol thread. */
 enum { Suppress_None = 0, Suppress_Unarmed, Suppress_Coolant };
@@ -227,6 +279,160 @@ void gflaser_disarm (void)
     disarm_request = false;
     disarmed_at = wall_s();
     report_message("laser disarmed - latch locked", Message_Info);
+}
+
+/* --- dose model ---------------------------------------------------------- */
+
+static const char *model_name (dose_model_t m)
+{
+    return m == Model_Analog ? "analog" : "density";
+}
+
+/* The boot default from the shared machine config: analog only when the
+ * key says so, density otherwise (including no key at all). */
+static dose_model_t conf_model (void)
+{
+    char model[16] = "";
+    return gfio_conf_read(POWER_MODEL_KEY, model, sizeof(model)) == 0 &&
+           strcmp(model, "analog") == 0 ? Model_Analog : Model_Density;
+}
+
+/* The model to apply: the M101 override while one is set, else the
+ * boot default. */
+static dose_model_t selected_model (void)
+{
+    return model_override == Override_None ? conf_model() : override_model;
+}
+
+/* The model's S-range floor, percent of full, clamped to 0..100 (a
+ * missing or unparsable key is the default; NaN fails the range test). */
+static float model_floor (dose_model_t m)
+{
+    float pct = m == Model_Analog
+                 ? gfio_conf_read_float(FLOOR_ANALOG_KEY, FLOOR_ANALOG_DEFAULT)
+                 : gfio_conf_read_float(FLOOR_DENSITY_KEY, FLOOR_DENSITY_DEFAULT);
+    if(!(pct >= 0.0f && pct <= 100.0f))
+        pct = m == Model_Analog ? FLOOR_ANALOG_DEFAULT : FLOOR_DENSITY_DEFAULT;
+    return pct;
+}
+
+static bool spindleConfig (spindle_ptrs_t *spindle);
+
+/* Put a model in force: the stream's rendering, and $35 as that model's
+ * floor with the PWM mapping re-precomputed against it. RAM only - the
+ * stored $35 is never written from here, so a job can never mutate the
+ * persisted settings. Called with the spindle off (the arm path runs
+ * before any fire reaches the stream; the M-code refuses otherwise). */
+static void apply_model (dose_model_t m)
+{
+    if(m == Model_Density) {
+        float ticks = gfio_conf_read_float(PULSE_TICKS_KEY, PULSE_TICKS_DEFAULT);
+        if(!(ticks >= 1.0f))            /* also catches NaN */
+            ticks = PULSE_TICKS_DEFAULT;
+        float min_ticks = gfio_conf_read_float(PULSE_MIN_KEY, PULSE_MIN_TICKS_DEFAULT);
+        if(!(min_ticks >= 1.0f))
+            min_ticks = PULSE_MIN_TICKS_DEFAULT;
+        gf_stream_laser_model((uint32_t)ticks, (uint32_t)min_ticks);
+    } else
+        gf_stream_laser_model(0, 0);
+
+    settings.pwm_spindle.pwm_min_value = model_floor(m);
+    spindleConfig(hal_spindle);
+    cur_model = m;
+}
+
+bool gflaser_density (void)
+{
+    return cur_model == Model_Density;
+}
+
+static void report_model (const char *what)
+{
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s (%s, floor %g %%)", what, model_name(cur_model),
+             (double)settings.pwm_spindle.pwm_min_value);
+    report_message(msg, Message_Info);
+}
+
+/* Program end and soft reset: a program-scoped switch reverts to the
+ * boot default. Applied on the spot so $$ tells the truth and the next
+ * job starts from the default even before its arm. */
+static void model_revert (void)
+{
+    if(model_override != Override_Program)
+        return;
+
+    model_override = Override_None;
+    if(selected_model() != cur_model) {
+        apply_model(selected_model());
+        report_model("laser power model reverted");
+    }
+}
+
+/* --- M101: the dose-model switch ------------------------------------------ */
+
+static user_mcode_type_t mcodeCheck (user_mcode_t mcode)
+{
+    if(mcode == MCODE_MODEL)
+        return UserMCode_Normal;
+
+    return user_mcode_chain.check ? user_mcode_chain.check(mcode) : UserMCode_Unsupported;
+}
+
+static status_code_t mcodeValidate (parser_block_t *gc_block)
+{
+    if(gc_block->user_mcode != MCODE_MODEL)
+        return user_mcode_chain.validate ? user_mcode_chain.validate(gc_block)
+                                         : Status_Unhandled;
+
+    if(!gc_block->words.p)
+        return Status_GcodeValueWordMissing;
+    if(!(gc_block->values.p == MODEL_P_ANALOG || gc_block->values.p == MODEL_P_DENSITY))
+        return Status_GcodeValueOutOfRange;
+    if(gc_block->words.q && !(gc_block->values.q == 0.0f || gc_block->values.q == 1.0f))
+        return Status_GcodeValueOutOfRange;
+
+    /* The G-code-level mistake: the spindle commanded on, by this block
+     * (an M3 on the same line executes before the M-code) or by an
+     * earlier one whose M5 never came. */
+    if(gc_block->spindle_modal.state.on || gc_state.modal.spindle[0].state.on) {
+        report_message("M101 needs the spindle off: send M5 first", Message_Warning);
+        return Status_UserException;
+    }
+
+    gc_block->words.p = gc_block->words.q = Off;
+    gc_block->user_mcode_sync = true;   /* drain the planner before the body runs */
+
+    return Status_OK;
+}
+
+static void mcodeExecute (sys_state_t state, parser_block_t *gc_block)
+{
+    if(gc_block->user_mcode != MCODE_MODEL) {
+        if(user_mcode_chain.execute)
+            user_mcode_chain.execute(state, gc_block);
+        return;
+    }
+
+    /* The structural gate, checked again at execution: Idle with the
+     * spindle record off means no kernel run is being fed and the last
+     * one ended dark, so there is no torn state for the switch to reach.
+     * Refuse rather than insert an M5 - an implicit spindle-off inside a
+     * laser M-code is a surprise, a refusal is a message. */
+    spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
+    if(state != STATE_IDLE || cur.on) {
+        report_message("M101 refused: the controller must be idle with the spindle off",
+                        Message_Warning);
+        return;
+    }
+
+    dose_model_t m = gc_block->values.p == MODEL_P_ANALOG ? Model_Analog : Model_Density;
+    /* The block is zeroed per line, so an absent Q reads 0 (program-scoped). */
+    model_override = gc_block->values.q == 1.0f ? Override_Sticky : Override_Program;
+    override_model = m;
+    apply_model(m);
+    report_model(model_override == Override_Sticky ? "laser power model set"
+                                                   : "laser power model set for this program");
 }
 
 /* The first laser-on of a job: gate, unlock, wait for the operator's
@@ -331,40 +537,21 @@ static bool gflaser_arm (void)
         return false;
     }
 
-    /* Select the dose model for this window, before any fire reaches
-     * the stream. */
-    char model[16] = "";
-    bool density = !(gfio_conf_read(POWER_MODEL_KEY, model, sizeof(model)) == 0 &&
-                      strcmp(model, "analog") == 0);
-    float floor_pct = settings.pwm_spindle.pwm_min_value;
-    if(density) {
-        float ticks = gfio_conf_read_float(PULSE_TICKS_KEY, PULSE_TICKS_DEFAULT);
-        if(!(ticks >= 1.0f))            /* also catches NaN */
-            ticks = PULSE_TICKS_DEFAULT;
-        float min_ticks = gfio_conf_read_float(PULSE_MIN_KEY, PULSE_MIN_TICKS_DEFAULT);
-        if(!(min_ticks >= 1.0f))
-            min_ticks = PULSE_MIN_TICKS_DEFAULT;
-        gf_stream_laser_model((uint32_t)ticks, (uint32_t)min_ticks);
-        /* Here $35 is the density floor, and without one the bottom of
-         * the S range asks for pulses too far apart to re-strike. */
-        if(floor_pct <= 0.0f)
-            report_message("$35 is 0: the bottom of the S range will not fire",
-                            Message_Warning);
-    } else {
-        gf_stream_laser_model(0, 0);
-        /* Here it is a duty floor, and the tube does not lase below the
-         * commissioned one whatever S asks for. */
-        if(floor_pct < ANALOG_FLOOR_PCT)
-            report_message("$35 is below the duty this tube lases at; low S will not fire",
-                            Message_Warning);
-    }
+    /* Put the selected dose model in force for this window - rendering
+     * and floor both - before any fire reaches the stream. A floor of 0
+     * is a deliberate setting (the threshold ladders run that way) and
+     * gets a note, never a refusal. */
+    apply_model(selected_model());
+    if(settings.pwm_spindle.pwm_min_value <= 0.0f)
+        report_message("laser floor is 0: the bottom of the S range will not fire",
+                        Message_Warning);
 
     disarm_request = false;
     laser_ok = true;
     disarm_at = 0.0;
     armed_client_gen = serial_client_generation();
     gf_stream_laser_arm(true);
-    report_message(density ? "laser armed (density)" : "laser armed", Message_Info);
+    report_model("laser armed");
 
     return true;
 }
@@ -375,6 +562,8 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
 {
     if(spindle == NULL)
         return false;
+
+    hal_spindle = spindle;              /* the core's table entry: stable */
 
     /* Precompute against a clock that makes one PWM period exactly the
      * hardware's 127 counts, so computed values are raw power bytes. */
@@ -543,8 +732,18 @@ static void onProgramCompleted (program_flow_t program_flow, bool check_mode)
     if(!check_mode && laser_ok)
         disarm_request = true;
 
+    if(!check_mode)
+        model_revert();
+
     if(on_program_completed)
         on_program_completed(program_flow, check_mode);
+}
+
+/* Soft reset (driver reset with sys.reset_pending): a program-scoped
+ * switch does not outlive the program it was made in. */
+void gflaser_reset (void)
+{
+    model_revert();
 }
 
 void gflaser_init (void)
@@ -554,6 +753,11 @@ void gflaser_init (void)
 
     on_program_completed = grbl.on_program_completed;
     grbl.on_program_completed = onProgramCompleted;
+
+    user_mcode_chain = grbl.user_mcode;
+    grbl.user_mcode.check = mcodeCheck;
+    grbl.user_mcode.validate = mcodeValidate;
+    grbl.user_mcode.execute = mcodeExecute;
 
     static const spindle_ptrs_t spindle = {
         .type = SpindleType_PWM,

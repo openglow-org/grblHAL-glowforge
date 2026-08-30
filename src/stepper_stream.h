@@ -53,6 +53,9 @@ void gf_stream_laser (uint8_t power, bool fire);
 // (measured: a 36 us stub drew no discharge at all, while the factory
 // never emits below one 100 us tick). The debt is conserved either way,
 // so the average density is the same. Selected per arm.
+// A change of model zeroes the shipper's current power, so the next run
+// leads dark until the commanded power lands: cur_power holds an analog
+// duty under one model and a density level under the other.
 void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks);
 
 // Laser arming state (glowforge_laser.c owns the policy). While armed an

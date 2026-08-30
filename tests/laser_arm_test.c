@@ -27,6 +27,13 @@
   the lid or the interlock loop opening during the wait cancels the job
   (relock, alarm, never armed), a press with the lid open does not arm,
   and a press with everything closed arms.
+
+  And the dose model: the arm derives $35 from the selected model's
+  floor key and re-precomputes the PWM mapping (density 10, analog 16 by
+  default; the config keys override), and the M101 switch is refused
+  with the spindle commanded on or the controller not idle, switches
+  model and floor when accepted, reverts at program end and on reset
+  unless Q1 made it stick, and never touches the stored settings.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -47,6 +54,12 @@ static char  last_message[128];
 static bool  stream_armed;          /* gf_stream_laser_arm(true) reached? */
 static uint32_t dose_period_last = 1;  /* gf_stream_laser_model() argument */
 static bool  latch_locked_last;
+static const char *conf_model_val;      /* laser_power_model in the config, NULL = absent */
+static float conf_floor_analog = -1.0f; /* laser_floor_analog, < 0 = absent */
+static float conf_floor_density = -1.0f;
+static float precomputed_min = -1.0f;   /* pwm_min_value at the last precompute */
+static int   precompute_calls;
+static int   settings_stores;           /* any EEPROM write would count here */
 
 /* Switch source: gfsw_read_raw() plays this script of EV_SW words, one
    per call, holding the last entry. sw_present = gfsw_available(). */
@@ -79,9 +92,18 @@ void gf_stream_laser_arm(bool armed) { stream_armed = armed; }
 void gf_stream_laser_latch(bool lock) { latch_locked_last = lock; }
 int  gfio_rd_attr(const char *a, char *b, size_t l)
 { (void)a; if (l) b[0] = '\0'; return -1; }
-float gfio_conf_read_float(const char *k, float fb) { (void)k; return fb; }
-/* No laser_power_model key: the arm selects the analog model (period 0). */
-int gfio_conf_read(const char *k, char *v, size_t n) { (void)k; (void)v; (void)n; return -1; }
+float gfio_conf_read_float(const char *k, float fb)
+{
+    if (!strcmp(k, "laser_floor_analog") && conf_floor_analog >= 0.0f) return conf_floor_analog;
+    if (!strcmp(k, "laser_floor_density") && conf_floor_density >= 0.0f) return conf_floor_density;
+    return fb;
+}
+int gfio_conf_read(const char *k, char *v, size_t n)
+{
+    if (strcmp(k, "laser_power_model") || conf_model_val == NULL) return -1;
+    snprintf(v, n, "%s", conf_model_val);
+    return 0;
+}
 void gf_stream_laser_model(uint32_t period, uint32_t min_ticks) { (void)min_ticks; dose_period_last = period; }
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
@@ -99,6 +121,8 @@ bool protocol_execute_realtime(void) { return resets_requested == 0; }
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 settings_t settings;
 grbl_t grbl;
+parser_state_t gc_state;
+static spindle_ptrs_t test_spindle;
 
 void report_message(const char *msg, message_type_t type)
 {
@@ -109,7 +133,9 @@ void system_raise_alarm(alarm_code_t alarm) { (void)alarm; alarms_raised++; }
 sys_state_t state_get(void) { return STATE_IDLE; }
 bool spindle_precompute_pwm_values(spindle_ptrs_t *s, spindle_pwm_t *p,
                                    spindle_pwm_settings_t *cfg, uint32_t hz)
-{ (void)s; (void)p; (void)cfg; (void)hz; return true; }
+{ (void)s; (void)p; (void)hz; precomputed_min = cfg->pwm_min_value; precompute_calls++; return true; }
+/* The core's persisted-settings writers: the driver must never call them. */
+void settings_write_global(void) { settings_stores++; }
 spindle_id_t spindle_register(const spindle_ptrs_t *s, const char *n)
 { (void)s; (void)n; return 0; }
 
@@ -138,6 +164,29 @@ static void reset_state(void)
     sw_present = false;             /* no switch source: no button wait */
     sw_calls = 0;
     sw_n = 0;
+    conf_model_val = NULL;
+    conf_floor_analog = conf_floor_density = -1.0f;
+    precomputed_min = -1.0f;
+    precompute_calls = 0;
+    settings_stores = 0;
+    settings.pwm_spindle.pwm_min_value = 0.0f;
+    hal_spindle = &test_spindle;    /* the core's table entry, as spindleConfig records it */
+    cur_model = Model_Density;
+    model_override = Override_None;
+    memset(&gc_state, 0, sizeof(gc_state));
+    dose_period_last = 1;
+}
+
+/* One M101 block as the parser hands it to validate/execute. */
+static parser_block_t m101(float p, bool with_q, float q)
+{
+    parser_block_t b;
+    memset(&b, 0, sizeof(b));
+    b.user_mcode = UserMCode_Generic1;
+    b.words.p = On;
+    b.values.p = p;
+    if (with_q) { b.words.q = On; b.values.q = q; }
+    return b;
 }
 
 static void script(bool a, bool b, int n)
@@ -192,6 +241,10 @@ int main(void)
     /* Density is the shipped default: with no laser_power_model key the
      * arm selects it, and passes the base period rather than 0. */
     CHECK(dose_period_last == 20, "no laser_power_model key selects the density dose model");
+    CHECK(settings.pwm_spindle.pwm_min_value == 10.0f && precomputed_min == 10.0f,
+          "the arm derives $35 from the density floor (10) and re-precomputes");
+    CHECK(strstr(last_message, "laser armed (density, floor 10 %)") != NULL,
+          "the arm report names the model and the floor in force");
 
     /* Case C - blocked at the pre-wait check: refuses before arming. */
     reset_state();
@@ -278,10 +331,119 @@ int main(void)
     spindleSetState(NULL, on, 500.0f);
     CHECK(sw_calls == 0 && laser_ok, "a laser-on inside the open window does not re-prompt");
 
+    printf("the dose model: derived floors and the M101 switch:\n");
+
+    /* Case J - the configured analog model derives the analog floor, and
+       the floor keys override the defaults. A stale $35 in RAM (a sender
+       wrote 3) is overwritten, never honored. */
+    reset_state();
+    script(true, true, 2);
+    conf_model_val = "analog";
+    settings.pwm_spindle.pwm_min_value = 3.0f;
+    CHECK(gflaser_arm(), "arms under the configured analog model");
+    CHECK(dose_period_last == 0, "laser_power_model = analog selects the analog rendering");
+    CHECK(settings.pwm_spindle.pwm_min_value == 16.0f && precomputed_min == 16.0f,
+          "the arm derives $35 from the analog floor (16), overwriting a typed value");
+    CHECK(strstr(last_message, "(analog, floor 16 %)") != NULL, "the arm report says analog, 16");
+    reset_state();
+    script(true, true, 2);
+    conf_floor_density = 12.5f;
+    CHECK(gflaser_arm() && settings.pwm_spindle.pwm_min_value == 12.5f,
+          "laser_floor_density overrides the density default");
+    reset_state();
+    script(true, true, 2);
+    conf_floor_density = 150.0f;    /* out of range: the default applies */
+    CHECK(gflaser_arm() && settings.pwm_spindle.pwm_min_value == 10.0f,
+          "an out-of-range floor key falls back to the default");
+    reset_state();
+    script(true, true, 2);
+    conf_floor_density = 0.0f;
+    CHECK(gflaser_arm() && settings.pwm_spindle.pwm_min_value == 0.0f,
+          "a floor of 0 is honored (the ladders run that way)");
+
+    /* Case K - validate: a P word is required and range-checked, the
+       words are taken, the body is synced, and the spindle on refuses. */
+    reset_state();
+    parser_block_t b = m101(0.0f, false, 0.0f);
+    CHECK(mcodeCheck(UserMCode_Generic1) == UserMCode_Normal, "M101 is claimed");
+    CHECK(mcodeCheck(UserMCode_Generic2) == UserMCode_Unsupported, "M102 is not");
+    CHECK(mcodeValidate(&b) == Status_OK, "M101 P0 validates");
+    CHECK(!b.words.p && b.user_mcode_sync, "validate takes the P word and asks for a planner sync");
+    b = m101(2.0f, false, 0.0f);
+    CHECK(mcodeValidate(&b) == Status_GcodeValueOutOfRange, "P2 is out of range");
+    b = m101(1.0f, false, 0.0f); b.words.p = Off;
+    CHECK(mcodeValidate(&b) == Status_GcodeValueWordMissing, "a missing P word is refused");
+    b = m101(1.0f, true, 2.0f);
+    CHECK(mcodeValidate(&b) == Status_GcodeValueOutOfRange, "Q2 is out of range");
+    b = m101(1.0f, false, 0.0f); b.spindle_modal.state.on = On;
+    CHECK(mcodeValidate(&b) == Status_UserException, "an M3 on the same line refuses the switch");
+    CHECK(strstr(last_message, "M5 first") != NULL, "the refusal says to send M5 first");
+    b = m101(1.0f, false, 0.0f); gc_state.modal.spindle[0].state.on = On;
+    CHECK(mcodeValidate(&b) == Status_UserException, "a spindle left on by an earlier block refuses");
+    gc_state.modal.spindle[0].state.on = Off;
+
+    /* Case L - execute: refused unless Idle with the spindle record off;
+       accepted, it switches the rendering and the floor, RAM only. */
+    reset_state();
+    b = m101(0.0f, false, 0.0f);
+    mcodeExecute(STATE_CYCLE, &b);
+    CHECK(cur_model == Model_Density && precompute_calls == 0, "not idle: the switch does nothing");
+    CHECK(strstr(last_message, "refused") != NULL, "not idle: the refusal is reported");
+    atomic_store(&cur_state_value, ((spindle_state_t){ .on = On }).value);
+    mcodeExecute(STATE_IDLE, &b);
+    CHECK(cur_model == Model_Density && precompute_calls == 0, "spindle record on: the switch does nothing");
+    atomic_store(&cur_state_value, 0);
+    mcodeExecute(STATE_IDLE, &b);
+    CHECK(cur_model == Model_Analog && dose_period_last == 0, "M101 P0 at idle selects analog");
+    CHECK(settings.pwm_spindle.pwm_min_value == 16.0f && precomputed_min == 16.0f,
+          "the switch loads the analog floor and re-precomputes");
+    CHECK(strstr(last_message, "for this program (analog, floor 16 %)") != NULL,
+          "the switch is reported as program-scoped, with model and floor");
+    CHECK(settings_stores == 0, "the switch never writes the stored settings");
+    script(true, true, 2);
+    CHECK(gflaser_arm() && dose_period_last == 0 && settings.pwm_spindle.pwm_min_value == 16.0f,
+          "the arm that follows honors the switch over the boot default");
+
+    /* Case M - program end reverts a program-scoped switch to the boot
+       default (density here), applied on the spot. */
+    onProgramCompleted(ProgramFlow_CompletedM2, false);
+    CHECK(cur_model == Model_Density && dose_period_last == 20 &&
+          settings.pwm_spindle.pwm_min_value == 10.0f,
+          "M2 reverts the switch: density rendering and floor are back");
+    CHECK(strstr(last_message, "reverted (density, floor 10 %)") != NULL, "the revert is reported");
+    CHECK(model_override == Override_None, "no override remains after the revert");
+
+    /* Case N - Q1 makes the switch stick across program end and reset. */
+    reset_state();
+    b = m101(0.0f, true, 1.0f);
+    CHECK(mcodeValidate(&b) == Status_OK && !b.words.q, "M101 P0 Q1 validates and takes the Q word");
+    mcodeExecute(STATE_IDLE, &b);
+    CHECK(cur_model == Model_Analog && model_override == Override_Sticky, "Q1 sets a sticky switch");
+    onProgramCompleted(ProgramFlow_CompletedM2, false);
+    gflaser_reset();
+    CHECK(cur_model == Model_Analog && settings.pwm_spindle.pwm_min_value == 16.0f,
+          "a sticky switch survives M2 and a soft reset");
+    b = m101(1.0f, false, 0.0f);
+    mcodeExecute(STATE_IDLE, &b);
+    CHECK(cur_model == Model_Density && model_override == Override_Program,
+          "the next switch replaces a sticky one");
+
+    /* Case O - a soft reset reverts a program-scoped switch; a check-mode
+       program end does not touch it. */
+    reset_state();
+    b = m101(0.0f, false, 0.0f);
+    mcodeExecute(STATE_IDLE, &b);
+    onProgramCompleted(ProgramFlow_CompletedM2, true);
+    CHECK(cur_model == Model_Analog, "a check-mode program end leaves the switch alone");
+    gflaser_reset();
+    CHECK(cur_model == Model_Density && settings.pwm_spindle.pwm_min_value == 10.0f,
+          "a soft reset reverts the switch");
+
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the arm re-checks the coolant gate after the wait, "
                       "the button wait honors the lid and the interlock, and "
-                      "every laser-on against a closed window prompts\n",
+                      "every laser-on against a closed window prompts, and the "
+                      "dose model derives its floor and switches safely\n",
            failures);
     return failures ? 1 : 0;
 }

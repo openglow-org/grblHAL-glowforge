@@ -460,6 +460,14 @@ void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks)
         min_ticks = period_ticks;     /* a whole period is the longest pulse */
 
     pthread_mutex_lock(&gf.lock);
+    if((gf.dith_period != 0) != (period_ticks != 0)) {
+        /* The models keep different things in cur_power: the analog
+         * duty byte, or the density level behind a pinned full duty. A
+         * switch happens with fire off between runs, and the next run
+         * leads with cur_power until the commanded power lands, so it
+         * must not carry the other model's number: lead dark instead. */
+        gf.cur_power = 0;
+    }
     gf.dith_period = period_ticks;
     gf.dith_min = min_ticks;
     dither_reset();

@@ -265,6 +265,7 @@ static void driverReset (void)
     if(sys.reset_pending) {
         gflaser_disarm();
         gf_stream_reset();
+        gflaser_reset();
     }
 
     driver_reset_chain();

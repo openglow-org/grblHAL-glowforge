@@ -54,6 +54,7 @@
 
 #include "fflog.h"
 #include "glowforge_cooling.h"
+#include "glowforge_laser.h"
 #include "glowforge_io.h"
 
 #include "grbl/hal.h"
@@ -133,7 +134,7 @@ static void warn (const char *msg)
  * connect is non-blocking and bounded by poll - SO_SNDTIMEO does not
  * cover connect(), and a wedged listener (full accept backlog) blocks
  * a plain connect through minutes of SYN retries. */
-static void report_send (const char *mode, bool armed)
+static void report_send (const char *mode, bool armed, bool density)
 {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if(fd < 0)
@@ -158,11 +159,12 @@ static void report_send (const char *mode, bool armed)
     }
     if(up) {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-        char req[192];
+        char req[224];
         int n = snprintf(req, sizeof(req),
-            "POST /cool/state?mode=%s&armed=%d HTTP/1.1\r\n"
+            "POST /cool/state?mode=%s&armed=%d&model=%s HTTP/1.1\r\n"
             "Host: 127.0.0.1\r\nConnection: close\r\n"
-            "Content-Length: 0\r\n\r\n", mode, armed ? 1 : 0);
+            "Content-Length: 0\r\n\r\n", mode, armed ? 1 : 0,
+            density ? "density" : "analog");
         if(write(fd, req, (size_t)n) == n) {
             char resp[128];
             (void)!read(fd, resp, sizeof(resp));    /* let the ack land */
@@ -181,6 +183,7 @@ static pthread_mutex_t rep_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rep_cv = PTHREAD_COND_INITIALIZER;
 static char rep_mode[12] = "idle";
 static bool rep_armed = false;
+static bool rep_density = true;     /* the dose model in force at the report */
 static unsigned rep_seq = 0;
 
 static void *reporter_thread (void *arg)
@@ -189,7 +192,7 @@ static void *reporter_thread (void *arg)
 
     unsigned seen = 0;
     char mode[12];
-    bool armed;
+    bool armed, density;
 
     pthread_mutex_lock(&rep_mx);
     for(;;) {
@@ -198,9 +201,10 @@ static void *reporter_thread (void *arg)
         seen = rep_seq;
         strcpy(mode, rep_mode);
         armed = rep_armed;
+        density = rep_density;
         pthread_mutex_unlock(&rep_mx);
 
-        report_send(mode, armed);
+        report_send(mode, armed, density);
 
         pthread_mutex_lock(&rep_mx);
     }
@@ -230,6 +234,7 @@ static void report_now (void)
     strncpy(rep_mode, mode, sizeof(rep_mode) - 1);
     rep_mode[sizeof(rep_mode) - 1] = '\0';
     rep_armed = laser_on_window;
+    rep_density = gflaser_density();
     rep_seq++;
     pthread_cond_signal(&rep_cv);
     pthread_mutex_unlock(&rep_mx);
