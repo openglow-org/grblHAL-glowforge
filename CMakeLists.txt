@@ -55,6 +55,7 @@ set(DRIVER_SOURCES
     src/glowforge_cooling.c
     src/glowforge_homing.c
     src/glowforge_laser.c
+    src/glowforge_status.c
     src/glowforge_switches.c
     src/serial.c
     src/eeprom.c

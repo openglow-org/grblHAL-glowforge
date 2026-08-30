@@ -346,6 +346,11 @@ bool gflaser_density (void)
     return cur_model == Model_Density;
 }
 
+bool gflaser_armed (void)
+{
+    return laser_ok;
+}
+
 static void report_model (const char *what)
 {
     char msg[96];

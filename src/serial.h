@@ -30,6 +30,13 @@ void serial_wait (long timeout_us);
 // Client-session generation: bumps on every connect and disconnect, so a
 // consumer can tell that the sender changed between two observations.
 unsigned serial_client_generation (void);
+
+// The sender session, for the published state file: whether a client is
+// connected, its address ("" when none or unknown), and the
+// CLOCK_MONOTONIC time it connected. Protocol thread only.
+bool serial_client_connected (void);
+const char *serial_client_peer (void);
+double serial_client_since (void);
 // An RX overrun happened since the last call: a sender wrote past the
 // free count Bf: reports, the overrunning line was dropped whole and
 // the lines after it are missing. The driver takes this once per event

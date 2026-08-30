@@ -39,6 +39,7 @@
 #include "glowforge_cooling.h"
 #include "glowforge_homing.h"
 #include "glowforge_laser.h"
+#include "glowforge_status.h"
 #include "glowforge_switches.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
@@ -327,6 +328,7 @@ static void glowforge_process_realtime (uint_fast16_t state)
     gfcool_poll();
     gflaser_poll();
     gfsw_poll();
+    gfstatus_poll();
 
     if(exit_requested) {
         if(state == STATE_CYCLE || state == STATE_JOG || state == STATE_HOMING) {
@@ -376,6 +378,7 @@ bool driver_init (void)
     gf_core_lock_init();        /* before gf_stream_init starts its threads */
     gf_stream_init();
     gfcool_init();
+    gfstatus_init();
     gfhome_init();
     gflaser_init();
     gfsw_init();

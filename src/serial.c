@@ -38,6 +38,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <string.h>
@@ -52,6 +54,8 @@ static enqueue_realtime_command_ptr enqueue_realtime_command = protocol_enqueue_
 static int listen_fd = -1;
 static int client_fd = -1;
 static unsigned client_generation = 0;  /* bumps on every connect/disconnect */
+static char client_peer[48];            /* the sender's address, "" when none */
+static double client_since;             /* CLOCK_MONOTONIC at the accept */
 static bool stdin_eof = false;  /* stdio mode: stop polling stdin at EOF */
 static bool rx_discarding = false;  /* dropping the rest of an overrun line */
 static bool rx_overrun = false;     /* an overrun happened, not yet taken */
@@ -72,6 +76,7 @@ static void drop_client (void)
     if(client_fd >= 0) {
         close(client_fd);
         client_fd = -1;
+        client_peer[0] = '\0';
         client_generation++;
     }
 }
@@ -79,6 +84,21 @@ static void drop_client (void)
 unsigned serial_client_generation (void)
 {
     return client_generation;
+}
+
+bool serial_client_connected (void)
+{
+    return client_fd >= 0;
+}
+
+const char *serial_client_peer (void)
+{
+    return client_peer;
+}
+
+double serial_client_since (void)
+{
+    return client_since;
 }
 
 //
@@ -278,9 +298,23 @@ static void rx_poll (void)
         // Always accept: a new connection displaces any current session
         // (last connection wins - single-operator machine, and a client
         // that died without FIN would otherwise hold the port forever).
-        int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        struct sockaddr_storage sa;
+        socklen_t sl = sizeof(sa);
+        int fd = accept4(listen_fd, (struct sockaddr *)&sa, &sl, SOCK_CLOEXEC);
         if(fd >= 0) {
             drop_client();
+            client_peer[0] = '\0';
+            if(sa.ss_family == AF_INET)
+                inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr,
+                          client_peer, sizeof(client_peer));
+            else if(sa.ss_family == AF_INET6)
+                inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr,
+                          client_peer, sizeof(client_peer));
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                client_since = (double)ts.tv_sec + ts.tv_nsec / 1e9;
+            }
             int flags = fcntl(fd, F_GETFL, 0);
             if(flags != -1)
                 fcntl(fd, F_SETFL, flags | O_NONBLOCK);
