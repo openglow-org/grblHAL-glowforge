@@ -11,9 +11,9 @@
     grbl.settings   the $$ view - every $N=value line, captured from the
                     core's own settings report so the bytes match what a
                     sender sees. Rewritten when a setting changes and
-                    when the derived floor moves (an arm or an M101
-                    loads the model's floor into $35 in RAM without a
-                    settings write, so the poll watches the value).
+                    when the derived floor moves (a precompute loads
+                    the floor key into $35 in RAM without a settings
+                    write, so the poll watches the value).
     grbl.state      one JSON object: ts_mono (CLOCK_MONOTONIC, for age),
                     the machine state and alarm code, the sender session
                     (connected, generation, seconds connected, peer
@@ -202,8 +202,8 @@ void gfstatus_poll (void)
     if(!active)
         return;
 
-    /* The derived floor changes without a settings write (apply_model
-     * sets it in RAM at every arm and M101 switch): watch the value. */
+    /* The derived floor changes without a settings write (the spindle
+     * precompute derives it in RAM): watch the value. */
     static float last_floor = -1.0f;
     if(settings.pwm_spindle.pwm_min_value != last_floor) {
         last_floor = settings.pwm_spindle.pwm_min_value;

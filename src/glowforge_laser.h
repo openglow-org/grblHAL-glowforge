@@ -21,13 +21,9 @@ void gflaser_poll (void);
 // Immediate disarm + latch relock (driver reset / stream fault paths).
 void gflaser_disarm (void);
 
-// Soft reset: a program-scoped M101 dose-model switch reverts to the
-// boot default (driver reset path, after the disarm).
-void gflaser_reset (void);
-
-// The dose model in force (the last one applied at an arm or an M101):
-// true for density, false for analog. The cooling client reports it so
-// the engine's tube-heat share follows the model that is actually cutting.
+// The dose model in force: true for density, which is every machine
+// (false only in the host harness's analog reference mode). The cooling
+// client and the published state file report it.
 bool gflaser_density (void);
 
 // True while the operator-armed window is open (the published state

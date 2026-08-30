@@ -28,12 +28,11 @@
   (relock, alarm, never armed), a press with the lid open does not arm,
   and a press with everything closed arms.
 
-  And the dose model: the arm derives $35 from the selected model's
-  floor key and re-precomputes the PWM mapping (density 10, analog 16 by
-  default; the config keys override), and the M101 switch is refused
-  with the spindle commanded on or the controller not idle, switches
-  model and floor when accepted, reverts at program end and on reset
-  unless Q1 made it stick, and never touches the stored settings.
+  And the dose model: the precompute derives $35 from the floor key
+  (density 10 by default; on the host the analog reference mode derives
+  its own 16), a typed $35 is overwritten, and the stored settings are
+  never touched. Density is the only model on hardware; the analog
+  branch exists for the harness's conservatism reference.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -121,7 +120,6 @@ bool protocol_execute_realtime(void) { return resets_requested == 0; }
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 settings_t settings;
 grbl_t grbl;
-parser_state_t gc_state;
 static spindle_ptrs_t test_spindle;
 
 void report_message(const char *msg, message_type_t type)
@@ -172,22 +170,9 @@ static void reset_state(void)
     settings.pwm_spindle.pwm_min_value = 0.0f;
     hal_spindle = &test_spindle;    /* the core's table entry, as spindleConfig records it */
     cur_model = Model_Density;
-    model_override = Override_None;
-    memset(&gc_state, 0, sizeof(gc_state));
     dose_period_last = 1;
 }
 
-/* One M101 block as the parser hands it to validate/execute. */
-static parser_block_t m101(float p, bool with_q, float q)
-{
-    parser_block_t b;
-    memset(&b, 0, sizeof(b));
-    b.user_mcode = UserMCode_Generic1;
-    b.words.p = On;
-    b.values.p = p;
-    if (with_q) { b.words.q = On; b.values.q = q; }
-    return b;
-}
 
 static void script(bool a, bool b, int n)
 {
@@ -331,7 +316,7 @@ int main(void)
     spindleSetState(NULL, on, 500.0f);
     CHECK(sw_calls == 0 && laser_ok, "a laser-on inside the open window does not re-prompt");
 
-    printf("the dose model: derived floors and the M101 switch:\n");
+    printf("the dose model: derived floors:\n");
 
     /* Case J - the configured analog model derives the analog floor, and
        the floor keys override the defaults. A stale $35 in RAM (a sender
@@ -361,89 +346,11 @@ int main(void)
     CHECK(gflaser_arm() && settings.pwm_spindle.pwm_min_value == 0.0f,
           "a floor of 0 is honored (the ladders run that way)");
 
-    /* Case K - validate: a P word is required and range-checked, the
-       words are taken, the body is synced, and the spindle on refuses. */
-    reset_state();
-    parser_block_t b = m101(0.0f, false, 0.0f);
-    CHECK(mcodeCheck(UserMCode_Generic1) == UserMCode_Normal, "M101 is claimed");
-    CHECK(mcodeCheck(UserMCode_Generic2) == UserMCode_Unsupported, "M102 is not");
-    CHECK(mcodeValidate(&b) == Status_OK, "M101 P0 validates");
-    CHECK(!b.words.p && b.user_mcode_sync, "validate takes the P word and asks for a planner sync");
-    b = m101(2.0f, false, 0.0f);
-    CHECK(mcodeValidate(&b) == Status_GcodeValueOutOfRange, "P2 is out of range");
-    b = m101(1.0f, false, 0.0f); b.words.p = Off;
-    CHECK(mcodeValidate(&b) == Status_GcodeValueWordMissing, "a missing P word is refused");
-    b = m101(1.0f, true, 2.0f);
-    CHECK(mcodeValidate(&b) == Status_GcodeValueOutOfRange, "Q2 is out of range");
-    b = m101(1.0f, false, 0.0f); b.spindle_modal.state.on = On;
-    CHECK(mcodeValidate(&b) == Status_UserException, "an M3 on the same line refuses the switch");
-    CHECK(strstr(last_message, "M5 first") != NULL, "the refusal says to send M5 first");
-    b = m101(1.0f, false, 0.0f); gc_state.modal.spindle[0].state.on = On;
-    CHECK(mcodeValidate(&b) == Status_UserException, "a spindle left on by an earlier block refuses");
-    gc_state.modal.spindle[0].state.on = Off;
-
-    /* Case L - execute: refused unless Idle with the spindle record off;
-       accepted, it switches the rendering and the floor, RAM only. */
-    reset_state();
-    b = m101(0.0f, false, 0.0f);
-    mcodeExecute(STATE_CYCLE, &b);
-    CHECK(cur_model == Model_Density && precompute_calls == 0, "not idle: the switch does nothing");
-    CHECK(strstr(last_message, "refused") != NULL, "not idle: the refusal is reported");
-    atomic_store(&cur_state_value, ((spindle_state_t){ .on = On }).value);
-    mcodeExecute(STATE_IDLE, &b);
-    CHECK(cur_model == Model_Density && precompute_calls == 0, "spindle record on: the switch does nothing");
-    atomic_store(&cur_state_value, 0);
-    mcodeExecute(STATE_IDLE, &b);
-    CHECK(cur_model == Model_Analog && dose_period_last == 0, "M101 P0 at idle selects analog");
-    CHECK(settings.pwm_spindle.pwm_min_value == 16.0f && precomputed_min == 16.0f,
-          "the switch loads the analog floor and re-precomputes");
-    CHECK(strstr(last_message, "for this program (analog, floor 16 %)") != NULL,
-          "the switch is reported as program-scoped, with model and floor");
-    CHECK(settings_stores == 0, "the switch never writes the stored settings");
-    script(true, true, 2);
-    CHECK(gflaser_arm() && dose_period_last == 0 && settings.pwm_spindle.pwm_min_value == 16.0f,
-          "the arm that follows honors the switch over the boot default");
-
-    /* Case M - program end reverts a program-scoped switch to the boot
-       default (density here), applied on the spot. */
-    onProgramCompleted(ProgramFlow_CompletedM2, false);
-    CHECK(cur_model == Model_Density && dose_period_last == 20 &&
-          settings.pwm_spindle.pwm_min_value == 10.0f,
-          "M2 reverts the switch: density rendering and floor are back");
-    CHECK(strstr(last_message, "reverted (density, floor 10 %)") != NULL, "the revert is reported");
-    CHECK(model_override == Override_None, "no override remains after the revert");
-
-    /* Case N - Q1 makes the switch stick across program end and reset. */
-    reset_state();
-    b = m101(0.0f, true, 1.0f);
-    CHECK(mcodeValidate(&b) == Status_OK && !b.words.q, "M101 P0 Q1 validates and takes the Q word");
-    mcodeExecute(STATE_IDLE, &b);
-    CHECK(cur_model == Model_Analog && model_override == Override_Sticky, "Q1 sets a sticky switch");
-    onProgramCompleted(ProgramFlow_CompletedM2, false);
-    gflaser_reset();
-    CHECK(cur_model == Model_Analog && settings.pwm_spindle.pwm_min_value == 16.0f,
-          "a sticky switch survives M2 and a soft reset");
-    b = m101(1.0f, false, 0.0f);
-    mcodeExecute(STATE_IDLE, &b);
-    CHECK(cur_model == Model_Density && model_override == Override_Program,
-          "the next switch replaces a sticky one");
-
-    /* Case O - a soft reset reverts a program-scoped switch; a check-mode
-       program end does not touch it. */
-    reset_state();
-    b = m101(0.0f, false, 0.0f);
-    mcodeExecute(STATE_IDLE, &b);
-    onProgramCompleted(ProgramFlow_CompletedM2, true);
-    CHECK(cur_model == Model_Analog, "a check-mode program end leaves the switch alone");
-    gflaser_reset();
-    CHECK(cur_model == Model_Density && settings.pwm_spindle.pwm_min_value == 10.0f,
-          "a soft reset reverts the switch");
-
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the arm re-checks the coolant gate after the wait, "
                       "the button wait honors the lid and the interlock, and "
                       "every laser-on against a closed window prompts, and the "
-                      "dose model derives its floor and switches safely\n",
+                      "floor is derived, never typed\n",
            failures);
     return failures ? 1 : 0;
 }
