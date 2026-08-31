@@ -69,6 +69,20 @@
                              level arrives as fewer full-width pulses
                              rather than stubs the supply cannot strike.
 
+    laser_corner_gamma       the corner rolloff exponent (default 2,
+                             range 0.25 to 4). Under M4 the core scales
+                             the commanded power with velocity; with
+                             the curve making light proportional to the
+                             command, corners get exactly proportional
+                             light - and the heat still accumulates
+                             where the head slows, so they over-burn.
+                             The exponent bends the rolloff: delivered
+                             light follows (v/v_programmed)^gamma, so
+                             gamma 1 is plain proportionality and
+                             higher values starve the slow spots. It
+                             rides the curve (a curve of "off" disables
+                             both) and touches only the velocity-scaled
+                             path - a constant-power M3 never sees it.
     laser_dose_curve         the measured dose curve, as density:light
                              percent pairs ("10:0.5,30:7,45:21,60:37,
                              80:50,100:100"). S commands a light
@@ -111,6 +125,7 @@
 #include "stepper_stream.h"
 #include "serial.h"
 
+#include "grbl/gcode.h"
 #include "grbl/hal.h"
 #include "grbl/protocol.h"
 #include "grbl/report.h"
@@ -118,6 +133,7 @@
 #include "grbl/system.h"
 
 #include <fcntl.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,11 +198,32 @@ static double disarmed_at;          /* margin for the sample-window lag */
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
 static spindle_ptrs_t *hal_spindle;         /* the registered spindle's table entry */
+static _Atomic uint32_t prog_rpm_bits;      /* the programmed rpm, recorded at every
+                                             * synced set_state (already override-
+                                             * scaled, like the per-segment value):
+                                             * in laser mode the core keeps no
+                                             * programmed speed anywhere the driver
+                                             * can reach at compute time. */
 static dose_model_t cur_model = Model_Density;   /* the model last applied */
 
 /* Producer-thread fire suppression, reported from the protocol thread. */
 enum { Suppress_None = 0, Suppress_Unarmed, Suppress_Coolant };
 static _Atomic int suppressed = Suppress_None;
+
+static void prog_rpm_set (float rpm)
+{
+    uint32_t b;
+    memcpy(&b, &rpm, sizeof(b));
+    atomic_store(&prog_rpm_bits, b);
+}
+
+static float prog_rpm_get (void)
+{
+    uint32_t b = atomic_load(&prog_rpm_bits);
+    float rpm;
+    memcpy(&rpm, &b, sizeof(rpm));
+    return rpm;
+}
 
 static double wall_s (void)
 {
@@ -277,6 +314,8 @@ void gflaser_disarm (void)
  * pairs, strictly increasing in both, measured by the head thermopile
  * and judged on material (2026-08-30). */
 #define CURVE_KEY "laser_dose_curve"
+#define GAMMA_KEY "laser_corner_gamma"
+#define GAMMA_DEFAULT 2.0f
 #define CURVE_MAX_POINTS 12
 
 typedef struct {
@@ -293,6 +332,7 @@ static const dose_curve_t curve_default = {
 };
 
 static dose_curve_t curve;              /* the curve in force */
+static float corner_gamma = GAMMA_DEFAULT;  /* velocity-rolloff exponent */
 
 /* Parse "d:l,d:l,..." percent pairs. Both sequences must be strictly
  * increasing and inside 0..100, at least two points. Returns false on
@@ -345,6 +385,14 @@ static void curve_load (void)
     }
 }
 
+static void gamma_load (void)
+{
+    float g = gfio_conf_read_float(GAMMA_KEY, GAMMA_DEFAULT);
+    if(!(g >= 0.25f && g <= 4.0f))      /* also catches NaN */
+        g = GAMMA_DEFAULT;
+    corner_gamma = g;
+}
+
 /* Light fraction (0..1) to density fraction (0..1) through the curve's
  * inverse, piecewise linear, clamped to the curve's ends. n = 0 is the
  * identity. */
@@ -385,6 +433,25 @@ static uint_fast16_t curveComputeValue (spindle_pwm_t *pwm_data, float rpm, bool
                       (hal_spindle->rpm_max - hal_spindle->rpm_min);
         if(light > 1.0f)
             light = 1.0f;
+        /* Corner rolloff: rpm arrives velocity-scaled under M4; the
+         * programmed speed is the one this driver recorded at the last
+         * synced set_state (in laser mode the core keeps it nowhere the
+         * compute path can reach). Bending the ratio by gamma - 1 makes
+         * the delivered light follow ratio^gamma: proportional at 1,
+         * corner-starved above it. The synchronous path passes the
+         * programmed rpm itself (ratio 1), so only real velocity
+         * scaling is shaped; an S change buried deep in a full planner
+         * queue reaches the recording one sync late, which a raster
+         * never sees (its velocity is constant where it fires). */
+        if(corner_gamma != 1.0f) {
+            float prog = prog_rpm_get();
+            if(prog > hal_spindle->rpm_max)
+                prog = hal_spindle->rpm_max;
+            if(prog > 0.0f && rpm < prog) {
+                float ratio = rpm / prog;
+                light *= powf(ratio, corner_gamma - 1.0f);
+            }
+        }
         uint_fast16_t v = (uint_fast16_t)(curve_apply(light) * (float)PWM_PERIOD + 0.5f);
         if(v > pwm_data->max_value)
             v = pwm_data->max_value;
@@ -602,6 +669,7 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
      * curve reloads on the same cadence. */
     settings.pwm_spindle.pwm_min_value = model_floor(cur_model);
     curve_load();
+    gamma_load();
 
     /* Precompute against a clock that makes one PWM period exactly the
      * hardware's 127 counts, so computed values are raw power bytes. */
@@ -627,6 +695,15 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
      * the spindle off (a sender change mid-job, a job whose M5 never
      * arrived) must prompt again at the next laser-on, or the job runs
      * with no press, no run report and no airflow. */
+    /* In laser mode the core turns the spindle on at rpm 0 and the
+     * programmed S never reaches this call; the poll below mirrors the
+     * parser's programmed speed instead. Record what arrives anyway so
+     * a non-zero synchronous change is never lost. */
+    if(state.on && rpm > 0.0f)
+        prog_rpm_set(rpm);
+    else if(!state.on)
+        prog_rpm_set(0.0f);
+
     if(state.on && !laser_ok && !gflaser_arm())
         state.on = Off;                 /* refused/aborted: stay dark */
 
@@ -687,6 +764,21 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
 
 void gflaser_poll (void)
 {
+    /* The programmed S for the corner rolloff: mirrored from the parser
+     * state on the protocol thread every pass (atomic bits, so the
+     * producer's compute reads it torn-free). Exact for a job cutting
+     * at one S; an S change buried deep in a full planner queue reaches
+     * the mirror early by the lookahead, which shapes at most the
+     * boundary segments of the previous block - and never a raster,
+     * whose velocity is constant wherever it fires. */
+    {
+        spindle_state_t st_now = { .value = atomic_load(&cur_state_value) };
+        if(st_now.on) {
+            float g = gc_state.modal.spindle[0].rpm;
+            if(g > 0.0f)
+                prog_rpm_set(g);
+        }
+    }
     int note = atomic_exchange(&suppressed, Suppress_None);
     if(note != Suppress_None)
         report_message(note == Suppress_Coolant

@@ -55,6 +55,7 @@ static uint32_t dose_period_last = 1;  /* gf_stream_laser_model() argument */
 static bool  latch_locked_last;
 static const char *conf_model_val;      /* laser_power_model in the config, NULL = absent */
 static const char *conf_curve_val;      /* laser_dose_curve, NULL = absent */
+static float conf_gamma = -1.0f;        /* laser_corner_gamma, < 0 = absent */
 static float conf_floor_analog = -1.0f; /* laser_floor_analog, < 0 = absent */
 static float conf_floor_density = -1.0f;
 static float precomputed_min = -1.0f;   /* pwm_min_value at the last precompute */
@@ -96,6 +97,7 @@ float gfio_conf_read_float(const char *k, float fb)
 {
     if (!strcmp(k, "laser_floor_analog") && conf_floor_analog >= 0.0f) return conf_floor_analog;
     if (!strcmp(k, "laser_floor_density") && conf_floor_density >= 0.0f) return conf_floor_density;
+    if (!strcmp(k, "laser_corner_gamma") && conf_gamma >= 0.0f) return conf_gamma;
     return fb;
 }
 int gfio_conf_read(const char *k, char *v, size_t n)
@@ -127,6 +129,7 @@ bool protocol_execute_realtime(void) { return resets_requested == 0; }
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 settings_t settings;
 grbl_t grbl;
+parser_state_t gc_state;
 static spindle_ptrs_t test_spindle;
 
 void report_message(const char *msg, message_type_t type)
@@ -171,7 +174,9 @@ static void reset_state(void)
     sw_n = 0;
     conf_model_val = NULL;
     conf_curve_val = NULL;
+    conf_gamma = -1.0f;
     conf_floor_analog = conf_floor_density = -1.0f;
+    prog_rpm_set(0.0f);
     precomputed_min = -1.0f;
     precompute_calls = 0;
     settings_stores = 0;
@@ -373,6 +378,8 @@ int main(void)
         pd.max_value = 127;
         test_spindle.rpm_min = 0.0f;
         test_spindle.rpm_max = 1000.0f;
+        conf_gamma = 1.0f;              /* the pure curve; gamma has case R */
+        gamma_load();
         uint_fast16_t half = curveComputeValue(&pd, 500.0f, false);
         uint_fast16_t full = curveComputeValue(&pd, 1000.0f, false);
         uint_fast16_t low = curveComputeValue(&pd, 50.0f, false);
@@ -385,6 +392,8 @@ int main(void)
         CHECK(least >= 12 && least <= 14,
               "the least command lands at the curve's first point, at or above the floor");
         CHECK(least < low && low < half && half < full, "the mapping is monotonic");
+        conf_gamma = -1.0f;
+        gamma_load();
     }
 
     /* Case Q - "off" is the identity, a bad value falls back loudly. */
@@ -402,6 +411,46 @@ int main(void)
     script(true, true, 2);
     conf_curve_val = "10:1,50:20,100:100";
     CHECK(gflaser_arm() && strcmp(gflaser_curve(), "custom") == 0, "a valid custom curve loads");
+
+    printf("the corner rolloff exponent:\n");
+
+    /* Case R - with the default gamma of 2, a velocity-scaled command
+       (rpm below the programmed S in param->rpm) delivers light bent by
+       the ratio, while the programmed command itself is untouched. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm(), "arms with the default gamma");
+    {
+        spindle_pwm_t pd;
+        memset(&pd, 0, sizeof(pd));
+        pd.rpm_min = 0.0f;
+        pd.min_value = 12;
+        pd.max_value = 127;
+        test_spindle.rpm_min = 0.0f;
+        test_spindle.rpm_max = 1000.0f;
+        prog_rpm_set(1000.0f);          /* programmed S1000 */
+        uint_fast16_t at_speed = curveComputeValue(&pd, 1000.0f, false);
+        uint_fast16_t corner = curveComputeValue(&pd, 500.0f, false);
+        /* Half speed at gamma 2: light = 0.5 * 0.5 = 0.25 -> density
+           through the curve between 45 and 60 percent (~61 counts). */
+        CHECK(at_speed == 127, "full speed delivers the programmed light");
+        CHECK(corner >= 56 && corner <= 66,
+              "half speed at gamma 2 delivers a quarter of the light");
+        prog_rpm_set(500.0f);           /* programmed S500: no scaling */
+        uint_fast16_t prog = curveComputeValue(&pd, 500.0f, false);
+        CHECK(prog >= 97 && prog <= 105,
+              "the same rpm as the programmed S is untouched (ratio 1)");
+        conf_gamma = 1.0f;
+        gamma_load();
+        prog_rpm_set(1000.0f);
+        uint_fast16_t plain = curveComputeValue(&pd, 500.0f, false);
+        CHECK(plain >= 97 && plain <= 105,
+              "gamma 1 is plain proportionality (half speed = half light)");
+        conf_gamma = 9.0f;              /* out of range: the default */
+        gamma_load();
+        CHECK(corner_gamma == 2.0f, "an out-of-range gamma falls back to 2");
+        prog_rpm_set(0.0f);
+    }
 
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the arm re-checks the coolant gate after the wait, "
