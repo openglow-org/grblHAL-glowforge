@@ -161,7 +161,7 @@ static void publish_state (bool force)
     snprintf(body, sizeof(body),
         "\"state\":\"%s\",\"alarm\":%d,"
         "\"sender\":{\"connected\":%s,\"generation\":%u,\"for_s\":%.0f,\"peer\":\"%s\"},"
-        "\"laser\":{\"armed\":%s,\"arming\":%s,\"model\":\"%s\",\"floor_pct\":%g},"
+        "\"laser\":{\"armed\":%s,\"arming\":%s,\"model\":\"%s\",\"floor_pct\":%g,\"curve\":\"%s\"},"
         "\"modals\":\"%s\","
         "\"overrides\":{\"feed\":%d,\"rapid\":%d},"
         "\"driver\":\"%s\"}",
@@ -174,6 +174,7 @@ static void publish_state (bool force)
         gflaser_arming() ? "true" : "false",
         gflaser_density() ? "density" : "analog",
         (double)settings.pwm_spindle.pwm_min_value,
+        gflaser_curve(),
         modals,
         (int)sys.override.feed_rate, (int)sys.override.rapid_rate,
         hal.driver_version ? hal.driver_version : "");

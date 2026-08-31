@@ -26,6 +26,10 @@ void gflaser_disarm (void);
 // client and the published state file report it.
 bool gflaser_density (void);
 
+// The dose curve in force, for the reports and the published state
+// file: "bench-default", "custom", "off", or "invalid: bench-default".
+const char *gflaser_curve (void);
+
 // True while the operator-armed window is open (the published state
 // file reports it beside the arming wait).
 bool gflaser_armed (void);

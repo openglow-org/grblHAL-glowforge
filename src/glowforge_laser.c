@@ -69,6 +69,20 @@
                              level arrives as fewer full-width pulses
                              rather than stubs the supply cannot strike.
 
+    laser_dose_curve         the measured dose curve, as density:light
+                             percent pairs ("10:0.5,30:7,45:21,60:37,
+                             80:50,100:100"). S commands a light
+                             fraction and the driver maps it through
+                             the curve's inverse onto the density that
+                             delivers it, so S500 means half the light
+                             rather than half the pulses. Absent = the
+                             bench-measured default; "off" = identity
+                             (S maps straight onto density, the old
+                             behavior); an unparsable value falls back
+                             to the default and the arm says so. Read
+                             at every precompute; $35/$36 still floor
+                             and ceil the result in density percent.
+
   DENSITY IS THE ONLY DOSE MODEL. The tube fires a strike transient at
   every beam-on, so a continuous analog duty carries a spot at every
   turn-on whatever the power, and the 3 to 14 % duty range is a dead
@@ -255,6 +269,132 @@ void gflaser_disarm (void)
 
 /* --- dose model ---------------------------------------------------------- */
 
+/* The measured dose curve: light output is convex in pulse density on
+ * this tube (80 % density delivers about half the CW light), so a raw
+ * S-to-density mapping makes S mean pulses, not light. The curve maps
+ * the commanded light fraction through the measured points' inverse
+ * onto the density that delivers it. Points are density:light percent
+ * pairs, strictly increasing in both, measured by the head thermopile
+ * and judged on material (2026-08-30). */
+#define CURVE_KEY "laser_dose_curve"
+#define CURVE_MAX_POINTS 12
+
+typedef struct {
+    float density[CURVE_MAX_POINTS];    /* percent of full, ascending */
+    float light[CURVE_MAX_POINTS];      /* percent of CW, ascending */
+    uint8_t n;                          /* 0 = identity (curve off) */
+    const char *name;                   /* for the arm report */
+} dose_curve_t;
+
+static const dose_curve_t curve_default = {
+    .density = { 10.0f, 20.0f, 30.0f, 45.0f, 60.0f, 80.0f, 100.0f },
+    .light   = {  0.5f,  2.0f,  7.0f, 21.0f, 37.0f, 50.0f, 100.0f },
+    .n = 7, .name = "bench-default"
+};
+
+static dose_curve_t curve;              /* the curve in force */
+
+/* Parse "d:l,d:l,..." percent pairs. Both sequences must be strictly
+ * increasing and inside 0..100, at least two points. Returns false on
+ * any violation, leaving *out untouched. */
+static bool curve_parse (const char *text, dose_curve_t *out)
+{
+    dose_curve_t c = { .n = 0, .name = "custom" };
+    const char *p = text;
+    while(*p && c.n < CURVE_MAX_POINTS) {
+        char *end;
+        float d = strtof(p, &end);
+        if(end == p || *end != ':')
+            return false;
+        p = end + 1;
+        float l = strtof(p, &end);
+        if(end == p)
+            return false;
+        p = *end == ',' ? end + 1 : end;
+        if(!(d >= 0.0f && d <= 100.0f && l >= 0.0f && l <= 100.0f))
+            return false;
+        if(c.n && !(d > c.density[c.n - 1] && l > c.light[c.n - 1]))
+            return false;
+        c.density[c.n] = d;
+        c.light[c.n] = l;
+        c.n++;
+    }
+    if(*p || c.n < 2)
+        return false;
+    *out = c;
+    return true;
+}
+
+/* Load the curve key: absent = the default, "off" = identity, a bad
+ * value = the default (reported at the arm). Call at every precompute. */
+static void curve_load (void)
+{
+    char text[192] = "";
+    if(gfio_conf_read(CURVE_KEY, text, sizeof(text)) != 0 || text[0] == '\0') {
+        curve = curve_default;
+        return;
+    }
+    if(strcmp(text, "off") == 0) {
+        curve.n = 0;
+        curve.name = "off";
+        return;
+    }
+    if(!curve_parse(text, &curve)) {
+        curve = curve_default;
+        curve.name = "invalid: bench-default";
+    }
+}
+
+/* Light fraction (0..1) to density fraction (0..1) through the curve's
+ * inverse, piecewise linear, clamped to the curve's ends. n = 0 is the
+ * identity. */
+static float curve_apply (float light)
+{
+    if(curve.n == 0)
+        return light;
+    float l = light * 100.0f;
+    if(l <= curve.light[0])
+        return curve.density[0] * (l / curve.light[0]) / 100.0f;
+    uint8_t i = 1;
+    while(i < curve.n - 1 && l > curve.light[i])
+        i++;
+    float span = curve.light[i] - curve.light[i - 1];
+    float f = span > 0.0f ? (l - curve.light[i - 1]) / span : 0.0f;
+    if(f > 1.0f)
+        f = 1.0f;
+    return (curve.density[i - 1] + f * (curve.density[i] - curve.density[i - 1])) / 100.0f;
+}
+
+const char *gflaser_curve (void)
+{
+    return curve.n ? curve.name : "off";
+}
+
+/* compute_value wrapper: rpm (velocity-scaled by the core under M4)
+ * commands a light fraction of full; the curve turns it into the
+ * density that delivers it, and $35/$36 still floor and ceil the
+ * result. The core's own computation handles off, overrides and the
+ * floor for the identity path; the wrapper only bends the middle. */
+static uint_fast16_t (*core_compute)(spindle_pwm_t *pwm_data, float rpm, bool pid_limit);
+
+static uint_fast16_t curveComputeValue (spindle_pwm_t *pwm_data, float rpm, bool pid_limit)
+{
+    if(curve.n && rpm > pwm_data->rpm_min && hal_spindle != NULL &&
+       hal_spindle->rpm_max > hal_spindle->rpm_min) {
+        float light = (rpm - hal_spindle->rpm_min) /
+                      (hal_spindle->rpm_max - hal_spindle->rpm_min);
+        if(light > 1.0f)
+            light = 1.0f;
+        uint_fast16_t v = (uint_fast16_t)(curve_apply(light) * (float)PWM_PERIOD + 0.5f);
+        if(v > pwm_data->max_value)
+            v = pwm_data->max_value;
+        if(v < pwm_data->min_value)
+            v = pwm_data->min_value;
+        return v;
+    }
+    return core_compute(pwm_data, rpm, pid_limit);
+}
+
 static const char *model_name (dose_model_t m)
 {
     return m == Model_Analog ? "analog" : "density";
@@ -319,9 +459,10 @@ bool gflaser_armed (void)
 
 static void report_model (const char *what)
 {
-    char msg[96];
-    snprintf(msg, sizeof(msg), "%s (%s, floor %g %%)", what, model_name(cur_model),
-             (double)settings.pwm_spindle.pwm_min_value);
+    char msg[112];
+    snprintf(msg, sizeof(msg), "%s (%s, floor %g %%, curve %s)", what,
+             model_name(cur_model), (double)settings.pwm_spindle.pwm_min_value,
+             gflaser_curve());
     report_message(msg, Message_Info);
 }
 
@@ -457,13 +598,22 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
 
     /* $35 is derived, never typed: the model's floor key is loaded here,
      * so boot reports the true floor, and a $35 written by a sender is
-     * overwritten the moment the core re-runs this config. */
+     * overwritten the moment the core re-runs this config. The dose
+     * curve reloads on the same cadence. */
     settings.pwm_spindle.pwm_min_value = model_floor(cur_model);
+    curve_load();
 
     /* Precompute against a clock that makes one PWM period exactly the
      * hardware's 127 counts, so computed values are raw power bytes. */
     spindle_precompute_pwm_values(spindle, &spindle_pwm, &settings.pwm_spindle,
                                    (uint32_t)((float)PWM_PERIOD * settings.pwm_spindle.pwm_freq));
+
+    /* S commands light, not pulses: bend the core's computation through
+     * the measured curve (the identity when the curve is off). */
+    if(spindle_pwm.compute_value != NULL && spindle_pwm.compute_value != curveComputeValue) {
+        core_compute = spindle_pwm.compute_value;
+        spindle_pwm.compute_value = curveComputeValue;
+    }
 
     return true;
 }

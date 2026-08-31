@@ -54,6 +54,7 @@ static bool  stream_armed;          /* gf_stream_laser_arm(true) reached? */
 static uint32_t dose_period_last = 1;  /* gf_stream_laser_model() argument */
 static bool  latch_locked_last;
 static const char *conf_model_val;      /* laser_power_model in the config, NULL = absent */
+static const char *conf_curve_val;      /* laser_dose_curve, NULL = absent */
 static float conf_floor_analog = -1.0f; /* laser_floor_analog, < 0 = absent */
 static float conf_floor_density = -1.0f;
 static float precomputed_min = -1.0f;   /* pwm_min_value at the last precompute */
@@ -99,9 +100,15 @@ float gfio_conf_read_float(const char *k, float fb)
 }
 int gfio_conf_read(const char *k, char *v, size_t n)
 {
-    if (strcmp(k, "laser_power_model") || conf_model_val == NULL) return -1;
-    snprintf(v, n, "%s", conf_model_val);
-    return 0;
+    if (!strcmp(k, "laser_power_model") && conf_model_val != NULL) {
+        snprintf(v, n, "%s", conf_model_val);
+        return 0;
+    }
+    if (!strcmp(k, "laser_dose_curve") && conf_curve_val != NULL) {
+        snprintf(v, n, "%s", conf_curve_val);
+        return 0;
+    }
+    return -1;
 }
 void gf_stream_laser_model(uint32_t period, uint32_t min_ticks) { (void)min_ticks; dose_period_last = period; }
 void serial_poll(void) {}
@@ -163,6 +170,7 @@ static void reset_state(void)
     sw_calls = 0;
     sw_n = 0;
     conf_model_val = NULL;
+    conf_curve_val = NULL;
     conf_floor_analog = conf_floor_density = -1.0f;
     precomputed_min = -1.0f;
     precompute_calls = 0;
@@ -228,8 +236,8 @@ int main(void)
     CHECK(dose_period_last == 20, "no laser_power_model key selects the density dose model");
     CHECK(settings.pwm_spindle.pwm_min_value == 10.0f && precomputed_min == 10.0f,
           "the arm derives $35 from the density floor (10) and re-precomputes");
-    CHECK(strstr(last_message, "laser armed (density, floor 10 %)") != NULL,
-          "the arm report names the model and the floor in force");
+    CHECK(strstr(last_message, "laser armed (density, floor 10 %, curve bench-default)") != NULL,
+          "the arm report names the model, the floor and the curve in force");
 
     /* Case C - blocked at the pre-wait check: refuses before arming. */
     reset_state();
@@ -329,7 +337,8 @@ int main(void)
     CHECK(dose_period_last == 0, "laser_power_model = analog selects the analog rendering");
     CHECK(settings.pwm_spindle.pwm_min_value == 16.0f && precomputed_min == 16.0f,
           "the arm derives $35 from the analog floor (16), overwriting a typed value");
-    CHECK(strstr(last_message, "(analog, floor 16 %)") != NULL, "the arm report says analog, 16");
+    CHECK(strstr(last_message, "(analog, floor 16 %, curve bench-default)") != NULL,
+          "the arm report says analog, 16, and names the curve");
     reset_state();
     script(true, true, 2);
     conf_floor_density = 12.5f;
@@ -345,6 +354,54 @@ int main(void)
     conf_floor_density = 0.0f;
     CHECK(gflaser_arm() && settings.pwm_spindle.pwm_min_value == 0.0f,
           "a floor of 0 is honored (the ladders run that way)");
+
+    printf("the dose curve: parse, apply, fall back:\n");
+
+    /* Case P - the compiled default loads with no key, and the wrapper
+       maps commanded light through its inverse: half light lands near
+       80 percent density, full stays full, and tiny commands ride the
+       first span. The core's own math handles rpm 0 and the floor. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm(), "arms with the default curve");
+    CHECK(strcmp(gflaser_curve(), "bench-default") == 0, "no key loads the bench default");
+    {
+        spindle_pwm_t pd;
+        memset(&pd, 0, sizeof(pd));
+        pd.rpm_min = 0.0f;
+        pd.min_value = 12;
+        pd.max_value = 127;
+        test_spindle.rpm_min = 0.0f;
+        test_spindle.rpm_max = 1000.0f;
+        uint_fast16_t half = curveComputeValue(&pd, 500.0f, false);
+        uint_fast16_t full = curveComputeValue(&pd, 1000.0f, false);
+        uint_fast16_t low = curveComputeValue(&pd, 50.0f, false);
+        uint_fast16_t least = curveComputeValue(&pd, 5.0f, false);
+        CHECK(half >= 97 && half <= 105,
+              "S500 (half light) maps near 80 percent density through the curve");
+        CHECK(full == 127, "S1000 maps to full");
+        CHECK(low >= 30 && low <= 36,
+              "S50 (5 percent light) maps through the low span to ~26 percent density");
+        CHECK(least >= 12 && least <= 14,
+              "the least command lands at the curve's first point, at or above the floor");
+        CHECK(least < low && low < half && half < full, "the mapping is monotonic");
+    }
+
+    /* Case Q - "off" is the identity, a bad value falls back loudly. */
+    reset_state();
+    script(true, true, 2);
+    conf_curve_val = "off";
+    CHECK(gflaser_arm() && strcmp(gflaser_curve(), "off") == 0, "curve off is honored");
+    CHECK(strstr(last_message, "curve off") != NULL, "the arm names the off curve");
+    reset_state();
+    script(true, true, 2);
+    conf_curve_val = "10:5,9:6";        /* densities not increasing */
+    CHECK(gflaser_arm() && strcmp(gflaser_curve(), "invalid: bench-default") == 0,
+          "a bad curve falls back to the default and says so");
+    reset_state();
+    script(true, true, 2);
+    conf_curve_val = "10:1,50:20,100:100";
+    CHECK(gflaser_arm() && strcmp(gflaser_curve(), "custom") == 0, "a valid custom curve loads");
 
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the arm re-checks the coolant gate after the wait, "
