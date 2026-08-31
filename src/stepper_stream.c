@@ -1253,7 +1253,8 @@ bool gf_stream_resume (void)
     bool ok = gfio_wr_attr("cnc/step_freq", val) == 0;
     lseek(fd, 1, SEEK_SET);           /* clear pulse data + byte counters */
     gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
-    gfio_wr_attr("cnc/enable", "1");  /* steppers on (idle) */
+    if(!gfio_pulse_inherited())
+        gfio_wr_attr("cnc/enable", "1");  /* standalone: steppers on; under the broker the rail is forgectrl's */
 
     pthread_mutex_lock(&gf.lock);
     gf.fd = fd;
@@ -1368,7 +1369,8 @@ void gf_stream_init (void)
         /* Fresh stream state. */
         lseek(gf.fd, 1, SEEK_SET);        /* clear pulse data + byte counters */
         gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
-        gfio_wr_attr("cnc/enable", "1");  /* steppers on (idle) */
+        if(!gfio_pulse_inherited())
+            gfio_wr_attr("cnc/enable", "1");  /* standalone: steppers on; under the broker the rail is forgectrl's */
 
         gf.active = true;
     }
