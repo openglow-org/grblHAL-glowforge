@@ -5,7 +5,8 @@
   Glowforge (Basic/Plus/Pro) i.MX6 control board.
 
   Every value below is measured/derived from the factory machine, not
-  guessed. Sources: kernel-module-glowforge/UAPI.md (feeder contract),
+  guessed. Sources: the pulse feeder contract
+  (https://docs.forgefirm.org/technical/forgefirm/pulse-feeder-contract/),
   forgefirm/docs/BRINGUP.md (hardware facts bank), and the factory pulse
   streams analyzed with forgefirm/scripts/bench/puls_profile.py:
   - XY: 0.15 mm per full step at x8 microstepping -> 53.333 usteps/mm.

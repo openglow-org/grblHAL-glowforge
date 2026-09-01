@@ -51,7 +51,7 @@ engine: the driver reports job state, gates fire and issues hold/resume
 from the engine's published verdict (a missing or stale verdict reads as
 fire-blocked), and carries a compiled-in fallback fan write for the case
 where the engine is provably absent while the laser is armed. The
-contract is forgectrl `docs/SERVICES.md`.
+contract is [the cooling engine](https://docs.forgefirm.org/technical/forgefirm/cooling-engine/) on the documentation site.
 
 Under the ForgeFIRM image the driver runs as a **supervised child of
 forgectrl** and receives `/dev/glowforge` as a broker-inherited fd

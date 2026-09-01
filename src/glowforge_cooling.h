@@ -11,7 +11,7 @@
 
 // Client setup (report target, verdict cache). The cooling engine and
 // the machine's thermal posture live in forgectrl; the contract is
-// forgectrl docs/SERVICES.md. Called from driver_init().
+// https://docs.forgefirm.org/technical/forgefirm/cooling-engine/. Called from driver_init().
 void gfcool_init (void);
 
 // hal.coolant backends. Flood (M8/M9) drives the job-state reports;

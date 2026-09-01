@@ -4,7 +4,7 @@
   Part of grblHAL-glowforge. The cooling engine - fan/pump/TEC/heater
   profiles, coolant-flow verification, over-temp policy - lives in
   forgectrl (the machine-services daemon); the shared contract is
-  forgectrl docs/SERVICES.md. This client:
+  https://docs.forgefirm.org/technical/forgefirm/cooling-engine/. This client:
 
   - reports job state to the engine: POST /cool/state (127.0.0.1,
     FORGECTRL_PORT or 8080) with mode=idle|run|cooldown and the armed
@@ -483,7 +483,7 @@ void gfcool_poll (void)
         }
     }
 
-    /* One reporter per machine (SERVICES.md): a gfcloud homing session
+    /* One reporter per machine (the cooling-engine contract): a gfcloud homing session
      * hands the machine to gfhome, which reports its own job state -
      * this client's idle reports would fight it, resetting the engine's
      * per-job profile and thrashing the flood state per motion. */

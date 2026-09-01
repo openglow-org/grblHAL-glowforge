@@ -4,8 +4,9 @@
   Part of grblHAL-glowforge. This module is the step "timer": it turns
   grblHAL stepper events directly into the kernel pulse-byte stream.
 
-  Contract (kernel-module-glowforge/UAPI.md, "Pulse-stream feeder
-  contract"): one byte per machine tick (kernel step_freq); velocity is
+  Contract (the pulse feeder contract,
+  https://docs.forgefirm.org/technical/forgefirm/pulse-feeder-contract/):
+  one byte per machine tick (kernel step_freq); velocity is
   step density; byte layout bit0 X_STEP, bit1 X_DIR (set = -X), bit2
   Y_STEP, bit3 Y_DIR (set = +Y), bit5 Z_STEP, bit6 Z_DIR (set = +Z, lens
   up); streaming=1 while live-feeding (underrun is fault-like), cleared

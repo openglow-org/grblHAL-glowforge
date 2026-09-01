@@ -4,7 +4,7 @@
   Part of grblHAL-glowforge. Host unit test for the exact mapping the
   controller gates motion on (src/glowforge_switch_map.h). The
   polarity facts under test are the shared contract (forgectrl
-  docs/SERVICES.md switch map):
+  switch map, https://docs.forgefirm.org/technical/forgefirm/forgectrl/):
 
     - doors (bit 3) is active = lid CLOSED (series chain)
     - interlock (bit 5) is INVERTED: active = loop OPEN (lockout);
