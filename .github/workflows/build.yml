@@ -29,7 +29,7 @@ jobs:
       - name: Fetch the test harnesses
         uses: actions/checkout@v4
         with:
-          repository: ScottW514/forgefirm
+          repository: openglow-org/forgefirm
           path: forgefirm
       - name: Laser stream emission rules
         run: python3 forgefirm/scripts/bench/laser_stream_test.py build/grblHAL_glowforge

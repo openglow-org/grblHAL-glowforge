@@ -1,4 +1,4 @@
 [submodule "src/grbl"]
 	path = src/grbl
-	url = https://github.com/ScottW514/core.git
+	url = https://github.com/openglow-org/grblHAL-core.git
 	branch = forgefirm

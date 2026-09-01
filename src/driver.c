@@ -384,7 +384,7 @@ bool driver_init (void)
 
     hal.info = "Glowforge";
     hal.driver_version = "260809";
-    hal.driver_url = "https://github.com/ScottW514/grblHAL-glowforge";
+    hal.driver_url = "https://github.com/openglow-org/grblHAL-glowforge";
     hal.board = "Glowforge factory control board (i.MX6)";
     hal.driver_setup = driver_setup;
     hal.rx_buffer_size = RX_BUFFER_SIZE;
