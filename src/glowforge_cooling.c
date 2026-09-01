@@ -476,7 +476,8 @@ void gfcool_poll (void)
                         report_message("cooling verdict clean - resuming",
                                        Message_Info);
                         fflog(LOG_INFO, "gfcool: resuming");
-                        protocol_enqueue_realtime_command(CMD_CYCLE_START);
+                        if(!gflaser_resume_gate())
+                            protocol_enqueue_realtime_command(CMD_CYCLE_START);
                     }
                 }
             }

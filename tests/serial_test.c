@@ -43,6 +43,7 @@ bool protocol_enqueue_realtime_command(uint8_t c)
 
 void driver_request_exit(void) {}
 uint8_t platform_poll_stdin(void) { return 0; }
+bool gflaser_resume_gate(void) { return false; }   /* no held laser job here */
 
 /* --- driver source under test ---------------------------------------- */
 #include "../src/serial.c"

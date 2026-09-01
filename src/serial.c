@@ -30,6 +30,7 @@
 // its struct field of the same name.
 #include "serial.h"
 #include "driver.h"
+#include "glowforge_laser.h"
 #include "platform.h"
 
 #include "grbl/hal.h"
@@ -248,6 +249,9 @@ static void rx_byte (uint8_t data)
         driver_request_exit();
         return;
     }
+
+    if((data == CMD_CYCLE_START_LEGACY || data == CMD_CYCLE_START) && gflaser_resume_gate())
+        return;                             // a held laser job re-arms first; the gate issues the start
 
     if(enqueue_realtime_command(data))
         return;                             // real-time: never queued, never dropped

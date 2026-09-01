@@ -117,6 +117,7 @@
 */
 
 #include "driver.h"
+#include "fflog.h"
 #include "glowforge_laser.h"
 #include "glowforge_cooling.h"
 #include "glowforge_io.h"
@@ -194,6 +195,8 @@ static double disarm_at;            /* 0 = no grace running */
 static unsigned armed_client_gen;   /* sender session the arm belongs to */
 static _Atomic bool disarm_request = false; /* program end: close the window */
 static _Atomic bool arming = false;         /* blocked in the button wait */
+static bool rearm_pending;                  /* a held job's resume waits for the press */
+static double rearm_deadline;
 static double disarmed_at;          /* margin for the sample-window lag */
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
@@ -536,7 +539,7 @@ static void report_model (const char *what)
 /* The first laser-on of a job: gate, unlock, wait for the operator's
  * button press. Runs on the protocol thread with the planner synced
  * (the core syncs every spindle state change, laser mode included). */
-static bool gflaser_arm (void)
+static bool arm_gates (void)
 {
     if(!gfcool_fire_ok()) {
         report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
@@ -557,6 +560,47 @@ static bool gflaser_arm (void)
             return false;
         }
     }
+
+    return true;
+}
+
+/* The arm's completion once the consent exists: the coolant gate
+ * re-checked at the moment it matters (the wait can run for minutes,
+ * and the verdict may have gone bad or stale during it), the dose model
+ * put in force, then the window opened. */
+static bool arm_complete (void)
+{
+    if(!gfcool_fire_ok()) {
+        latch_lock(true);
+        gfcool_laser_armed(false);
+        report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
+        system_raise_alarm(Alarm_AbortCycle);
+        return false;
+    }
+
+    /* Put the dose model in force for this window - rendering and
+     * floor both - before any fire reaches the stream. A floor of 0 is
+     * a deliberate setting (the threshold ladders run that way) and
+     * gets a note, never a refusal. */
+    apply_model(selected_model());
+    if(settings.pwm_spindle.pwm_min_value <= 0.0f)
+        report_message("laser floor is 0: the bottom of the S range will not fire",
+                        Message_Warning);
+
+    disarm_request = false;
+    laser_ok = true;
+    disarm_at = 0.0;
+    armed_client_gen = serial_client_generation();
+    gf_stream_laser_arm(true);
+    report_model("laser armed");
+
+    return true;
+}
+
+static bool gflaser_arm (void)
+{
+    if(!arm_gates())
+        return false;
 
     /* Fan run profile + flow interrogation cover the whole armed
      * window, whatever the sender's M8/M9 state. */
@@ -624,34 +668,93 @@ static bool gflaser_arm (void)
         }
     }
 
-    /* Re-check the coolant gate at the moment it matters: the wait can
-     * run for minutes, and the verdict may have gone bad (or stale)
-     * during it. */
-    if(!gfcool_fire_ok()) {
+    return arm_complete();
+}
+
+/* --- resuming a held job whose window has closed -------------------------- */
+
+/* A cycle start against a held laser job whose window has closed must
+ * not reach the core as it is: the core restores the spindle inside the
+ * held state, and the blocking arm wait cannot run there - its pump
+ * enters the core's suspend loop, which spins until the hold ends, so
+ * the press would never be read. The press is collected from the poll
+ * instead, and the cycle start is issued once the window is open. */
+
+static void rearm_end (bool armed)
+{
+    rearm_pending = false;
+    arming = false;
+    button_led(0);
+    if(!armed) {
         latch_lock(true);
         gfcool_laser_armed(false);
-        report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
-        system_raise_alarm(Alarm_AbortCycle);
-        return false;
     }
+}
 
-    /* Put the dose model in force for this window - rendering and
-     * floor both - before any fire reaches the stream. A floor of 0 is
-     * a deliberate setting (the threshold ladders run that way) and
-     * gets a note, never a refusal. */
-    apply_model(selected_model());
-    if(settings.pwm_spindle.pwm_min_value <= 0.0f)
-        report_message("laser floor is 0: the bottom of the S range will not fire",
-                        Message_Warning);
+bool gflaser_resume_gate (void)
+{
+    sys_state_t st = state_get();
 
-    disarm_request = false;
-    laser_ok = true;
-    disarm_at = 0.0;
-    armed_client_gen = serial_client_generation();
-    gf_stream_laser_arm(true);
-    report_model("laser armed");
+    if(!(st & (STATE_HOLD | STATE_SAFETY_DOOR)))
+        return false;
+    if(rearm_pending)
+        return true;                    /* the wait already running takes it */
+    if(laser_ok || !gc_state.modal.spindle[0].state.on)
+        return false;                   /* window open, or nothing to fire */
+
+    if(!arm_gates())
+        return true;                    /* refused: the alarm ends the job */
+
+    gfcool_laser_armed(true);
+    latch_lock(false);
+
+    if(!gfsw_available())
+        return !arm_complete();         /* no button (host builds): straight through */
+
+    float timeout_s = gfio_conf_read_float("laser_button_timeout_s", BUTTON_TIMEOUT_S_DEFAULT);
+    if(!(timeout_s >= 1.0f && timeout_s <= 3600.0f))
+        timeout_s = BUTTON_TIMEOUT_S_DEFAULT;
+    rearm_deadline = wall_s() + (double)timeout_s;
+    rearm_pending = true;
+    arming = true;
+    button_led(255);
+    report_message("press the button to resume the laser job", Message_Info);
 
     return true;
+}
+
+static void rearm_poll (void)
+{
+    if(!rearm_pending)
+        return;
+
+    if(!(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR))) {
+        rearm_end(false);               /* a reset, an alarm or a cancel took the job */
+        return;
+    }
+
+    switch(arm_switches()) {
+        case Arm_Pressed:
+            gfsw_button_consumed();     /* not a pause toggle */
+            rearm_end(arm_complete());
+            if(laser_ok)
+                protocol_enqueue_realtime_command(CMD_CYCLE_START);
+            break;
+        case Arm_LidOpen:
+        case Arm_InterlockOpen:
+            /* The lid policy takes the held job from here (a cancel, or
+             * the stock door hold); the wait ends without consent. */
+            rearm_end(false);
+            report_message("lid or interlock open - the resume is cancelled", Message_Warning);
+            break;
+        default:
+            if(wall_s() > rearm_deadline) {
+                rearm_end(false);
+                report_message("laser arm timed out waiting for the button - the job stays held",
+                               Message_Warning);
+            }
+            break;
+    }
 }
 
 /* --- spindle backends ----------------------------------------------------- */
@@ -704,8 +807,19 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
     else if(!state.on)
         prog_rpm_set(0.0f);
 
-    if(state.on && !laser_ok && !gflaser_arm())
-        state.on = Off;                 /* refused/aborted: stay dark */
+    if(state.on && !laser_ok) {
+        if(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR)) {
+            /* A spindle restore inside a held state, against a closed
+             * window: a cycle start the resume gate did not see. The
+             * blocking arm wait cannot run here (its pump enters the
+             * core's suspend loop, which spins until the hold ends), so
+             * the job stays dark and says so; the gate is the path that
+             * re-arms a held job. */
+            state.on = Off;
+            report_message("laser not armed - hold and resume again to re-arm", Message_Warning);
+        } else if(!gflaser_arm())
+            state.on = Off;             /* refused/aborted: stay dark */
+    }
 
     atomic_store(&cur_state_value, state.value);
 
@@ -805,6 +919,8 @@ void gflaser_poll (void)
         }
     }
 
+    rearm_poll();
+
     if(!laser_ok)
         return;
 
@@ -816,8 +932,17 @@ void gflaser_poll (void)
     }
 
     /* A sender change closes the window: the button press that armed
-     * it belonged to the displaced session. */
+     * it belonged to the displaced session. A job still running is held
+     * as well, so the next sender finds the cut where it stopped rather
+     * than a dark pass run to its end; ~ or the button re-arms and
+     * resumes it through the resume gate. */
     if(serial_client_generation() != armed_client_gen) {
+        if(st == STATE_CYCLE) {
+            protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+            fflog(LOG_NOTICE, "gflaser: sender changed mid-job - job held, laser disarmed");
+            report_message("sender changed - job held, laser disarmed; a resume re-arms",
+                           Message_Warning);
+        }
         gflaser_disarm();
         return;
     }

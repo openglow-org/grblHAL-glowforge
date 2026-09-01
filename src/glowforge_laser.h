@@ -38,3 +38,10 @@ bool gflaser_armed (void);
 // press: that press is the arm's, and the button toggle must not act on
 // it (glowforge_switches.c).
 bool gflaser_arming (void);
+
+// The gate every cycle start passes on its way to the core. A held
+// laser job whose armed window has closed re-arms first: the press is
+// collected from the poll and the cycle start is issued once the window
+// is open. Returns true when the gate took the request (the caller must
+// not enqueue the cycle start), false when the job resumes as it is.
+bool gflaser_resume_gate (void);

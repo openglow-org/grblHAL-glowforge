@@ -115,6 +115,7 @@ int gfio_conf_read(const char *k, char *v, size_t n)
 void gf_stream_laser_model(uint32_t period, uint32_t min_ticks) { (void)min_ticks; dose_period_last = period; }
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
+void fflog(int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
 static unsigned client_gen = 1;     /* bumped to model a sender change */
 unsigned serial_client_generation(void) { return client_gen; }
 static int resets_requested;
