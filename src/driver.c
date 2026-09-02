@@ -36,6 +36,7 @@
 #include "driver.h"
 #include "serial.h"
 #include "stepper_stream.h"
+#include "build_info.h"
 #include "glowforge_cooling.h"
 #include "glowforge_homing.h"
 #include "glowforge_laser.h"
@@ -56,6 +57,19 @@ static on_execute_realtime_ptr on_execute_realtime;
 static driver_reset_ptr driver_reset_chain;
 static _Atomic bool exit_requested = false;
 static bool exit_reset_sent = false;
+static double exit_wait_until;
+
+/* True once a reset issued for the exit has had its bounded time to
+ * ramp the kernel down (the longest ramp is well under a second). */
+static bool exit_wait_over (void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + ts.tv_nsec / 1e9;
+    if(exit_wait_until == 0.0)
+        exit_wait_until = now + 2.0;
+    return now >= exit_wait_until;
+}
 
 /* Deferred hal.delay_ms callback (fired from the realtime hook; the core
  * itself only ever uses the blocking form, plugins may not). */
@@ -330,15 +344,20 @@ static void glowforge_process_realtime (uint_fast16_t state)
     gfstatus_poll();
 
     if(exit_requested) {
-        if(state == STATE_CYCLE || state == STATE_JOG || state == STATE_HOMING) {
+        if(state == STATE_CYCLE || state == STATE_JOG || state == STATE_HOMING ||
+           ((state & STATE_HOLD) && !gf_stream_kernel_idle())) {
             /* A termination request during motion is a stop, not a
              * "finish the job": the same path as an incoming ^X -
              * controlled deceleration, latch relocked, alarm - and the
-             * exit follows on the next pass. */
+             * exit follows once the kernel has ramped down. A hold whose
+             * deceleration is still playing counts as motion. */
             if(!exit_reset_sent) {
                 exit_reset_sent = true;
                 protocol_enqueue_realtime_command(CMD_RESET);
             }
+        } else if(exit_reset_sent && !gf_stream_kernel_idle() && !exit_wait_over()) {
+            /* The reset's ramp is still playing: leave the kernel to it
+             * (bounded), so the exit's halt does not cut it short. */
         } else {
             serial_poll();      /* flush the last reports (disarm, alarm) to the sender */
             exit(EXIT_SUCCESS);
@@ -383,7 +402,7 @@ bool driver_init (void)
     gfsw_init();
 
     hal.info = "Glowforge";
-    hal.driver_version = "260809";
+    hal.driver_version = DRV_VERSION;
     hal.driver_url = "https://github.com/openglow-org/grblHAL-glowforge";
     hal.board = "Glowforge factory control board (i.MX6)";
     hal.driver_setup = driver_setup;

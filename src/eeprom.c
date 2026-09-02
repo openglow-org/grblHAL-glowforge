@@ -28,6 +28,7 @@
 #include "fflog.h"
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
@@ -89,6 +90,14 @@ static FILE *eeprom_fp (void)
     }
 
     return EEPROM_FP;
+}
+
+void eeprom_sync (void)
+{
+    if (EEPROM_FP) {
+        fflush(EEPROM_FP);
+        fsync(fileno(EEPROM_FP));
+    }
 }
 
 void eeprom_close (void)

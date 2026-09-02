@@ -92,7 +92,7 @@
 
 /* Stream ring: 1 << 17 = 131072 machine ticks of headroom (4.6 s @ 28160).
  * With the producer wall-paced the lead over the shipped cursor stays near
- * the preload depth; the guard below is a belt-and-braces failsafe. */
+ * the preload depth; the guard below is a second failsafe. */
 #define RING_BITS 17
 #define RING_SIZE (1u << RING_BITS)
 #define RING_MASK (RING_SIZE - 1)
@@ -535,6 +535,19 @@ void gf_stream_laser_arm (bool state)
  * where the core's wanted state is re-asserted for whatever follows.
  * The wanted state itself is left alone: the jog changes nothing about
  * what the next cut lights with. */
+/* True when the kernel reports idle (or cannot be asked: no device). A
+ * read that fails reads as "not idle" for the callers that wait on it,
+ * which are all bounded. */
+bool gf_stream_kernel_idle (void)
+{
+    char state[16] = "";
+    if(!gf.active)
+        return true;
+    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+        return false;
+    return strcmp(state, "idle") == 0;
+}
+
 void gf_stream_jog (bool jog)
 {
     if(gf.failed)
@@ -1127,7 +1140,18 @@ void gf_stream_reset (void)
      *   draining its completed queue: leave it. That queue is the tail of
      *   motion the core has counted; a stop here would strand it (to
      *   replay later) or lose it, and the shipper's end-of-stream logic
-     *   finishes as it always does. */
+     *   finishes as it always does.
+     * A stream fault (an underrun, a kernel fault, a refused run, a write
+     * error, a ring overflow) ended the run and alarmed the core. The reset
+     * is the operator's acknowledgment of the alarm: stop and re-arm the
+     * kernel, clear what the ring still holds once it is idle, and arm the
+     * producer again, so an unlock restores a controller that moves. The
+     * homing anchor stays invalid - the position is not trusted until a
+     * re-home - and the alarm path has locked the latch already.
+     * The sysfs writes happen after the lock is dropped: the shipper needs
+     * it every 10 ms. */
+    bool stop_kernel = false, acknowledged = false;
+
     pthread_mutex_lock(&gf.lock);
     if(gf.streaming) {
         gf.produced = gf.shipped;
@@ -1138,10 +1162,7 @@ void gf_stream_reset (void)
         gf.power_sent = false;
         dither_reset();
         if(gf.kernel_running) {
-            if(gf.active) {
-                gfio_wr_attr("cnc/stop", "1");
-                gfio_wr_attr("cnc/streaming", "0");
-            }
+            stop_kernel = gf.active;
             gf.kernel_running = false;
             gf.run_pending = false;
             gf.clear_pending = true;
@@ -1149,21 +1170,9 @@ void gf_stream_reset (void)
             gf.hold_poll_at = wall_s() + 0.2;
         }
     }
-    /* else: the completed stream's tail keeps shipping and draining. */
-
-    /* A stream fault (an underrun, a kernel fault, a refused run, a
-     * write error, a ring overflow) ended the run and alarmed the core.
-     * The reset is the operator's acknowledgment of the alarm: stop
-     * and re-arm the kernel, clear what the ring still holds once it
-     * is idle, and arm the producer again, so an unlock restores a
-     * controller that moves. The homing anchor stays invalid - the
-     * position is not trusted until a re-home - and the alarm path
-     * has locked the latch already. */
     if(gf.failed) {
-        if(gf.active) {
-            gfio_wr_attr("cnc/stop", "1");
-            gfio_wr_attr("cnc/streaming", "0");
-        }
+        stop_kernel = gf.active;
+        acknowledged = true;
         gf.failed = false;
         gf.kernel_running = false;
         gf.run_pending = false;
@@ -1176,9 +1185,15 @@ void gf_stream_reset (void)
         gf.want_fire = false;
         gf.power_sent = false;
         dither_reset();
-        rt_log("gfstream: fault acknowledged by the reset; the stream is armed again\n");
     }
     pthread_mutex_unlock(&gf.lock);
+
+    if(stop_kernel) {
+        gfio_wr_attr("cnc/stop", "1");
+        gfio_wr_attr("cnc/streaming", "0");
+    }
+    if(acknowledged)
+        rt_log("gfstream: fault acknowledged by the reset; the stream is armed again\n");
 }
 
 bool gf_stream_fault_take (void)
@@ -1453,7 +1468,15 @@ void gf_stream_shutdown (void)
 
     if(gf.active && !gf.suspended) {
         gfio_wr_attr("cnc/streaming", "0");
-        gfio_wr_attr("cnc/halt", "1");
+        /* A run still playing gets the ramp, never a halt: the halt is
+         * for a kernel that did not stop on its own. */
+        if(gf.kernel_running) {
+            gfio_wr_attr("cnc/stop", "1");
+            for(int i = 0; i < 100 && !gf_stream_kernel_idle(); i++)
+                sleep_ns(20 * 1000 * 1000L);
+        }
+        if(!gf_stream_kernel_idle())
+            gfio_wr_attr("cnc/halt", "1");
     }
     /* Under the broker this close is not the final close of the pulse
      * device, so the kernel's close-relock does not fire; relock

@@ -30,9 +30,6 @@
 #include <sys/time.h>
 #include "platform.h"
 
-#define MS_PER_SEC 1000000
-
-#define SIM_ECHO_TERMINAL 0 //use this to make grbl_sim act like a serial terminal with local echo on.
 
 // Saved STDIN state so it can be restored on exit. The terminal is switched to
 // raw mode (and STDIN made non-blocking) once at startup instead of on every
@@ -55,7 +52,6 @@ static void platform_restore_terminal(void)
     }
 }
 
-//any platform-specific setup that must be done before sim starts here
 void platform_init()
 {
     // Make STDIN non-blocking once so polling is a single read() with no
@@ -73,8 +69,7 @@ void platform_init()
     if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
         struct termios raw = orig_termios;
         raw.c_lflag &= ~(ICANON);
-        if (!SIM_ECHO_TERMINAL)
-            raw.c_lflag &= ~(ECHO);
+        raw.c_lflag &= ~(ECHO);
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
         termios_saved = 1;
     }
@@ -83,65 +78,6 @@ void platform_init()
     atexit(platform_restore_terminal);
 }
 
-//cleanup int here;
-void platform_terminate()
-{
-    platform_restore_terminal();
-}
-
-//returns a free-running 32 bit nanosecond counter which rolls over
-uint32_t platform_ns() 
-{
-    static uint32_t gTimeBase = 0;
-    static uint32_t timestamp;
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    timestamp = ts.tv_sec * (uint32_t)1e9 + ts.tv_nsec;
-    if (gTimeBase == 0)
-        gTimeBase = timestamp;
-
-    return timestamp - gTimeBase;
-}
-
-//sleep in microseconds
-void platform_sleep(long  microsec)
-{
-    struct timespec ts={0};
-
-    while (microsec >= MS_PER_SEC){
-        ts.tv_sec++;
-        microsec -= MS_PER_SEC;
-    }
-    ts.tv_nsec = microsec * 1000;
-    nanosleep(&ts, NULL);
-}
-
-plat_thread_t* platform_start_thread(plat_threadfunc_t threadfunc)
-{
-    plat_thread_t* th = malloc(sizeof(plat_thread_t));
-    if (pthread_create(&th->tid, NULL, threadfunc, &th->exit)){
-        free(th);
-        return NULL;
-    }
-    return th;
-}
-
-//ask thread to exit nicely, wait
-void platform_stop_thread(plat_thread_t* th)
-{
-    th->exit = 1;
-    pthread_join(th->tid, NULL);  
-}
-
-//force-kill thread
-void platform_kill_thread(plat_thread_t* th)
-{
-    th->exit = 1;
-    pthread_cancel(th->tid); 
-}
-
-//return char if one available.
 uint8_t platform_poll_stdin()
 {
     uint8_t char_in = 0;

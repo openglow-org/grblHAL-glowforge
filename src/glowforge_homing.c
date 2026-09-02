@@ -111,7 +111,11 @@ static bool pump (long timeout_us)
 static status_code_t gfcloud_home (sys_state_t entry_state)
 {
     char cmd[256];
-    if(cfg_read("gfcloud_home_cmd", cmd, sizeof(cmd)) != 0 || cmd[0] == '\0')
+    /* The command override is a host-test hook: a config file cannot
+     * choose what runs as root on the machine. */
+    const char *sink = getenv("GFSINK");
+    if((sink != NULL && *sink != '\0') ||
+       cfg_read("gfcloud_home_cmd", cmd, sizeof(cmd)) != 0 || cmd[0] == '\0')
         strcpy(cmd, CMD_DEFAULT);
 
     uint32_t timeout_ms =
@@ -255,8 +259,15 @@ static status_code_t home_cmd (sys_state_t state, char *args)
 
     char mode[24] = "";
     cfg_read("homing_mode", mode, sizeof(mode));
+    if(!strcmp(mode, "switches")) {
+        /* No limit switch backend exists: the core's cycle would drive
+         * the gantry into the frame for the full search distance against
+         * signals that never assert. */
+        report_message("homing_mode = switches: no limit switches on this machine yet", Message_Warning);
+        return Status_SettingDisabled;
+    }
     if(strcmp(mode, "gfcloud"))
-        return Status_Unhandled;   /* switches/none: core $H semantics */
+        return Status_Unhandled;   /* none (or unset): core $H semantics, disabled */
 
     if(!(state == STATE_IDLE || state == STATE_ALARM))
         return Status_IdleError;

@@ -18,10 +18,13 @@
 
   SPDX-License-Identifier: GPL-3.0-or-later
 */
+
+#pragma once
 #include <stdint.h>
 #include <stdbool.h>
 
 void eeprom_close (void);
+void eeprom_sync (void);
 bool set_eeprom_name (const char *name);
 uint8_t eeprom_get_char (uint32_t addr );
 void eeprom_put_char (uint32_t addr, uint8_t new_value );

@@ -27,7 +27,7 @@
        real-time traffic like the homing session does - until the
        operator presses the physical button (EV_SW bit 2 on the input
        device), a soft reset aborts, the lid or the interlock loop
-       opens (the job is cancelled: relock, alarm), or the timeout
+       opens (the job is canceled: relock, alarm), or the timeout
        expires. A press with the lid open does not arm - the hardware
        button latch would not clear on it either.
 
@@ -200,6 +200,7 @@ static _Atomic bool arming = false;         /* blocked in the button wait */
 static bool rearm_pending;                  /* a held job's resume waits for the press */
 static double rearm_deadline;
 static double disarmed_at;          /* margin for the sample-window lag */
+static bool rearm_released;         /* the button came up since the re-arm began */
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
 static spindle_ptrs_t *hal_spindle;         /* the registered spindle's table entry */
@@ -308,7 +309,7 @@ void gflaser_disarm (void)
  * the commanded light fraction through the measured points' inverse
  * onto the density that delivers it. Points are density:light percent
  * pairs, strictly increasing in both, measured by the head thermopile
- * and judged on material (2026-08-30). */
+ *. */
 #define CURVE_KEY "laser_dose_curve"
 #define GAMMA_KEY "laser_corner_gamma"
 #define GAMMA_DEFAULT 2.0f
@@ -347,7 +348,7 @@ static bool curve_parse (const char *text, dose_curve_t *out)
         if(end == p)
             return false;
         p = *end == ',' ? end + 1 : end;
-        if(!(d >= 0.0f && d <= 100.0f && l >= 0.0f && l <= 100.0f))
+        if(!(d >= 0.0f && d <= 100.0f && l >= 0.0f && l <= 100.0f) || (c.n == 0 && l <= 0.0f))
             return false;
         if(c.n && !(d > c.density[c.n - 1] && l > c.light[c.n - 1]))
             return false;
@@ -612,25 +613,35 @@ static bool gflaser_arm (void)
          * (the factory does the same; the hardware button latch sets on
          * the lid and would ignore a press anyway). */
         bool pressed = false, aborted = false;
+        unsigned sender_gen = serial_client_generation();
         arming = true;
         while(!pressed && !aborted) {
+            /* The consent belongs to the sender that asked for it: a
+             * sender change during the wait ends the arm, so a press
+             * never lands on another session's lines. */
+            if(serial_client_generation() != sender_gen) {
+                report_message("sender changed during arm - job canceled", Message_Warning);
+                system_raise_alarm(Alarm_AbortCycle);
+                aborted = true;
+                break;
+            }
             switch(arm_switches()) {
                 case Arm_Pressed:
                     pressed = true;
                     gfsw_button_consumed();   /* not a pause press */
                     break;
-                /* Lid or loop open: the job is cancelled the way a mid-job
+                /* Lid or loop open: the job is canceled the way a mid-job
                  * open cancels it - a soft reset from a standstill (the
                  * position is kept, no alarm), so the sender's stream ends
                  * on the banner and nothing needs unlocking afterward. The
                  * reset lands in the pump below, which then returns false. */
                 case Arm_LidOpen:
-                    report_message("lid opened during arm - job cancelled", Message_Warning);
+                    report_message("lid opened during arm - job canceled", Message_Warning);
                     protocol_enqueue_realtime_command(CMD_RESET);
                     aborted = !pump(50000);
                     break;
                 case Arm_InterlockOpen:
-                    report_message("interlock open during arm - job cancelled", Message_Warning);
+                    report_message("interlock open during arm - job canceled", Message_Warning);
                     protocol_enqueue_realtime_command(CMD_RESET);
                     aborted = !pump(50000);
                     break;
@@ -703,6 +714,7 @@ bool gflaser_resume_gate (void)
         timeout_s = BUTTON_TIMEOUT_S_DEFAULT;
     rearm_deadline = wall_s() + (double)timeout_s;
     rearm_pending = true;
+    rearm_released = false;             /* the press that asked for this must end first */
     arming = true;
     button_led(255);
     report_message("press the button to resume the laser job", Message_Info);
@@ -722,6 +734,8 @@ static void rearm_poll (void)
 
     switch(arm_switches()) {
         case Arm_Pressed:
+            if(!rearm_released)
+                break;                  /* still the press that started the re-arm */
             gfsw_button_consumed();     /* not a pause toggle */
             rearm_end(arm_complete());
             if(laser_ok)
@@ -732,8 +746,11 @@ static void rearm_poll (void)
             /* The lid policy takes the held job from here (a cancel, or
              * the stock door hold); the wait ends without consent. */
             rearm_end(false);
-            report_message("lid or interlock open - the resume is cancelled", Message_Warning);
+            report_message("lid or interlock open - the resume is canceled", Message_Warning);
             break;
+        case Arm_Waiting:
+            rearm_released = true;      /* the button is up: the next press counts */
+            /* fall through */
         default:
             if(wall_s() > rearm_deadline) {
                 rearm_end(false);
@@ -835,6 +852,8 @@ static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
      * velocity ratio in this spindle's param. */
     if(spindle->param != NULL)
         rate_param = spindle->param;
+    if(spindle_pwm.compute_value == NULL)
+        return spindle_pwm.off_value;
     return spindle_pwm.compute_value(&spindle_pwm, rpm, false);
 }
 

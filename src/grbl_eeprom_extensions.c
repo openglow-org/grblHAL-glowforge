@@ -1,6 +1,6 @@
 /*
   grbl_eeprom_extensions.c -
-  Grbl adds 2 functions to the orignal avr eeprom library.
+  Grbl adds 2 functions to the original avr eeprom library.
   They need to be reproduced here because we need to completely override the
   original eeprom interface.
 
@@ -21,7 +21,7 @@
 */
 
 // Extensions added as part of Grbl
-// KEEP IN SYNC WITH ../eeprom.c
+// KEEP IN SYNC WITH eeprom.c
 //
 // grblHAL-glowforge: block writes store a physical checksum and reads
 // verify it over the copied data. An EEPROM file whose blocks carry no
@@ -48,6 +48,10 @@ bool memcpy_to_eeprom(uint32_t destination, uint8_t *source, uint32_t size, bool
         eeprom_put_char(dest, checksum >> 8);
 #endif
     }
+
+    /* One sync per block write: a power loss right after a settings
+     * change must not leave a torn block on the flash. */
+    eeprom_sync();
 
     return true;
 }

@@ -72,6 +72,10 @@ void serial_set_listen_fd (int fd)
     listen_fd = fd;
 }
 
+static void serialRxFlush (void);
+
+/* A displaced or dropped sender takes its partial line with it: the next
+ * sender's first line must never be glued to a fragment of the last. */
 static void drop_client (void)
 {
     if(client_fd >= 0) {
@@ -79,6 +83,7 @@ static void drop_client (void)
         client_fd = -1;
         client_peer[0] = '\0';
         client_generation++;
+        serialRxFlush();
     }
 }
 

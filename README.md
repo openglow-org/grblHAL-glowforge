@@ -3,31 +3,33 @@
 A [grblHAL](https://github.com/grblHAL) driver for the **stock Glowforge
 (Basic/Plus/Pro) control board**: the factory NXP i.MX6 SOM running Linux.
 Part of the **ForgeFIRM** project, which replaces the cloud-dependent
-factory firmware with an open, locally-controlled image — no hardware
+factory firmware with an open, locally-controlled image, with no hardware
 modification.
 
 The unmodified grblHAL core (git submodule at `src/grbl`) runs as a Linux
 userspace process. Steps are not fired from a GPIO ISR: the driver streams
 **pulse bytes** (one byte per machine tick) into the factory kernel module's
 SDMA + EPIT playback engine (`glowforge.ko`, `/dev/glowforge`), the same
-jitter-free hardware step generator the factory firmware used — but fed
-live from grblHAL's planner instead of a cloud-generated file.
+jitter-free hardware step generator the factory firmware used, fed live
+from grblHAL's planner instead of a cloud-generated file.
 
 ## Architecture
 
-- **grbl protocol thread** — parser/planner/protocol loop; Grbl 1.1
+- **grbl protocol thread**: parser/planner/protocol loop; Grbl 1.1
   protocol over raw TCP (`-p 23`, LightBurn/UGS/cncjs-compatible) or stdio.
-- **stepper producer thread** — replaces a hardware step timer: runs the
-  core's stepper interrupt callback against a virtual step clock
-  (1000 × machine tick), wall-clock paced, and maps each step event onto
-  the pulse-byte grid.
-- **shipper thread** (`SCHED_FIFO`) — writes due bytes to `/dev/glowforge`
+- **stepper producer thread** (`SCHED_FIFO`): replaces a hardware step
+  timer: runs the core's stepper interrupt callback against a virtual step
+  clock (1000 x machine tick), wall-clock paced, and maps each step event
+  onto the pulse-byte grid.
+- **shipper thread** (`SCHED_FIFO`): writes due bytes to `/dev/glowforge`
   with a bounded queue (default 200 ms = feed-hold latency), and owns the
   kernel run/stop/streaming/underrun state machine plus the factory's PIC
   run/hold stepper-current scheme.
+- **cooling reporter thread**: reports the job state to the forgectrl
+  cooling engine at 1 Hz.
 
 Machine constants (steps/mm, max rates, accelerations) are measured from
-the factory machine and its pulse streams — see `src/boards/glowforge.h`
+the factory machine and its pulse streams - see `src/boards/glowforge.h`
 for sources.
 
 **Laser control** (`src/glowforge_laser.c`): grblHAL laser mode (M3/M4,
@@ -39,9 +41,12 @@ laser blocks, and an armed underrun fails safe. The hardware safety
 AND-chain remains authoritative regardless.
 
 **Safety inputs** (`src/glowforge_switches.c`): the lid switches and the
-remote-interlock loop drive the core's safety-door signal, so opening the
-lid mid-job parks it in the door state and closing it resumes — matching
-what the hardware chain does to the beam. The `hv_enable` bit is the
+remote-interlock loop drive the core's safety-door signal. By default
+(`lid_policy = cancel`) opening the lid mid-job cancels it: a controlled
+stop, the head back at the job's start, the laser latch relocked. With
+`lid_policy = hold` the job parks in the door state and closing the lid
+resumes it after a button press, the way the hardware chain treats the
+beam. The `hv_enable` bit is the
 readback of the board's HV_ENABLE output (high only while a run feeds the
 charge-pump watchdog with the lid closed); it is telemetry and gates
 nothing.
@@ -55,7 +60,7 @@ contract is [the cooling engine](https://docs.forgefirm.org/technical/forgefirm/
 
 Under the ForgeFIRM image the driver runs as a **supervised child of
 forgectrl** and receives `/dev/glowforge` as a broker-inherited fd
-(`GF_PULSE_FD`) — handovers such as the `$H` homing session then never
+(`GF_PULSE_FD`) - handovers such as the `$H` homing session then never
 close the device or cycle the 40 V motor rail. Standalone (no
 `GF_PULSE_FD`), it opens the device itself and every takeover runs a
 deliberate rail-off settle (`rail_settle_s`).
@@ -76,10 +81,16 @@ GFSINK=/dev/glowforge grblHAL_glowforge -p 23 -e /data/EEPROM.DAT
 ```
 
 Environment: `GFSINK` (pulse device; unset = null-sink test mode),
-`GFSINK_RATE` (machine tick, default 28160 Hz — the factory's own
-travel-move tick; accepted 1000–165000), `GFSINK_DEPTH_MS` (queue depth,
+`GFSINK_RATE` (machine tick, default 28160 Hz, the factory's own
+travel-move tick; accepted 1000-165000), `GFSINK_DEPTH_MS` (queue depth,
 default 200; at least 20 and no more than half the stream ring at the
-chosen rate). An out-of-range value is reported and the default is used.
+chosen rate), `GF_PULSE_FD` (an inherited pulse-device fd, set by the
+forgectrl broker), `FORGECTRL_PORT` (the cooling engine's HTTP port). An
+out-of-range value is reported and the default is used. Test hooks for the
+host harnesses: `GFSINK_LEAD_MS`, `GF_SWITCH_FILE`, `GF_VERDICT_FILE`,
+`GF_STATE_DIR`, and the config keys `laser_power_model`,
+`laser_floor_analog` and `gfcloud_home_cmd` (the last honored only without
+`GFSINK`).
 
 ## Lineage & license
 

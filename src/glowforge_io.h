@@ -35,7 +35,7 @@ int gfio_open_pulse_dev_nb (const char *path);
 bool gfio_pulse_inherited (void);
 
 // Factory analog machine config (print-header ground truth): x8 XY
-// microstepping, slow-decay mode, Z locked in the pulse stream, laser
+// microstepping, mixed-decay mode (decay mode 1), Z locked in the pulse stream, laser
 // latched out, PIC hold currents. The kernel does not restore any of
 // this after a module reload.
 void gfio_analog_config (void);

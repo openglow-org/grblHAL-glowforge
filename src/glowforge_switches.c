@@ -129,8 +129,8 @@ static bool button_prev;                   /* button level at the previous poll 
 /* The cancel policy's state (see the file header). */
 static enum {
     Cancel_None = 0,       /* nothing pending */
-    Cancel_WaitDrain,      /* job cancelled; the kernel drains the hold tail, then reset */
-    Cancel_ResetSent,      /* job cancelled, soft reset queued; wait for Idle */
+    Cancel_WaitDrain,      /* job canceled; the kernel drains the hold tail, then reset */
+    Cancel_ResetSent,      /* job canceled, soft reset queued; wait for Idle */
     Cancel_ParkQueued      /* return-to-start motion enqueued; wait for it to end */
 } cancel_state = Cancel_None;
 static bool door_hidden;                   /* hide the door through reset + park */
@@ -217,7 +217,7 @@ static control_signals_t visible (control_signals_t now)
 }
 
 /* Job start = the machine position at the Idle -> Cycle transition that
-   begins a job (not a jog, not the park itself): where a cancelled job's
+   begins a job (not a jog, not the park itself): where a canceled job's
    head returns to, as the factory returns to its job origin.
 
    A job is under way from that transition until the core is Idle with
@@ -328,7 +328,7 @@ static void cancel_job (void)
     const char *why = gfsw_bit_set(raw, SW_BIT_INTERLOCK) && gfsw_bit_set(raw, SW_BIT_DOORS)
                        ? "interlock open" : "lid opened";
     char msg[96];
-    snprintf(msg, sizeof(msg), "%s - job cancelled%s", why,
+    snprintf(msg, sizeof(msg), "%s - job canceled%s", why,
              have_job_start ? ", returning to the job start" : "");
     report_message(msg, Message_Warning);
     fflog(LOG_NOTICE, "gfswitch: %s", msg);
@@ -348,7 +348,7 @@ static bool kernel_idle (void)
 {
     char state[16] = "";
     if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
-        return true;
+        return false;                   /* unreadable: not idle; the 2 s bound ends the wait */
     return strcmp(state, "idle") == 0;
 }
 

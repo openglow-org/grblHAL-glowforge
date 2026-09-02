@@ -145,6 +145,33 @@ static void publish_settings (void)
  * timestamp so the reader's age stays meaningful. */
 static void publish_state (bool force)
 {
+    /* The render costs a modal report and a JSON body; it runs only when
+     * something cheap to read has changed, or the heartbeat is due. */
+    static struct {
+        sys_state_t state;
+        uint8_t alarm;
+        bool connected, armed, arming;
+        unsigned generation;
+        int feed, rapid;
+    } seen;
+    sys_state_t st_now = state_get();
+    bool changed = force || st_now != seen.state || (uint8_t)sys.alarm != seen.alarm ||
+                   serial_client_connected() != seen.connected ||
+                   serial_client_generation() != seen.generation ||
+                   gflaser_armed() != seen.armed || gflaser_arming() != seen.arming ||
+                   (int)sys.override.feed_rate != seen.feed ||
+                   (int)sys.override.rapid_rate != seen.rapid;
+    if(!changed && mono_s() < next_heartbeat)
+        return;
+    seen.state = st_now;
+    seen.alarm = (uint8_t)sys.alarm;
+    seen.connected = serial_client_connected();
+    seen.generation = serial_client_generation();
+    seen.armed = gflaser_armed();
+    seen.arming = gflaser_arming();
+    seen.feed = (int)sys.override.feed_rate;
+    seen.rapid = (int)sys.override.rapid_rate;
+
     char modals[256] = "";
     cap_len = 0;
     cap_buf[0] = '\0';

@@ -39,6 +39,15 @@ string(REGEX REPLACE "-f[a-z-]*prefix-map=[^ ]*" "" DRV_C_FLAGS "${DRV_C_FLAGS}"
 string(REGEX REPLACE "--sysroot=[^ ]*" "" DRV_C_FLAGS "${DRV_C_FLAGS}")
 string(REGEX REPLACE "  +" " " DRV_C_FLAGS "${DRV_C_FLAGS}")
 string(STRIP "${DRV_C_FLAGS}" DRV_C_FLAGS)
+# The driver version $I reports: the describing git tag or commit of the
+# source, "unknown" outside a checkout.
+execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_LIST_DIR} describe --always --dirty --tags
+    OUTPUT_VARIABLE DRV_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET RESULT_VARIABLE _drv_git_rc)
+if(NOT _drv_git_rc EQUAL 0 OR "${DRV_VERSION}" STREQUAL "")
+    set(DRV_VERSION "unknown")
+endif()
 configure_file(
     ${CMAKE_CURRENT_LIST_DIR}/src/build_info.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.h
