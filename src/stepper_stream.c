@@ -1150,6 +1150,34 @@ void gf_stream_reset (void)
         }
     }
     /* else: the completed stream's tail keeps shipping and draining. */
+
+    /* A stream fault (an underrun, a kernel fault, a refused run, a
+     * write error, a ring overflow) ended the run and alarmed the core.
+     * The reset is the operator's acknowledgment of the alarm: stop
+     * and re-arm the kernel, clear what the ring still holds once it
+     * is idle, and arm the producer again, so an unlock restores a
+     * controller that moves. The homing anchor stays invalid - the
+     * position is not trusted until a re-home - and the alarm path
+     * has locked the latch already. */
+    if(gf.failed) {
+        if(gf.active) {
+            gfio_wr_attr("cnc/stop", "1");
+            gfio_wr_attr("cnc/streaming", "0");
+        }
+        gf.failed = false;
+        gf.kernel_running = false;
+        gf.run_pending = false;
+        gf.clear_pending = true;
+        gf.hold_pending = false;
+        gf.produced = gf.shipped;
+        gf.streaming = false;
+        gf.lev_head = gf.lev_tail;
+        gf.cur_fire = false;
+        gf.want_fire = false;
+        gf.power_sent = false;
+        dither_reset();
+        rt_log("gfstream: fault acknowledged by the reset; the stream is armed again\n");
+    }
     pthread_mutex_unlock(&gf.lock);
 }
 
