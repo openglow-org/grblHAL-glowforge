@@ -10,7 +10,7 @@
   forgefirm/docs/BRINGUP.md (hardware facts bank), and the factory pulse
   streams analyzed with forgefirm/scripts/bench/puls_profile.py:
   - XY: 0.15 mm per full step at x8 microstepping -> 53.333 usteps/mm.
-  - Z: 0.3534 mm per half-step -> 2.832 half-steps/mm, ~10.6 mm travel.
+  - Z: 0.70612 mm per full step, driven in half-steps (0.3531 mm) -> 2.832 half-steps/mm, ~10.6 mm travel.
   - Travel moves peak 202 mm/s vector with ~700 mm/s2 ramps on v2.6.0
     factory firmware (header HAxr=132/HAyr=112/HAar=133 at ~5.3 mm/s2 per
     unit; the 2018 firmware ramped at ~1000, so 700/590 is conservative).
