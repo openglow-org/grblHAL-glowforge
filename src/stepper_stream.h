@@ -63,6 +63,7 @@ void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks);
 // run resets the hardware PWM duty, so replaying queued fire bits would
 // fire at ~full power.
 void gf_stream_laser_arm (bool armed);
+void gf_stream_jog (bool jog);
 
 // Serialized cnc/laser_latch write (lock = 1 locks the latch). Every
 // latch write in the process goes through here so the shipper's

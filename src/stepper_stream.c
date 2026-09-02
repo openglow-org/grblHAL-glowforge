@@ -231,6 +231,7 @@ static struct {
      * ride, so the next run re-asserts it at its first byte. */
     uint8_t want_power;
     bool want_fire;
+    bool jogging;               /* the core is in STATE_JOG: fire masked */
 
     /* Producer state: vticks/period written only under the core lock. */
     uint64_t vticks;          /* virtual step-clock time since wakeup epoch */
@@ -518,13 +519,31 @@ void gf_stream_laser (uint8_t power, bool fire)
     pthread_mutex_lock(&gf.lock);
     gf.want_power = power;
     gf.want_fire = fire;
-    laser_event_locked(power, fire);
+    laser_event_locked(power, fire && !gf.jogging);
     pthread_mutex_unlock(&gf.lock);
 }
 
 void gf_stream_laser_arm (bool state)
 {
     laser_armed = state;
+}
+
+/* The core is jogging, or has stopped. A jog block carries the modal
+ * spindle, so its ticks would fire at the S in force: the mask holds
+ * fire off from the transition into STATE_JOG (queued at the current
+ * virtual time, ahead of the jog's own ticks) until the transition out,
+ * where the core's wanted state is re-asserted for whatever follows.
+ * The wanted state itself is left alone: the jog changes nothing about
+ * what the next cut lights with. */
+void gf_stream_jog (bool jog)
+{
+    if(gf.failed)
+        return;
+
+    pthread_mutex_lock(&gf.lock);
+    gf.jogging = jog;
+    laser_event_locked(gf.want_power, gf.want_fire && laser_armed && !jog);
+    pthread_mutex_unlock(&gf.lock);
 }
 
 void gf_stream_wakeup (void)
@@ -584,7 +603,7 @@ void gf_stream_wakeup (void)
          * the gap cannot be resurrected here; the leading power byte
          * still precedes it, because the shipper drains events before
          * emitting the tick. */
-        bool want_fire = gf.want_fire && laser_armed;
+        bool want_fire = gf.want_fire && laser_armed && !gf.jogging;
         if(gf.want_power != gf.cur_power || want_fire != gf.cur_fire) {
             if(gf.lev_tail - gf.lev_head < LEV_N) {
                 gf.lev[gf.lev_tail & LEV_MASK] = (struct laser_ev){

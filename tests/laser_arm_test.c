@@ -90,6 +90,7 @@ bool gfsw_read_raw(uint8_t *sw)
 void gfcool_laser_armed(bool armed) { (void)armed; }
 void gf_stream_laser(unsigned char power, bool fire) { (void)power; (void)fire; }
 void gf_stream_laser_arm(bool armed) { stream_armed = armed; }
+void gf_stream_jog(bool jog) { (void)jog; }   /* the jog mask lives in the stream */
 void gf_stream_laser_latch(bool lock) { latch_locked_last = lock; }
 int  gfio_rd_attr(const char *a, char *b, size_t l)
 { (void)a; if (l) b[0] = '\0'; return -1; }
@@ -132,6 +133,7 @@ settings_t settings;
 grbl_t grbl;
 parser_state_t gc_state;
 static spindle_ptrs_t test_spindle;
+static spindle_param_t test_param;      /* the active spindle's param: the segment's velocity ratio */
 
 void report_message(const char *msg, message_type_t type)
 {
@@ -177,7 +179,9 @@ static void reset_state(void)
     conf_curve_val = NULL;
     conf_gamma = -1.0f;
     conf_floor_analog = conf_floor_density = -1.0f;
-    prog_rpm_set(0.0f);
+    memset(&test_param, 0, sizeof(test_param));
+    test_param.rate_ratio = 1.0f;
+    rate_param = &test_param;
     precomputed_min = -1.0f;
     precompute_calls = 0;
     settings_stores = 0;
@@ -416,8 +420,9 @@ int main(void)
     printf("the corner rolloff exponent:\n");
 
     /* Case R - with the default gamma of 2, a velocity-scaled command
-       (rpm below the programmed S in param->rpm) delivers light bent by
-       the ratio, while the programmed command itself is untouched. */
+       (the core hands over rpm scaled by the segment's velocity ratio and
+       records that ratio in the spindle's param) delivers light bent by
+       the ratio, while a command at ratio 1 is untouched. */
     reset_state();
     script(true, true, 2);
     CHECK(gflaser_arm(), "arms with the default gamma");
@@ -429,28 +434,34 @@ int main(void)
         pd.max_value = 127;
         test_spindle.rpm_min = 0.0f;
         test_spindle.rpm_max = 1000.0f;
-        prog_rpm_set(1000.0f);          /* programmed S1000 */
+        test_param.rate_ratio = 1.0f;   /* programmed S1000 at full speed */
         uint_fast16_t at_speed = curveComputeValue(&pd, 1000.0f, false);
+        test_param.rate_ratio = 0.5f;   /* the same S at half speed */
         uint_fast16_t corner = curveComputeValue(&pd, 500.0f, false);
         /* Half speed at gamma 2: light = 0.5 * 0.5 = 0.25 -> density
            through the curve between 45 and 60 percent (~61 counts). */
         CHECK(at_speed == 127, "full speed delivers the programmed light");
         CHECK(corner >= 56 && corner <= 66,
               "half speed at gamma 2 delivers a quarter of the light");
-        prog_rpm_set(500.0f);           /* programmed S500: no scaling */
+        test_param.rate_ratio = 1.0f;   /* programmed S500, full speed: no scaling */
         uint_fast16_t prog = curveComputeValue(&pd, 500.0f, false);
         CHECK(prog >= 97 && prog <= 105,
-              "the same rpm as the programmed S is untouched (ratio 1)");
+              "the same rpm at ratio 1 is untouched");
+        /* The parser's newest S is nowhere in this: a queued S1000 line
+           changes nothing about the S500 block's segments. */
+        test_param.rate_ratio = 1.0f;
+        CHECK(curveComputeValue(&pd, 500.0f, false) == prog,
+              "the ratio is the segment's own, not the newest S over the block's");
         conf_gamma = 1.0f;
         gamma_load();
-        prog_rpm_set(1000.0f);
+        test_param.rate_ratio = 0.5f;
         uint_fast16_t plain = curveComputeValue(&pd, 500.0f, false);
         CHECK(plain >= 97 && plain <= 105,
               "gamma 1 is plain proportionality (half speed = half light)");
         conf_gamma = 9.0f;              /* out of range: the default */
         gamma_load();
         CHECK(corner_gamma == 2.0f, "an out-of-range gamma falls back to 2");
-        prog_rpm_set(0.0f);
+        test_param.rate_ratio = 1.0f;
     }
 
     printf(failures ? "FAIL: %d check(s) failed\n"

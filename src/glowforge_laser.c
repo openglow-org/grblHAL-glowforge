@@ -8,9 +8,11 @@
   exactly 127), and fire rides the per-tick FIRE bit. Power lands via
   the core's per-segment spindle update, which the stepper producer runs
   at exact virtual-tick positions - so the laser only ever fires inside
-  motion segments of laser blocks. Jogs, G0 and homing are fire-free by
-  construction, and the kernel's end-of-data backstop forces the lines
-  low whenever a stream ends.
+  motion segments of laser blocks. G0 and homing are fire-free by
+  construction; a jog carries the modal spindle in Grbl, so the stream
+  masks fire for as long as the core is jogging (gf_stream_jog). The
+  kernel's end-of-data backstop forces the lines low whenever a stream
+  ends.
 
   ARMING - the operator stays in the loop. FIRE reaches the tube only
   through the hardware AND chain (lid switches, interlock, HV OK, the
@@ -201,32 +203,23 @@ static double disarmed_at;          /* margin for the sample-window lag */
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
 static spindle_ptrs_t *hal_spindle;         /* the registered spindle's table entry */
-static _Atomic uint32_t prog_rpm_bits;      /* the programmed rpm, recorded at every
-                                             * synced set_state (already override-
-                                             * scaled, like the per-segment value):
-                                             * in laser mode the core keeps no
-                                             * programmed speed anywhere the driver
-                                             * can reach at compute time. */
 static dose_model_t cur_model = Model_Density;   /* the model last applied */
+static on_state_change_ptr on_state_change;
+static bool jogging;                        /* the core is in STATE_JOG */
+static spindle_param_t *rate_param;         /* the active spindle's param, as the
+                                             * core hands it to get_pwm and
+                                             * set_state; the config callback sees
+                                             * the registration entry, which has
+                                             * none */
 
-/* Producer-thread fire suppression, reported from the protocol thread. */
+/* Producer-thread fire suppression, reported from the protocol thread
+ * once per episode: a segment sets the note, the poll reports the first
+ * of a run of them and stays quiet until the run has been over for a
+ * second. */
 enum { Suppress_None = 0, Suppress_Unarmed, Suppress_Coolant };
 static _Atomic int suppressed = Suppress_None;
-
-static void prog_rpm_set (float rpm)
-{
-    uint32_t b;
-    memcpy(&b, &rpm, sizeof(b));
-    atomic_store(&prog_rpm_bits, b);
-}
-
-static float prog_rpm_get (void)
-{
-    uint32_t b = atomic_load(&prog_rpm_bits);
-    float rpm;
-    memcpy(&rpm, &b, sizeof(rpm));
-    return rpm;
-}
+static int suppress_shown = Suppress_None;
+static double suppress_last;
 
 static double wall_s (void)
 {
@@ -436,24 +429,18 @@ static uint_fast16_t curveComputeValue (spindle_pwm_t *pwm_data, float rpm, bool
                       (hal_spindle->rpm_max - hal_spindle->rpm_min);
         if(light > 1.0f)
             light = 1.0f;
-        /* Corner rolloff: rpm arrives velocity-scaled under M4; the
-         * programmed speed is the one this driver recorded at the last
-         * synced set_state (in laser mode the core keeps it nowhere the
-         * compute path can reach). Bending the ratio by gamma - 1 makes
-         * the delivered light follow ratio^gamma: proportional at 1,
-         * corner-starved above it. The synchronous path passes the
-         * programmed rpm itself (ratio 1), so only real velocity
-         * scaling is shaped; an S change buried deep in a full planner
-         * queue reaches the recording one sync late, which a raster
-         * never sees (its velocity is constant where it fires). */
-        if(corner_gamma != 1.0f) {
-            float prog = prog_rpm_get();
-            if(prog > hal_spindle->rpm_max)
-                prog = hal_spindle->rpm_max;
-            if(prog > 0.0f && rpm < prog) {
-                float ratio = rpm / prog;
+        /* Corner rolloff: under M4 the core hands over rpm scaled by the
+         * segment's velocity ratio (actual over programmed speed) and
+         * records that ratio in the spindle's param as it prepares the
+         * segment - the block's own, whatever S the parser has reached
+         * since, and free of the override the rpm already carries. The
+         * synchronous path prepares no segment and reads 1. Bending the
+         * ratio by gamma - 1 makes the delivered light follow
+         * ratio^gamma: proportional at 1, corner-starved above it. */
+        if(corner_gamma != 1.0f && rate_param != NULL) {
+            float ratio = rate_param->rate_ratio;
+            if(ratio > 0.0f && ratio < 1.0f)
                 light *= powf(ratio, corner_gamma - 1.0f);
-            }
         }
         uint_fast16_t v = (uint_fast16_t)(curve_apply(light) * (float)PWM_PERIOD + 0.5f);
         if(v > pwm_data->max_value)
@@ -798,15 +785,6 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
      * the spindle off (a sender change mid-job, a job whose M5 never
      * arrived) must prompt again at the next laser-on, or the job runs
      * with no press, no run report and no airflow. */
-    /* In laser mode the core turns the spindle on at rpm 0 and the
-     * programmed S never reaches this call; the poll below mirrors the
-     * parser's programmed speed instead. Record what arrives anyway so
-     * a non-zero synchronous change is never lost. */
-    if(state.on && rpm > 0.0f)
-        prog_rpm_set(rpm);
-    else if(!state.on)
-        prog_rpm_set(0.0f);
-
     if(state.on && !laser_ok) {
         if(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR)) {
             /* A spindle restore inside a held state, against a closed
@@ -835,8 +813,13 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
      * of every run: what is pushed here is what the next run lights with,
      * and nothing older may be. */
     uint_fast16_t pwm = spindle_pwm.off_value;
-    if(state.on && spindle_pwm.compute_value)
+    if(state.on && spindle_pwm.compute_value) {
+        if(spindle->param != NULL) {
+            spindle->param->rate_ratio = 1.0f;      /* no segment: the programmed speed itself */
+            rate_param = spindle->param;
+        }
         pwm = spindle_pwm.compute_value(&spindle_pwm, rpm, false);
+    }
     spindleUpdatePWM(spindle, pwm);
 }
 
@@ -848,7 +831,10 @@ static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
 
 static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
 {
-    (void)spindle;
+    /* The per-segment path: the core has just recorded the segment's
+     * velocity ratio in this spindle's param. */
+    if(spindle->param != NULL)
+        rate_param = spindle->param;
     return spindle_pwm.compute_value(&spindle_pwm, rpm, false);
 }
 
@@ -878,26 +864,19 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
 
 void gflaser_poll (void)
 {
-    /* The programmed S for the corner rolloff: mirrored from the parser
-     * state on the protocol thread every pass (atomic bits, so the
-     * producer's compute reads it torn-free). Exact for a job cutting
-     * at one S; an S change buried deep in a full planner queue reaches
-     * the mirror early by the lookahead, which shapes at most the
-     * boundary segments of the previous block - and never a raster,
-     * whose velocity is constant wherever it fires. */
     {
-        spindle_state_t st_now = { .value = atomic_load(&cur_state_value) };
-        if(st_now.on) {
-            float g = gc_state.modal.spindle[0].rpm;
-            if(g > 0.0f)
-                prog_rpm_set(g);
-        }
+        int note = atomic_exchange(&suppressed, Suppress_None);
+        double t = wall_s();
+        if(note != Suppress_None) {
+            if(note != suppress_shown)
+                report_message(note == Suppress_Coolant
+                                ? "laser fire suppressed: coolant flow fault or over-temperature"
+                                : "laser fire suppressed: laser not armed", Message_Warning);
+            suppress_shown = note;
+            suppress_last = t;
+        } else if(suppress_shown != Suppress_None && t - suppress_last > 1.0)
+            suppress_shown = Suppress_None;          /* the episode is over */
     }
-    int note = atomic_exchange(&suppressed, Suppress_None);
-    if(note != Suppress_None)
-        report_message(note == Suppress_Coolant
-                        ? "laser fire suppressed: coolant flow fault or over-temperature"
-                        : "laser fire suppressed: laser not armed", Message_Warning);
 
     /* Emission witness (~1 Hz): laser_on_sampled counts the last ~1 s
      * window's emitting samples on the gated output of the hardware
@@ -970,9 +949,12 @@ void gflaser_poll (void)
     }
 
     double now = wall_s();
-    if(disarm_at == 0.0)
-        disarm_at = now + (double)gfio_conf_read_float("laser_disarm_s", DISARM_S_DEFAULT);
-    else if(now >= disarm_at) {
+    if(disarm_at == 0.0) {
+        float grace_s = gfio_conf_read_float("laser_disarm_s", DISARM_S_DEFAULT);
+        if(!(grace_s >= 1.0f && grace_s <= 3600.0f))
+            grace_s = DISARM_S_DEFAULT;             /* nan, inf, nonsense: the default */
+        disarm_at = now + (double)grace_s;
+    } else if(now >= disarm_at) {
         /* Never relock while the kernel still plays a queue tail - a
          * severed FIRE there would truncate the job's last bytes. The
          * grace makes this unreachable in practice; check anyway. */
@@ -998,6 +980,21 @@ static void onProgramCompleted (program_flow_t program_flow, bool check_mode)
         on_program_completed(program_flow, check_mode);
 }
 
+/* A jog carries the modal spindle in Grbl (the core copies it into the
+ * jog block and never disables the laser for it), so the stream masks
+ * fire for as long as the core is jogging: the mask follows the state
+ * transitions, which bracket the jog's own blocks in the stream. */
+static void onStateChange (sys_state_t state)
+{
+    bool jog = state == STATE_JOG;
+    if(jog != jogging) {
+        jogging = jog;
+        gf_stream_jog(jog);
+    }
+    if(on_state_change)
+        on_state_change(state);
+}
+
 void gflaser_init (void)
 {
     const char *dev = getenv("GFSINK");
@@ -1005,6 +1002,8 @@ void gflaser_init (void)
 
     on_program_completed = grbl.on_program_completed;
     grbl.on_program_completed = onProgramCompleted;
+    on_state_change = grbl.on_state_change;
+    grbl.on_state_change = onStateChange;
 
     static const spindle_ptrs_t spindle = {
         .type = SpindleType_PWM,
