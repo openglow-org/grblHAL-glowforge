@@ -413,7 +413,7 @@ void gfcool_poll (void)
     uint32_t now = mono_ms();
 
     if((int32_t)(now - next_verdict_ms) >= 0) {
-        next_verdict_ms = now + 1000;
+        next_verdict_ms = now + 500;    /* half the staleness window: no gap between reads */
         verdict_read();
 
         bool fresh = verdict_fresh();
