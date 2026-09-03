@@ -552,12 +552,47 @@ static bool arm_gates (void)
     return true;
 }
 
-/* The arm's completion once the consent exists: the coolant gate
- * re-checked at the moment it matters (the wait can run for minutes,
- * and the verdict may have gone bad or stale during it), the dose model
- * put in force, then the window opened. */
+/* The arm's completion once the consent exists: the cooling engine's
+ * acknowledgment of this job waited for, the coolant gate re-checked at
+ * the moment it matters (the wait can run for minutes, and the verdict
+ * may have gone bad or stale during it), the dose model put in force,
+ * then the window opened. */
+
+/* How long the acknowledgment may take before the job is refused. The
+ * engine reports on every change and repeats at 1 Hz, and the client
+ * re-reads the verdict twice a second, so this is several times the
+ * worst honest case. The host test shortens it rather than spinning. */
+#ifndef COOL_ACK_S
+#define COOL_ACK_S 5.0
+#endif
+
 static bool arm_complete (void)
 {
+    /* The armed window is reported to the engine when it opens, and the
+     * engine answers by applying the cut airflow and the flow
+     * interrogation for the job. Until that answer arrives the verdict
+     * on file is the one computed for the idle session before the arm -
+     * permissive, because nothing is wrong at idle - so firing on it
+     * puts the beam on the work with the fans still at their idle duty.
+     * A press that lands the instant the button lights is exactly the
+     * case that reaches the gate first, so the arm waits here. */
+    double ack_deadline = wall_s() + COOL_ACK_S;
+    while(!gfcool_run_ack()) {
+        if(!pump(50000)) {
+            latch_lock(true);
+            gfcool_laser_armed(false);
+            return false;               /* soft reset during the wait */
+        }
+        if(wall_s() > ack_deadline) {
+            latch_lock(true);
+            gfcool_laser_armed(false);
+            report_message("laser fire blocked: the cooling service did not take the job",
+                            Message_Warning);
+            system_raise_alarm(Alarm_AbortCycle);
+            return false;
+        }
+    }
+
     if(!gfcool_fire_ok()) {
         latch_lock(true);
         gfcool_laser_armed(false);

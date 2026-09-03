@@ -90,7 +90,9 @@ static const char *verdict_file = VERDICT_FILE;
 #define FB_INTAKE     "43278"
 
 static coolant_state_t coolant_reported = {0};
-static bool laser_on_window = false;    /* armed (glowforge_laser.c) */
+/* Armed (glowforge_laser.c). Written on the protocol thread, read from
+ * the stepper producer thread through the fire gate, so atomic. */
+static _Atomic bool laser_on_window = false;
 static bool was_run = false;            /* for the cooldown report */
 
 /* Verdict cache. fire_ok is read from the stepper producer thread; the
@@ -101,6 +103,12 @@ static bool was_run = false;            /* for the cooldown report */
 static _Atomic bool v_fire_ok = false;
 static _Atomic bool v_hold = false;
 static _Atomic bool v_resume_ok = false;
+/* The engine's acknowledgment of our armed window. A verdict is only an
+ * answer to the session it is read against: the window opens here
+ * before the engine has seen the report, so an idle verdict - fire_ok
+ * with nothing wrong at idle - would otherwise stay fresh across the arm
+ * and authorize the first fire before the run airflow is applied. */
+static _Atomic bool v_armed = false;
 static _Atomic uint32_t v_fresh_until_ms = 0;
 static char v_reason[112];
 static char v_reason_shown[112];
@@ -324,6 +332,7 @@ static void verdict_read (void)
     atomic_store_explicit(&v_hold, json_bool(body, "hold", true), memory_order_relaxed);
     atomic_store_explicit(&v_resume_ok, json_bool(body, "resume_ok", false), memory_order_relaxed);
     atomic_store_explicit(&v_fire_ok, json_bool(body, "fire_ok", false), memory_order_relaxed);
+    atomic_store_explicit(&v_armed, json_bool(body, "armed", false), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
     atomic_store_explicit(&v_fresh_until_ms,
         mono_ms() + (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),
@@ -402,10 +411,29 @@ void gfcool_laser_armed (bool armed)
 
 bool gfcool_fire_ok (void)
 {
-    /* Freshness (acquire) first: the flag read below is then at least
+    /* Freshness (acquire) first: the flags read below are then at least
      * as new as the verdict that set the deadline. */
+    if(!verdict_fresh() ||
+        !atomic_load_explicit(&v_fire_ok, memory_order_relaxed))
+        return false;
+
+    /* Inside our armed window the verdict must be one the engine
+     * computed with that window in effect, or it is an answer to the
+     * previous session. Before the window opens there is nothing to
+     * acknowledge, so the pre-arm gate reads the verdict as it stands.
+     * The engine re-reports at 1 Hz and on every change, so the wait
+     * here is bounded by one report and one engine tick. */
+    if(atomic_load_explicit(&laser_on_window, memory_order_relaxed) &&
+        !atomic_load_explicit(&v_armed, memory_order_relaxed))
+        return false;
+
+    return true;
+}
+
+bool gfcool_run_ack (void)
+{
     return verdict_fresh() &&
-            atomic_load_explicit(&v_fire_ok, memory_order_relaxed);
+            atomic_load_explicit(&v_armed, memory_order_relaxed);
 }
 
 void gfcool_poll (void)

@@ -40,6 +40,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* The acknowledgment wait, shortened so the never-acknowledged case
+   refuses in a fraction of a second instead of spinning out the
+   shipped bound. */
+#define COOL_ACK_S 0.2
+
 /* --- controllable + observable stubs (defined before the include so the
    driver source links against them) ------------------------------------ */
 
@@ -74,6 +79,18 @@ bool gfcool_fire_ok(void)
     int i = fire_ok_calls < fire_ok_n ? fire_ok_calls : fire_ok_n - 1;
     fire_ok_calls++;
     return fire_ok_script[i];
+}
+
+/* The cooling engine's acknowledgment of the armed window. False for the
+ * first ack_hold calls, so 0 is an engine that has already taken the job
+ * (every case that is not about the wait) and a large value is one that
+ * never does. */
+static int ack_hold;
+static int ack_calls;
+
+bool gfcool_run_ack(void)
+{
+    return ack_calls++ >= ack_hold;
 }
 
 bool gfsw_available(void) { return sw_present; }
@@ -162,6 +179,8 @@ static int failures;
 static void reset_state(void)
 {
     fire_ok_calls = 0;
+    ack_hold = 0;
+    ack_calls = 0;
     alarms_raised = 0;
     resets_requested = 0;
     last_message[0] = '\0';
@@ -256,6 +275,38 @@ int main(void)
     CHECK(!armed_c, "refuses when the gate is blocked up front");
     CHECK(!laser_ok, "armed window stays closed on the early refusal");
     CHECK(fire_ok_calls == 1, "the pre-wait check short-circuits the arm");
+
+    /* Case A2 - the engine never takes the job. The armed window is
+       reported to the cooling engine when it opens, and the engine
+       answers by applying the cut airflow and the flow interrogation.
+       The verdict standing on file until then was computed for the idle
+       session before the arm, and at idle nothing is wrong, so it says
+       fire is fine - firing on it puts the beam on the work with the
+       fans at their idle duty. The gate here reads clear at both checks,
+       so the missing acknowledgment is the only thing that can refuse. */
+    reset_state();
+    script(true, true, 2);
+    ack_hold = 1 << 30;
+    bool armed_a2 = gflaser_arm();
+    CHECK(!armed_a2, "refuses when the engine never takes the armed window");
+    CHECK(!laser_ok, "armed window stays closed without the acknowledgment");
+    CHECK(!stream_armed, "stream is never told armed without the acknowledgment");
+    CHECK(latch_locked_last, "latch is left locked without the acknowledgment");
+    CHECK(alarms_raised == 1, "raises an alarm when the engine does not take the job");
+    CHECK(strstr(last_message, "did not take the job") != NULL,
+          "names the cooling service as the reason");
+
+    /* Case A3 - the acknowledgment arriving a few polls late is the
+       ordinary case: the engine sees the report on its next tick. The
+       arm waits for it and then proceeds. */
+    reset_state();
+    script(true, true, 2);
+    ack_hold = 3;
+    bool armed_a3 = gflaser_arm();
+    CHECK(armed_a3, "arms once the engine takes the armed window");
+    CHECK(laser_ok && stream_armed, "the armed window opens after the wait");
+    CHECK(ack_calls > 3, "the arm waited for the acknowledgment");
+    CHECK(alarms_raised == 0, "a late acknowledgment is not an alarm");
 
     printf("gflaser_arm() button wait against the switches:\n");
 

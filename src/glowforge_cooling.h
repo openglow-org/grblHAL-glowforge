@@ -31,6 +31,13 @@ void gfcool_poll (void);
 // no file IO on that path.
 bool gfcool_fire_ok (void);
 
+// True once the engine has answered the armed window this client
+// reported: a fresh verdict carrying the engine's own armed flag. The
+// window opens before the engine has seen the report, and until it has,
+// the verdict on file answers the idle session that preceded the arm -
+// so the arm waits on this before it lets the gate above decide.
+bool gfcool_run_ack (void);
+
 // Armed-window hook from glowforge_laser.c: reported to the engine,
 // which forces the run fan profile and flow interrogation while armed,
 // whatever the sender's M8/M9 state.
