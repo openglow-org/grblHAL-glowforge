@@ -34,6 +34,7 @@
 #include <time.h>
 
 #include "driver.h"
+#include "glowforge_io.h"
 #include "serial.h"
 #include "stepper_stream.h"
 #include "build_info.h"
@@ -267,8 +268,11 @@ static void irqEnable (void)
 
 void settings_changed (settings_t *settings, settings_changed_flags_t changed)
 {
-    (void)settings; (void)changed;
-    /* Must exist: the core's wrapper calls it without a NULL check. */
+    (void)changed;
+    (void)settings;
+    /* The Z soft limit is the driver's, whatever $20 says: the core's
+     * own recomputation on a settings change would drop it. */
+    gfhome_apply_z_limit();
 }
 
 static void driverReset (void)

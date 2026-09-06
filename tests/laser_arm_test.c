@@ -134,6 +134,7 @@ void gf_stream_laser_model(uint32_t period, uint32_t min_ticks) { (void)min_tick
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
 void fflog(int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
+void gfhome_reference_z(float z_mm, int below, int above) { (void)z_mm; (void)below; (void)above; }
 static unsigned client_gen = 1;     /* bumped to model a sender change */
 unsigned serial_client_generation(void) { return client_gen; }
 static int resets_requested;

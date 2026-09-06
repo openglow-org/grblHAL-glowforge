@@ -7,6 +7,12 @@
   the main thread; the stepper stream owns its own threads
   (stepper_stream.c).
 
+  Options: -p <port> (TCP listener, else stdio), -b <addr> (the listen
+  address, an IPv6 or IPv4 literal, default :: for all interfaces;
+  parsed by bind_addr.c), -e <file> (the settings file). The listener is
+  one dual-stack socket, so an IPv4 literal binds in its v4-mapped form.
+  print_usage() names the environment variables.
+
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
@@ -20,6 +26,7 @@
 // as a macro, which must not be in scope when the core's vfs.h declares
 // its struct field of the same name.
 #include "build_info.h"
+#include "bind_addr.h"
 #include "driver.h"
 #include "eeprom.h"
 #include "platform.h"
@@ -52,6 +59,8 @@ static void print_usage (const char *badarg)
       "%s [options]\n"
       "  Options:\n"
       "    -p <port>        : TCP port for raw Grbl protocol (e.g. 23). Default: stdio.\n"
+      "    -b <addr>        : listen address for -p, an IPv6 or IPv4 literal\n"
+      "                       (::, ::1, 0.0.0.0, 127.0.0.1). Default: :: (all interfaces).\n"
       "    -e <EEPROM file> : file holding grblHAL settings. default = EEPROM.DAT\n"
       "    -h               : this help.\n"
       "    -v, --version    : print version and build information.\n"
@@ -66,7 +75,7 @@ static void print_usage (const char *badarg)
       "                       default from /data/forgefirm.conf (log_grblhal_*).\n"
       "    FFLOG_STDERR     : 1 = echo log lines to stderr (automatic on a terminal).\n"
       "    GF_PULSE_FD      : an inherited pulse-device fd (set by the forgectrl broker).\n"
-      "    FORGECTRL_PORT   : the cooling engine's HTTP port (default 8080).\n"
+      "    FORGECTRL_PORT   : the cooling engine's HTTP port (default 80).\n"
       "  Test hooks (host builds): GFSINK_LEAD_MS, GF_SWITCH_FILE, GF_VERDICT_FILE,\n"
       "  GF_STATE_DIR, and the config keys laser_power_model, laser_floor_analog,\n"
       "  gfcloud_home_cmd (honored only without GFSINK).\n"
@@ -107,6 +116,7 @@ int main (int argc, char *argv[])
 {
     int port = 0;
     int listen_fd = -1;
+    struct in6_addr bind_addr = in6addr_any;
 
     progname = argv[0];
     // Log through syslog under this program name (levels from the shared
@@ -137,6 +147,15 @@ int main (int argc, char *argv[])
                 case 'p':
                     if(argc < 2 || (port = atoi(argv[1])) <= 0 || port > 65535) {
                         printf("Option -p needs a TCP port (1-65535).\n");
+                        print_usage(NULL);
+                        return EXIT_FAILURE;
+                    }
+                    argv++; argc--;
+                    break;
+
+                case 'b':
+                    if(argc < 2 || bind_addr_parse(argv[1], &bind_addr) != 0) {
+                        printf("Option -b needs an IPv6 or IPv4 address literal (e.g. ::, ::1, 127.0.0.1).\n");
                         print_usage(NULL);
                         return EXIT_FAILURE;
                     }
@@ -180,7 +199,10 @@ int main (int argc, char *argv[])
         // Close-on-exec: the homing runner is fork+exec'd from this
         // process and must not inherit the listen socket (a straggling
         // child would keep the port bound across a controller respawn).
-        // One dual-stack socket serves IPv4 and IPv6 senders.
+        // One dual-stack socket serves IPv4 and IPv6 senders. IPV6_V6ONLY
+        // stays off for every -b address: with an IPv4 or v4-mapped
+        // address it is what makes the bind work, and with an IPv6
+        // address it changes nothing.
         if((listen_fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) {
             printf("Fatal: Unable to create socket.\n");
             exit(-5);
@@ -191,11 +213,11 @@ int main (int argc, char *argv[])
         setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
         server_addr.sin6_family = AF_INET6;
-        server_addr.sin6_addr = in6addr_any;
+        server_addr.sin6_addr = bind_addr;
         server_addr.sin6_port = htons(port);
 
         if(bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-            printf("Fatal: Unable to bind socket.\n");
+            printf("Fatal: Unable to bind socket: %s.\n", strerror(errno));
             exit(-5);
         }
 

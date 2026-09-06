@@ -18,7 +18,8 @@
                     the machine state and alarm code, the sender session
                     (connected, generation, seconds connected, peer
                     address), the laser (armed window, arming wait, dose
-                    model and its floor), the exact [GC:...] modal report
+                    model, its floor, the curve and the corner gamma), the
+                    exact [GC:...] modal report
                     the sender would get, the feed and rapid override
                     percents, and the driver version. Rewritten on
                     change and on a slow heartbeat so age stays honest.
@@ -153,12 +154,14 @@ static void publish_state (bool force)
         bool connected, armed, arming;
         unsigned generation;
         int feed, rapid;
+        float gamma;
     } seen;
     sys_state_t st_now = state_get();
     bool changed = force || st_now != seen.state || (uint8_t)sys.alarm != seen.alarm ||
                    serial_client_connected() != seen.connected ||
                    serial_client_generation() != seen.generation ||
                    gflaser_armed() != seen.armed || gflaser_arming() != seen.arming ||
+                   gflaser_gamma() != seen.gamma ||
                    (int)sys.override.feed_rate != seen.feed ||
                    (int)sys.override.rapid_rate != seen.rapid;
     if(!changed && mono_s() < next_heartbeat)
@@ -169,6 +172,7 @@ static void publish_state (bool force)
     seen.generation = serial_client_generation();
     seen.armed = gflaser_armed();
     seen.arming = gflaser_arming();
+    seen.gamma = gflaser_gamma();
     seen.feed = (int)sys.override.feed_rate;
     seen.rapid = (int)sys.override.rapid_rate;
 
@@ -188,7 +192,8 @@ static void publish_state (bool force)
     snprintf(body, sizeof(body),
         "\"state\":\"%s\",\"alarm\":%d,"
         "\"sender\":{\"connected\":%s,\"generation\":%u,\"for_s\":%.0f,\"peer\":\"%s\"},"
-        "\"laser\":{\"armed\":%s,\"arming\":%s,\"model\":\"%s\",\"floor_pct\":%g,\"curve\":\"%s\"},"
+        "\"laser\":{\"armed\":%s,\"arming\":%s,\"model\":\"%s\",\"floor_pct\":%g,\"curve\":\"%s\","
+        "\"gamma\":%.2f},"
         "\"modals\":\"%s\","
         "\"overrides\":{\"feed\":%d,\"rapid\":%d},"
         "\"driver\":\"%s\"}",
@@ -202,6 +207,7 @@ static void publish_state (bool force)
         gflaser_density() ? "density" : "analog",
         (double)settings.pwm_spindle.pwm_min_value,
         gflaser_curve(),
+        (double)gflaser_gamma(),
         modals,
         (int)sys.override.feed_rate, (int)sys.override.rapid_rate,
         hal.driver_version ? hal.driver_version : "");

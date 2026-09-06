@@ -58,6 +58,7 @@ include(src/grbl/CMakeLists.txt)
 
 set(DRIVER_SOURCES
     src/main.c
+    src/bind_addr.c
     src/driver.c
     src/stepper_stream.c
     src/glowforge_io.c
@@ -80,6 +81,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # core submodule is upstream code and is not held to -Werror here.
     set_source_files_properties(${DRIVER_SOURCES}
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
+        tests/bind_addr_test.c tests/lens_home_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
 
@@ -117,3 +119,20 @@ target_link_libraries(laser_arm_test m)
 # is reported once. Includes the serial source directly, stubs the core.
 add_executable(serial_test tests/serial_test.c)
 target_include_directories(serial_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+
+# Host unit test for the -b listen-address parser (src/bind_addr.c): an
+# IPv6 literal binds as written, an IPv4 literal binds in its v4-mapped
+# form, and anything that is not a literal is rejected. Links the parser
+# source alone; must not link the core.
+add_executable(bind_addr_test tests/bind_addr_test.c src/bind_addr.c)
+target_include_directories(bind_addr_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+
+# Host unit test for the Z a home sets (the pure helpers in
+# src/glowforge_homing.h): the edge's focal height lands on the step
+# grid the controller counts, so the reported position agrees with the
+# home position, and the park from the edge stays inside the window
+# every head reaches without touching a stop. Headers only; must not
+# link the core.
+add_executable(lens_home_test tests/lens_home_test.c)
+target_include_directories(lens_home_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(lens_home_test m)

@@ -85,6 +85,16 @@
                              rides the curve (a curve of "off" disables
                              both) and touches only the velocity-scaled
                              path - a constant-power M3 never sees it.
+    M102 reloads laser_corner_gamma, laser_dose_curve, and
+    laser_floor_density inside an armed job, after every buffered
+    motion has played (synchronized), through the same spindle
+    configuration the arm runs, so the PWM mapping is precomputed
+    against the new floor: the commissioning sheet's corner card burns
+    one pattern per gamma in a single press, and its floor and
+    dose-curve cards burn their text under the machine's keys and
+    switch the floor and the curve off for their rungs, the daemon
+    writing the keys and streaming M102 ahead.
+
     laser_dose_curve         the measured dose curve, as density:light
                              percent pairs ("10:0.5,30:7,45:21,60:37,
                              80:50,100:100"). S commands a light
@@ -122,6 +132,7 @@
 #include "fflog.h"
 #include "glowforge_laser.h"
 #include "glowforge_cooling.h"
+#include "glowforge_homing.h"
 #include "glowforge_io.h"
 #include "glowforge_switches.h"
 #include "glowforge_switch_map.h"
@@ -559,12 +570,23 @@ static bool arm_gates (void)
  * then the window opened. */
 
 /* How long the acknowledgment may take before the job is refused. The
- * engine reports on every change and repeats at 1 Hz, and the client
- * re-reads the verdict twice a second, so this is several times the
- * worst honest case. The host test shortens it rather than spinning. */
+ * engine acknowledges once every gated fan reads its floor, which the
+ * big exhaust fan takes seconds to reach, so the budget is the fan
+ * grace (cool_fan_grace_s, the engine's own spin-up window) plus a
+ * margin, never under COOL_ACK_S. The host harness keeps the grace at
+ * 0 so its refusal cases stay short. */
 #ifndef COOL_ACK_S
 #define COOL_ACK_S 5.0
 #endif
+
+static double ack_budget_s (void)
+{
+    float grace = gfio_conf_read_float("cool_fan_grace_s", 15.0f);
+    if(!(grace >= 0.0f && grace <= 120.0f))
+        grace = 15.0f;
+    double budget = (double)grace + COOL_ACK_S;
+    return budget < COOL_ACK_S ? COOL_ACK_S : budget;
+}
 
 static bool arm_complete (void)
 {
@@ -576,7 +598,8 @@ static bool arm_complete (void)
      * puts the beam on the work with the fans still at their idle duty.
      * A press that lands the instant the button lights is exactly the
      * case that reaches the gate first, so the arm waits here. */
-    double ack_deadline = wall_s() + COOL_ACK_S;
+    double budget = ack_budget_s();
+    double ack_deadline = wall_s() + budget;
     while(!gfcool_run_ack()) {
         if(!pump(50000)) {
             latch_lock(true);
@@ -584,10 +607,12 @@ static bool arm_complete (void)
             return false;               /* soft reset during the wait */
         }
         if(wall_s() > ack_deadline) {
+            char msg[112];
             latch_lock(true);
             gfcool_laser_armed(false);
-            report_message("laser fire blocked: the cooling service did not take the job",
-                            Message_Warning);
+            snprintf(msg, sizeof(msg), "laser fire blocked: the cooling service did not take the "
+                     "job within %.0f s (the fans at their floors?)", budget);
+            report_message(msg, Message_Warning);
             system_raise_alarm(Alarm_AbortCycle);
             return false;
         }
@@ -1049,6 +1074,59 @@ static void onStateChange (sys_state_t state)
         on_state_change(state);
 }
 
+float gflaser_gamma (void)
+{
+    return corner_gamma;
+}
+
+/* M102: reload the keys a job may change between its passes. Chained
+ * behind whatever handlers the core or another plugin installed. */
+static user_mcode_ptrs_t user_mcode;
+
+static user_mcode_type_t mcodeCheck (user_mcode_t mcode)
+{
+    if(mcode == UserMCode_Generic2 || mcode == UserMCode_Generic3)
+        return UserMCode_Normal;
+    return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
+}
+
+static status_code_t mcodeValidate (parser_block_t *gc_block)
+{
+    if(gc_block->user_mcode == UserMCode_Generic3) {
+        /* M103 Z<focal height at the hall edge> [P<free half-steps below>]
+         * [Q<above>]: the lens was referenced by the sender's own means
+         * (a commissioning card). */
+        if(!gc_block->words.z)
+            return Status_GcodeValueWordMissing;
+        gc_block->words.z = Off;
+        gc_block->words.p = gc_block->words.q = Off;
+        gc_block->user_mcode_sync = true;
+        return Status_OK;
+    }
+    if(gc_block->user_mcode == UserMCode_Generic2) {
+        gc_block->user_mcode_sync = true;
+        return Status_OK;
+    }
+    return user_mcode.validate ? user_mcode.validate(gc_block) : Status_Unhandled;
+}
+
+static void mcodeExecute (sys_state_t state, parser_block_t *gc_block)
+{
+    if(gc_block->user_mcode == UserMCode_Generic3) {
+        gfhome_reference_z(gc_block->values.xyz[Z_AXIS], (int)gc_block->values.p,
+                           (int)gc_block->values.q);
+    } else if(gc_block->user_mcode == UserMCode_Generic2) {
+        char msg[112];
+        spindleConfig(hal_spindle);     /* the floor, the curve, the gamma, the PWM mapping */
+        snprintf(msg, sizeof(msg), "laser keys reloaded: corner gamma %.2f, curve %s, floor %g %%",
+                 (double)corner_gamma, gflaser_curve(),
+                 (double)settings.pwm_spindle.pwm_min_value);
+        report_message(msg, Message_Info);
+        fflog(LOG_INFO, "%s", msg);
+    } else if(user_mcode.execute)
+        user_mcode.execute(state, gc_block);
+}
+
 void gflaser_init (void)
 {
     const char *dev = getenv("GFSINK");
@@ -1058,6 +1136,10 @@ void gflaser_init (void)
     grbl.on_program_completed = onProgramCompleted;
     on_state_change = grbl.on_state_change;
     grbl.on_state_change = onStateChange;
+    user_mcode = grbl.user_mcode;
+    grbl.user_mcode.check = mcodeCheck;
+    grbl.user_mcode.validate = mcodeValidate;
+    grbl.user_mcode.execute = mcodeExecute;
 
     static const spindle_ptrs_t spindle = {
         .type = SpindleType_PWM,

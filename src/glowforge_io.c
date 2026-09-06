@@ -149,7 +149,13 @@ void gfio_analog_config (void)
     gfio_wr_attr("cnc/y_mode", "8");
     gfio_wr_attr("cnc/x_decay", "1");
     gfio_wr_attr("cnc/y_decay", "1");
-    gfio_wr_attr("cnc/motor_lock", "8");
+    /* Every axis in the pulse path, the lens included: Z is the focal
+     * height and a job's Z moves the lens. The lens motor steps in
+     * half-steps ($102) and rises only at its drive current, which the
+     * run posture sets and the hold posture takes back. */
+    gfio_wr_attr("cnc/motor_lock", "0");
+    gfio_wr_attr("head/z_mode", "1");
+    gfio_wr_attr("head/z_enable", "0");
     gfio_currents_hold();
 }
 
@@ -157,12 +163,14 @@ void gfio_currents_run (void)
 {
     gfio_wr_attr("pic/x_step_current", X_CURRENT_RUN);
     gfio_wr_attr("pic/y_step_current", Y_CURRENT_RUN);
+    gfio_wr_attr("head/z_current", "0");
 }
 
 void gfio_currents_hold (void)
 {
     gfio_wr_attr("pic/x_step_current", X_CURRENT_HOLD);
     gfio_wr_attr("pic/y_step_current", Y_CURRENT_HOLD);
+    gfio_wr_attr("head/z_current", "1");
 }
 
 /* --- the shared machine config ("key = value", '#' comments) --------- */

@@ -25,7 +25,11 @@
   senders get status reports for the minutes the session can take. On
   success the machine position is set to the configured post-homing
   coordinates: the factory home corner is machine origin (back-left,
-  workspace all-positive), the lens rests at top-of-travel. A soft
+  workspace all-positive); the runner leaves the lens on the hall
+  sensor's rising edge, whose focal height the focus card measured, and
+  parks it the half-steps the driver hands it (GFHOME_PARK_HALF_STEPS,
+  inside the head's free travel as the focus card found it) at the park
+  height, so Z after a home is the park height. A soft
   reset (^X) aborts the session (SIGTERM, then SIGKILL); failures raise
   the homing-fail alarm.
 
@@ -81,9 +85,66 @@
 #define cfg_read       gfio_conf_read
 #define cfg_read_float gfio_conf_read_float
 
+/* The Z reference: whether Z is referenced, and the envelope it opened. */
+static bool z_referenced;
+static float z_env_min, z_env_max;
+
+void gfhome_apply_z_limit (void)
+{
+    float z_spm = settings.axis[Z_AXIS].steps_per_mm;
+    if(z_referenced) {
+        sys.work_envelope.min.values[Z_AXIS] = z_env_min;
+        sys.work_envelope.max.values[Z_AXIS] = z_env_max;
+    } else {
+        /* Unreferenced: Z stays where it is. */
+        float z = (float)sys.position[Z_AXIS] / z_spm;
+        sys.work_envelope.min.values[Z_AXIS] = z;
+        sys.work_envelope.max.values[Z_AXIS] = z;
+    }
+    /* The core checks the limit on homed axes only: Z is always
+     * referenced, to the edge or to where it stands. */
+    sys.homed.mask |= Z_AXIS_BIT;
+    sys.soft_limits.mask |= Z_AXIS_BIT;
+}
+
+/* The free travel each way from the edge: the values given, else the
+ * focus card's settings, else the fallback window. */
+static void lens_window (int *below, int *above)
+{
+    if(*below < 1 || *below > 40) {
+        float f = cfg_read_float("lens_stop_below_steps", 0.0f);
+        *below = f >= 1.0f && f <= 40.0f ? (int)f : LENS_WINDOW_DOWN;
+    }
+    if(*above < 1 || *above > 40) {
+        float f = cfg_read_float("lens_stop_above_steps", 0.0f);
+        *above = f >= 1.0f && f <= 40.0f ? (int)f : LENS_WINDOW_UP;
+    }
+}
+
+void gfhome_reference_z (float z_mm, int below, int above)
+{
+    float z_spm = settings.axis[Z_AXIS].steps_per_mm;
+    long steps = gfhome_z_steps(z_mm, z_spm);
+    lens_window(&below, &above);
+    sys.position[Z_AXIS] = steps;
+    sys.home_position[Z_AXIS] = (float)steps / z_spm;
+    /* A half-step of slack at each end: the free travel is already two
+     * short of the contact. */
+    z_env_min = (float)(steps - below - 1) / z_spm;
+    z_env_max = (float)(steps + above + 1) / z_spm;
+    z_referenced = true;
+    sys.homed.mask |= Z_AXIS_BIT;
+    gfhome_apply_z_limit();
+    sync_position();
+    fflog(LOG_INFO, "lens referenced at Z%.2f, free %d half-steps below and %d above",
+          (double)sys.home_position[Z_AXIS], below, above);
+}
+
 void gfhome_invalidate (void)
 {
     unlink(HOMED_ANCHOR);
+    z_referenced = false;
+    gfhome_apply_z_limit();
 }
 
 static void anchor_write (const float *home)
@@ -147,6 +208,23 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     snprintf(budget, sizeof(budget), "%u",
              timeout_ms > 60000 ? timeout_ms / 1000 - 30 : 30);
     setenv("GFHOME_TIMEOUT_S", budget, 1);
+    /* The park: from the edge to the park height, in whole half-steps,
+     * inside the window every head reaches without touching a stop. The
+     * runner takes the steps after its reference; Z below is set to
+     * match. */
+    float edge_z = cfg_read_float("lens_hall_edge_z_mm", DEFAULT_LENS_HALL_EDGE_Z_MM);
+    float park_z = cfg_read_float("lens_park_z_mm", DEFAULT_LENS_PARK_Z_MM);
+    float z_spm = settings.axis[Z_AXIS].steps_per_mm;
+    /* The head's free travel each way from the edge, as the focus card
+     * found its stops; the fallback window until then. */
+    float below_f = cfg_read_float("lens_stop_below_steps", 0.0f);
+    float above_f = cfg_read_float("lens_stop_above_steps", 0.0f);
+    int below = below_f >= 1.0f && below_f <= 40.0f ? (int)below_f : LENS_WINDOW_DOWN;
+    int above = above_f >= 1.0f && above_f <= 40.0f ? (int)above_f : LENS_WINDOW_UP;
+    int park = gfhome_park_steps(edge_z, park_z, z_spm, below, above);
+    char park_s[16];
+    snprintf(park_s, sizeof(park_s), "%d", park);
+    setenv("GFHOME_PARK_HALF_STEPS", park_s, 1);
 
     pid_t pid = fork();
     if(pid == 0) {
@@ -155,6 +233,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         _exit(127);
     }
     unsetenv("GFHOME_TIMEOUT_S");
+    unsetenv("GFHOME_PARK_HALF_STEPS");
     if(pid < 0) {
         fflog(LOG_ERR, "gfhome: cannot spawn the homing runner");
         if(!gf_stream_resume())
@@ -217,13 +296,18 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
 
     /* Homed: the head sits at the factory home position. Machine origin
      * is that corner (back-left, +Y toward the front), workspace all-
-     * positive; the lens rests at the top-of-travel hall reference.
+     * positive. Z is the focal point's height above the tray: the runner
+     * left the lens on the hall sensor's rising edge, whose focal height
+     * the focus card measured (lens_hall_edge_z_mm; the default is the
+     * bench reference machine's), then parked it the half-steps handed
+     * to it, so Z is the edge's height on the step grid plus the park.
+     * The Z envelope is the head's free travel around the edge.
      * NOTE: settings.axis[].max_travel is stored negative. */
+    long edge_steps = gfhome_z_steps(edge_z, z_spm);
     float home[N_AXIS];
     home[X_AXIS] = cfg_read_float("gfcloud_home_x", 0.0f);
     home[Y_AXIS] = cfg_read_float("gfcloud_home_y", 0.0f);
-    home[Z_AXIS] = cfg_read_float("gfcloud_home_z",
-                                   -settings.axis[Z_AXIS].max_travel);
+    home[Z_AXIS] = (float)(edge_steps + park) / z_spm;
 
     uint_fast8_t idx;
     for(idx = 0; idx < N_AXIS; idx++) {
@@ -232,7 +316,13 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         sys.work_envelope.min.values[idx] = 0.0f;
         sys.work_envelope.max.values[idx] = -settings.axis[idx].max_travel;
     }
+    /* The Z envelope: the head's free travel around the edge, a
+     * half-step of slack at each end; the Z soft limit stands on it. */
+    z_env_min = (float)(edge_steps - below - 1) / z_spm;
+    z_env_max = (float)(edge_steps + above + 1) / z_spm;
+    z_referenced = true;
     sys.homed.mask = X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT;
+    gfhome_apply_z_limit();
     sync_position();
 
     gf_stream_clear_position();
@@ -247,8 +337,9 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     st_go_idle();
     grbl.report.feedback_message(Message_None);
 
-    fflog(LOG_NOTICE, "gfhome: homed - X%.2f Y%.2f Z%.2f",
-          home[X_AXIS], home[Y_AXIS], home[Z_AXIS]);
+    fflog(LOG_NOTICE, "gfhome: homed - X%.2f Y%.2f Z%.2f (the hall edge at Z%.2f, the lens "
+          "parked %+d half-steps from it)",
+          home[X_AXIS], home[Y_AXIS], home[Z_AXIS], gfhome_grid_z(edge_z, z_spm), park);
 
     return Status_OK;
 }

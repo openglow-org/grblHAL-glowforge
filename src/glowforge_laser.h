@@ -30,6 +30,10 @@ bool gflaser_density (void);
 // file: "bench-default", "custom", "off", or "invalid: bench-default".
 const char *gflaser_curve (void);
 
+/* The corner rolloff exponent in force (laser_corner_gamma, reloaded
+ * at every arm and by M102). */
+float gflaser_gamma (void);
+
 // True while the operator-armed window is open (the published state
 // file reports it beside the arming wait).
 bool gflaser_armed (void);

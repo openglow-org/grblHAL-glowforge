@@ -7,7 +7,7 @@
   https://docs.forgefirm.org/technical/forgefirm/cooling-engine/. This client:
 
   - reports job state to the engine: POST /cool/state (127.0.0.1,
-    FORGECTRL_PORT or 8080) with mode=idle|run|cooldown and the armed
+    FORGECTRL_PORT or 80) with mode=idle|run|cooldown and the armed
     flag - level-triggered, re-sent every ~1 s from gfcool_poll and
     immediately on every change, so a lost report self-heals. The
     effective run window is the sender's M8/M9 OR'd with the laser
@@ -20,6 +20,9 @@
     freshness deadline - no file IO on that path), a hold verdict
     takes a real feed hold (jogs are canceled instead - grblHAL never
     holds a jog), and resume_ok auto-resumes a hold this client took.
+    A job resumed under a standing hold (the button, a ~, a sender) is
+    held again within the next poll: fire is blocked either way, and a
+    verdict with no resume is a reset, never a pause.
     A missing or stale verdict (ts_mono older than 2 s) is treated as
     fire_ok=false, hold=true: the engine being gone must look exactly
     like a fault.
@@ -114,13 +117,14 @@ static char v_reason[112];
 static char v_reason_shown[112];
 
 static bool hold_ours = false;
+static bool rehold_said = false;        /* one message per resume under a hold */
 static bool jog_warned = false;
 static bool fallback_done = false;
 static bool stale_warned = false;
 
 static uint32_t next_report_ms = 0;
 static uint32_t next_verdict_ms = 0;
-static int http_port = 8080;
+static int http_port = 80;
 
 static uint32_t mono_ms (void)
 {
@@ -133,6 +137,22 @@ static void warn (const char *msg)
 {
     report_message(msg, Message_Warning);
     fflog(LOG_WARNING, "gfcool: %s", msg);
+}
+
+/* Take the feed hold, or take it again. hold_ours already set with the
+ * core back in Cycle means the job was resumed under a standing verdict
+ * (the button, a ~, a sender): fire is blocked either way, so the job
+ * would run dark to its end. It is held again, and told why once per
+ * resume. A verdict with no resume is a reset, never a pause. */
+static void hold_take (bool stale)
+{
+    if(hold_ours && !rehold_said) {
+        rehold_said = true;
+        warn(stale ? "cooling service lost - job held again"
+                   : "cooling hold stands - job held again; reset the job");
+    }
+    hold_ours = true;
+    protocol_enqueue_realtime_command(CMD_FEED_HOLD);
 }
 
 /* ------------------------------------------------------- job reports */
@@ -460,10 +480,10 @@ void gfcool_poll (void)
                      * nobody else will make now. */
                     gfio_wr_attr("thermal/heater_pwm", "0");
                 }
-                if(st == STATE_CYCLE && !hold_ours) {
-                    hold_ours = true;
-                    protocol_enqueue_realtime_command(CMD_FEED_HOLD);
-                }
+                if(st == STATE_CYCLE)
+                    hold_take(true);
+                else if(st & STATE_HOLD)
+                    rehold_said = false;
                 if(laser_on_window && !fallback_done) {
                     fallback_done = true;
                     fallback_fans();
@@ -483,9 +503,10 @@ void gfcool_poll (void)
             strcpy(v_reason_shown, v_reason);
 
             if(v_hold) {
-                if(st == STATE_CYCLE && !hold_ours) {
-                    hold_ours = true;
-                    protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+                if(st == STATE_CYCLE) {
+                    hold_take(false);
+                } else if(st & STATE_HOLD) {
+                    rehold_said = false;
                 } else if(st == STATE_JOG) {
                     /* grblHAL never holds a jog; cancel it instead. */
                     protocol_enqueue_realtime_command(CMD_JOG_CANCEL);
@@ -496,6 +517,7 @@ void gfcool_poll (void)
                 }
             } else {
                 jog_warned = false;
+                rehold_said = false;
                 if(hold_ours) {
                     if(!(st & STATE_HOLD))
                         hold_ours = false;  /* operator resumed or reset */
