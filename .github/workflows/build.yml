@@ -45,3 +45,5 @@ jobs:
         run: python3 forgefirm/scripts/bench/z_envelope_test.py build/grblHAL_glowforge
       - name: XY microstep mode from the shared config
         run: python3 forgefirm/scripts/bench/xy_mode_test.py build/grblHAL_glowforge
+      - name: A deep planner buffer starts
+        run: python3 forgefirm/scripts/bench/planner_blocks_test.py build/grblHAL_glowforge
