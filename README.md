@@ -77,7 +77,7 @@ project builds it via the Yocto SDK; see `forgefirm/scripts/bench/`).
 ## Running (on the board)
 
 ```sh
-GFSINK=/dev/glowforge grblHAL_glowforge -p 23 -e /data/EEPROM.DAT
+GFSINK=/dev/glowforge grblHAL_glowforge -p 23 -e /data/forgefirm/EEPROM-glowforge.DAT
 ```
 
 Environment: `GFSINK` (pulse device; unset = null-sink test mode),
