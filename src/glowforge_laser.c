@@ -63,10 +63,14 @@
                              written, $$ reports the floor in force,
                              and a $35 typed by a sender is overwritten
                              on the spot.
-    laser_pulse_ticks        density base period in machine ticks
-                             (default 20 = 710 us at 28160 Hz)
-    laser_pulse_min_ticks    shortest pulse the density model will emit
-                             (default 3 = 106 us). Below it a period is
+    laser_pulse_ticks        density base period in ticks of the x8
+                             reference tick, 28160 Hz (default 20 =
+                             710 us); the stream scales it to the tick
+                             in force, so the period is a time at every
+                             microstep mode
+    laser_pulse_min_ticks    shortest pulse the density model will emit,
+                             in the same ticks (default 3 = 106 us).
+                             Below it a period is
                              skipped and its debt carried, so a low
                              level arrives as fewer full-width pulses
                              rather than stubs the supply cannot strike.
@@ -168,15 +172,16 @@
  * band at every corner and short segment. The density model instead
  * pins the duty at full and modulates how many ticks of each base
  * period fire, which cannot land in the band by construction. Default
- * period: 20 ticks of the 28160 Hz stream = 710 us, the factory's
- * ~1.43 kHz pulse rate. */
+ * period: 20 ticks of the x8 reference tick (28160 Hz) = 710 us, the
+ * factory's ~1.43 kHz pulse rate. The stream scales the count to the
+ * tick in force (stepper_stream.h), so the period is a time. */
 #define PULSE_TICKS_DEFAULT 20.0f
 
-/* Shortest pulse worth emitting, in machine ticks. A 36 us stub (one
- * tick) draws no discharge at all on this supply, and the factory never
- * emits below one of its 100 us ticks; 3 ticks is 106 us. Below this a
- * period is skipped and its debt carried, so a low level arrives as
- * fewer full-width pulses rather than stubs. */
+/* Shortest pulse worth emitting, in the same reference ticks. A 36 us
+ * stub (one tick) draws no discharge at all on this supply, and the
+ * factory never emits below one of its 100 us ticks; 3 ticks is 106 us.
+ * Below this a period is skipped and its debt carried, so a low level
+ * arrives as fewer full-width pulses rather than stubs. */
 #define PULSE_MIN_TICKS_DEFAULT 3.0f
 
 /* The S-range floor, percent of full, loaded into $35 at every

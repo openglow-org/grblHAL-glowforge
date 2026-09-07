@@ -268,8 +268,33 @@ static void irqEnable (void)
 
 static on_settings_changed_ptr settings_changed_chain;
 
+/* The XY scale is the microstep mode's, never typed: $100/$101 are
+ * re-asserted from it before the chain runs, so everything the chain
+ * derives sees the values in force (RAM only, like $35: the stored
+ * values are never written from here, and a typed one is overwritten
+ * on the spot). $110/$111 are then held under what the stream can
+ * carry, one step per machine tick per axis, which matters when the
+ * bench lowers the tick under GFSINK_RATE. */
+static void apply_xy_scale (settings_t *settings)
+{
+    float spm = gfio_xy_steps_per_mm_of(gfio_xy_microsteps());
+    float ceiling = gfio_xy_rate_ceiling(gf_stream_rate(), spm);
+    uint_fast8_t axes[] = { X_AXIS, Y_AXIS };
+
+    for(uint_fast8_t i = 0; i < 2; i++) {
+        settings->axis[axes[i]].steps_per_mm = spm;
+        if(settings->axis[axes[i]].max_rate > ceiling) {
+            fflog(LOG_WARNING, "$%u=%.3f is above the %.3f mm/min the %u Hz tick carries at %.3f steps/mm; held at the ceiling",
+                  (unsigned)(110 + axes[i]), settings->axis[axes[i]].max_rate, ceiling, gf_stream_rate(), spm);
+            settings->axis[axes[i]].max_rate = ceiling;
+        }
+    }
+}
+
 static void onSettingsChanged (settings_t *settings, settings_changed_flags_t changed)
 {
+    apply_xy_scale(settings);
+
     if(settings_changed_chain)
         settings_changed_chain(settings, changed);
 

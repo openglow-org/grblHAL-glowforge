@@ -9,7 +9,7 @@
   (https://docs.forgefirm.org/technical/forgefirm/pulse-feeder-contract/),
   forgefirm/docs/BRINGUP.md (hardware facts bank), and the factory pulse
   streams analyzed with forgefirm/scripts/bench/puls_profile.py:
-  - XY: 0.15 mm per full step at x8 microstepping -> 53.333 usteps/mm.
+  - XY: 0.15 mm per full step; 53.333 usteps/mm at x8 microstepping.
   - Z: 0.70612 mm per full step, driven in half-steps (0.3531 mm) -> 2.832 half-steps/mm, ~10.6 mm travel.
   - Travel moves peak 202 mm/s vector with ~700 mm/s2 ramps on v2.6.0
     factory firmware (header HAxr=132/HAyr=112/HAar=133 at ~5.3 mm/s2 per
@@ -27,6 +27,20 @@
 
 #define BOARD_GLOWFORGE
 
+// XY: 0.15 mm per full step. The microstep mode is the operator's
+// (xy_microsteps in /data/forgefirm.conf: 8, 16 or 32; unset or anything
+// else reads as 8), read once at the controller's start and applied to
+// the DRV8825 MODE pins at idle. Three quantities are derived from it
+// and never typed: $100/$101 (glowforge_io.h, re-asserted from the
+// settings-changed chain like $35), the machine tick (the factory travel
+// tick at x8, scaled with the mode so the ticks per step stay the same
+// and so does the top speed), and the kernel stop ramp (scaled the same
+// way so a controlled stop covers the same distance). The defaults below
+// are the x8 values.
+#define XY_MM_PER_FULL_STEP 0.15f
+#define XY_MICROSTEPS_DEFAULT 8
+#define GF_TICK_X8_HZ 28160             // the factory travel tick
+#define GF_RAMP_X8_HZ_PER_S 125000      // the kernel's default stop ramp, at that tick
 #define DEFAULT_X_STEPS_PER_MM 53.333f
 #define DEFAULT_Y_STEPS_PER_MM 53.333f
 // Z: the lens screw's half-steps per millimeter, 36 over the carriage's

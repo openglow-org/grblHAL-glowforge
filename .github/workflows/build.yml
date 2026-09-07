@@ -28,6 +28,8 @@ jobs:
         run: ./build/bind_addr_test
       - name: Z after a home sits on the step grid and the park stays inside the window
         run: ./build/lens_home_test
+      - name: XY microstep scale derivations
+        run: ./build/xy_scale_test
       # The safety harnesses live in the forgefirm repo (scripts/bench/)
       # and drive the null-sink build over TCP - no hardware, no root.
       - name: Fetch the test harnesses
@@ -41,3 +43,5 @@ jobs:
         run: python3 forgefirm/scripts/bench/laser_lifecycle_test.py build/grblHAL_glowforge
       - name: Z envelope survives a settings write
         run: python3 forgefirm/scripts/bench/z_envelope_test.py build/grblHAL_glowforge
+      - name: XY microstep mode from the shared config
+        run: python3 forgefirm/scripts/bench/xy_mode_test.py build/grblHAL_glowforge

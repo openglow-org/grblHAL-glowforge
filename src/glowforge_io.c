@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "glowforge_io.h"
+#include "fflog.h"
 
 #define GF_SYSFS "/sys/glowforge/"
 
@@ -144,9 +145,11 @@ int gfio_open_pulse_dev_nb (const char *path)
 
 void gfio_analog_config (void)
 {
+    char mode[8];
+    snprintf(mode, sizeof(mode), "%u", gfio_xy_microsteps());
     gfio_wr_attr("cnc/laser_latch", "1");
-    gfio_wr_attr("cnc/x_mode", "8");
-    gfio_wr_attr("cnc/y_mode", "8");
+    gfio_wr_attr("cnc/x_mode", mode);
+    gfio_wr_attr("cnc/y_mode", mode);
     gfio_wr_attr("cnc/x_decay", "1");
     gfio_wr_attr("cnc/y_decay", "1");
     /* Every axis in the pulse path, the lens included: Z is the focal
@@ -227,4 +230,22 @@ float gfio_conf_read_float (const char *key, float fallback)
         return fallback;
     float f = strtof(val, &end);
     return end == val ? fallback : f;
+}
+
+unsigned gfio_xy_microsteps (void)
+{
+    static unsigned mode = 0;
+
+    if(mode == 0) {
+        char val[32];
+        if(gfio_conf_read("xy_microsteps", val, sizeof(val)) == 0) {
+            mode = gfio_xy_mode_parse(val);
+            if(mode == 0)
+                fflog(LOG_WARNING, "xy_microsteps '%s' is not 8, 16 or 32; running at x%u",
+                      val, XY_MICROSTEPS_DEFAULT);
+        }
+        if(mode == 0)
+            mode = XY_MICROSTEPS_DEFAULT;
+    }
+    return mode;
 }

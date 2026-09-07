@@ -14,9 +14,11 @@
 // into PWMSAR against this period, so 127 is full duty.
 #define GF_PWM_PERIOD 127
 
-// Init (reads GFSINK/GFSINK_RATE/GFSINK_DEPTH_MS, opens the pulse device
-// when GFSINK is set, applies the analog machine config, spawns the
-// producer and shipper threads). Called from driver_init().
+// Init (reads GFSINK/GFSINK_RATE/GFSINK_DEPTH_MS, takes the machine tick
+// from the XY microstep mode unless GFSINK_RATE overrides it, opens the
+// pulse device when GFSINK is set, applies the analog machine config,
+// the tick and the stop ramp, spawns the producer and shipper threads).
+// Called from driver_init().
 void gf_stream_init (void);
 
 // Virtual step-clock frequency for hal.f_step_timer: 1000 x machine tick.
@@ -46,6 +48,10 @@ void gf_stream_laser (uint8_t power, bool fire);
 // still average out. Density is what the tube's dead band below its
 // lasing threshold requires - every pulse it emits is full-power, so no
 // commanded level lands in the band.
+//
+// Both tick counts are ticks of the x8 reference tick (28160 Hz, the
+// unit the commissioned laser keys are in) and are scaled to the tick
+// in force, so the laser timing is the same at every microstep mode.
 //
 // min_ticks is the shortest pulse worth emitting: below it a period is
 // skipped and its debt carried, so a low level arrives as fewer

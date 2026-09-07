@@ -149,11 +149,14 @@
 /* Shipper cadence. */
 #define SHIP_PERIOD_NS 10000000 /* 10 ms */
 
-/* GFSINK_RATE / GFSINK_DEPTH_MS bounds. The rate ceiling is the kernel
- * script's effective per-byte playback limit (~165 kHz); the depth floor
- * keeps at least one ship chunk in flight per shipper period, and the
- * ceiling (RING_SIZE / 2 bytes at the chosen rate) is applied at init. */
-#define GFSINK_RATE_DEFAULT 28160
+/* GFSINK_RATE / GFSINK_DEPTH_MS bounds. The machine tick is the XY
+ * microstep mode's (glowforge_io.h: the factory travel tick at x8,
+ * doubled at x16, quadrupled at x32, so the ticks per step and the top
+ * speed stay the same); GFSINK_RATE overrides it for the bench. The rate
+ * ceiling is the kernel script's effective per-byte playback limit
+ * (~165 kHz); the depth floor keeps at least one ship chunk in flight per
+ * shipper period, and the ceiling (RING_SIZE / 2 bytes at the chosen
+ * rate) is applied at init. */
 #define GFSINK_RATE_MIN 1000
 #define GFSINK_RATE_MAX 165000
 #define GFSINK_DEPTH_MS_DEFAULT 200
@@ -163,9 +166,10 @@
  * the producer and the shipped cursor (~preload depth of stream time).
  * Grayscale engraving is the heavy case - a power change per pixel can
  * queue hundreds across a 200 ms window. */
-/* Longest base period the density model will take, in machine ticks.
- * At the 28160 Hz stream rate this is 36 ms; the factory works at 7
- * ticks of its 10 kHz print rate (700 us). */
+/* Longest base period the density model will take, in ticks of the x8
+ * reference tick: 36 ms at 28160 Hz (the factory works at 7 ticks of its
+ * 10 kHz print rate, 700 us). The model's ticks arrive in the reference
+ * tick and are scaled to the stream's, so the bound is a time. */
 #define DITH_PERIOD_MAX 1024
 
 #define LEV_BITS 12
@@ -457,12 +461,24 @@ static bool dither_tick (void)
     return false;
 }
 
+/* Ticks of the x8 reference tick (the commissioned laser keys) into
+ * ticks of the stream in force: a whole number, never below one. */
+static uint32_t ref_ticks_to_stream (uint32_t ref_ticks)
+{
+    uint64_t t = ((uint64_t)ref_ticks * gf.rate + GF_TICK_X8_HZ / 2) / GF_TICK_X8_HZ;
+    return t < 1 ? 1 : (uint32_t)t;
+}
+
 void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks)
 {
     if(period_ticks > DITH_PERIOD_MAX)
         period_ticks = DITH_PERIOD_MAX;
+    if(period_ticks)
+        period_ticks = ref_ticks_to_stream(period_ticks);
     if(min_ticks < 1)
         min_ticks = 1;
+    if(period_ticks)
+        min_ticks = ref_ticks_to_stream(min_ticks);
     if(min_ticks > period_ticks)
         min_ticks = period_ticks;     /* a whole period is the longest pulse */
 
@@ -1277,6 +1293,20 @@ static void rail_settle (void)
         sleep_ns(50000000);
 }
 
+/* The machine tick, and with it the kernel stop ramp: the ramp is Hz/s
+ * of tick frequency, so it follows the tick to keep a controlled stop
+ * over the same distance at every mode (glowforge_io.h). */
+static bool apply_tick (void)
+{
+    char val[16];
+    snprintf(val, sizeof(val), "%u", gf.rate);
+    bool ok = gfio_wr_attr("cnc/step_freq", val) == 0;
+    snprintf(val, sizeof(val), "%u", gfio_xy_ramp_for_tick(gf.rate));
+    if(gfio_wr_attr("cnc/ramp_rate", val) != 0)
+        fflog(LOG_WARNING, "gfstream: cannot set ramp_rate %s", val);
+    return ok;
+}
+
 bool gf_stream_resume (void)
 {
     if(!gf.active)
@@ -1316,9 +1346,7 @@ bool gf_stream_resume (void)
     /* The homing session reconfigured the machine; re-apply the full
      * analog config and stream state exactly as at init. */
     gfio_analog_config();
-    char val[16];
-    snprintf(val, sizeof(val), "%u", gf.rate);
-    bool ok = gfio_wr_attr("cnc/step_freq", val) == 0;
+    bool ok = apply_tick();
     lseek(fd, 1, SEEK_SET);           /* clear pulse data + byte counters */
     gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
     if(!gfio_pulse_inherited())
@@ -1348,7 +1376,6 @@ bool gf_stream_resume (void)
 void gf_stream_init (void)
 {
     const char *dev = getenv("GFSINK"), *opt;
-    char val[16];
 
     /* gf.lock is contended by the SCHED_FIFO shipper against two
      * normal-priority threads on a uniprocessor: priority inheritance
@@ -1369,14 +1396,15 @@ void gf_stream_init (void)
      * a division by zero in the pacing math, a rate above the kernel's
      * effective playback ceiling underruns by construction, and a depth
      * the stream ring cannot hold faults on the first ship. */
-    gf.rate = GFSINK_RATE_DEFAULT;
+    unsigned xy_mode = gfio_xy_microsteps();
+    gf.rate = gfio_xy_tick_hz_of(xy_mode);
     if((opt = getenv("GFSINK_RATE")) && *opt) {
         long v = strtol(opt, NULL, 10);
         if(v >= GFSINK_RATE_MIN && v <= GFSINK_RATE_MAX)
             gf.rate = (uint32_t)v;
         else
             fflog(LOG_WARNING, "gfstream: GFSINK_RATE '%s' out of range (%u-%u); using %u",
-                  opt, GFSINK_RATE_MIN, GFSINK_RATE_MAX, GFSINK_RATE_DEFAULT);
+                  opt, GFSINK_RATE_MIN, GFSINK_RATE_MAX, gf.rate);
     }
     uint32_t depth_ms = GFSINK_DEPTH_MS_DEFAULT;
     if((opt = getenv("GFSINK_DEPTH_MS")) && *opt) {
@@ -1429,8 +1457,7 @@ void gf_stream_init (void)
          * inside an operator-armed job window); then the full factory
          * analog config (modes, decay, motor lock, hold currents). */
         gfio_analog_config();
-        snprintf(val, sizeof(val), "%u", gf.rate);
-        if(gfio_wr_attr("cnc/step_freq", val) != 0) {
+        if(!apply_tick()) {
             fflog(LOG_ERR, "gfstream: cannot set step_freq");
             exit(1);
         }
@@ -1451,8 +1478,8 @@ void gf_stream_init (void)
     gf.threads_started = true;
 
     atexit(gf_stream_shutdown);
-    fflog(LOG_INFO, "gfstream: %s, %u Hz machine tick, %u ms depth, %u ms producer lead",
-          gf.active ? dev : "null-sink (no GFSINK)", gf.rate, depth_ms, lead_ms);
+    fflog(LOG_INFO, "gfstream: %s, x%u microsteps, %u Hz machine tick, %u ms depth, %u ms producer lead",
+          gf.active ? dev : "null-sink (no GFSINK)", xy_mode, gf.rate, depth_ms, lead_ms);
 }
 
 void gf_stream_shutdown (void)

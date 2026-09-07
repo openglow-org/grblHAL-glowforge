@@ -81,7 +81,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # core submodule is upstream code and is not held to -Werror here.
     set_source_files_properties(${DRIVER_SOURCES}
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
-        tests/bind_addr_test.c tests/lens_home_test.c
+        tests/bind_addr_test.c tests/lens_home_test.c tests/xy_scale_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
 
@@ -136,3 +136,10 @@ target_include_directories(bind_addr_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR
 add_executable(lens_home_test tests/lens_home_test.c)
 target_include_directories(lens_home_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(lens_home_test m)
+
+# Host unit test for the XY microstep scale (the pure helpers in
+# src/glowforge_io.h): the mode a config value names, and the $100/$101,
+# machine tick, stop ramp and feed ceiling derived from it. Headers only.
+add_executable(xy_scale_test tests/xy_scale_test.c)
+target_include_directories(xy_scale_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(xy_scale_test m)

@@ -81,8 +81,10 @@ GFSINK=/dev/glowforge grblHAL_glowforge -p 23 -e /data/forgefirm/EEPROM-glowforg
 ```
 
 Environment: `GFSINK` (pulse device; unset = null-sink test mode),
-`GFSINK_RATE` (machine tick, default 28160 Hz, the factory's own
-travel-move tick; accepted 1000-165000), `GFSINK_DEPTH_MS` (queue depth,
+`GFSINK_RATE` (machine tick override; the default is the XY microstep
+mode's: 28160 Hz at x8, the factory's own travel-move tick, doubled at
+x16 and quadrupled at x32, from `xy_microsteps` in the shared config;
+accepted 1000-165000), `GFSINK_DEPTH_MS` (queue depth,
 default 200; at least 20 and no more than half the stream ring at the
 chosen rate), `GF_PULSE_FD` (an inherited pulse-device fd, set by the
 forgectrl broker), `FORGECTRL_PORT` (the cooling engine's HTTP port). An
