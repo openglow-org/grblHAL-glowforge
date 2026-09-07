@@ -39,3 +39,5 @@ jobs:
         run: python3 forgefirm/scripts/bench/laser_stream_test.py build/grblHAL_glowforge
       - name: Armed-window lifecycle
         run: python3 forgefirm/scripts/bench/laser_lifecycle_test.py build/grblHAL_glowforge
+      - name: Z envelope survives a settings write
+        run: python3 forgefirm/scripts/bench/z_envelope_test.py build/grblHAL_glowforge

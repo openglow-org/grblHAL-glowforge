@@ -266,12 +266,16 @@ static void irqEnable (void)
 
 /* ------------------------------------------------------------------------- */
 
-void settings_changed (settings_t *settings, settings_changed_flags_t changed)
+static on_settings_changed_ptr settings_changed_chain;
+
+static void onSettingsChanged (settings_t *settings, settings_changed_flags_t changed)
 {
-    (void)changed;
-    (void)settings;
+    if(settings_changed_chain)
+        settings_changed_chain(settings, changed);
+
     /* The Z soft limit is the driver's, whatever $20 says: the core's
-     * own recomputation on a settings change would drop it. */
+     * own recomputation on a settings change would drop it. The chain
+     * runs first, so this is the last write of the dispatch. */
     gfhome_apply_z_limit();
 }
 
@@ -388,7 +392,7 @@ static void glowforge_process_realtime (uint_fast16_t state)
 bool driver_setup (settings_t *settings)
 {
     settings_changed_flags_t changed_flags = {0};
-    hal.settings_changed(settings, changed_flags);
+    grbl.on_settings_changed(settings, changed_flags);
     hal.stepper.go_idle(true);
     hal.coolant.set_state((coolant_state_t){0});
 
@@ -414,7 +418,8 @@ bool driver_init (void)
     hal.f_step_timer = gf_stream_vclk();
     hal.step_us_min = 1000000.0f / (float)gf_stream_rate();
     hal.delay_ms = driver_delay_ms;
-    hal.settings_changed = settings_changed;
+    settings_changed_chain = grbl.on_settings_changed;
+    grbl.on_settings_changed = onSettingsChanged;
 
     driver_reset_chain = hal.driver_reset;
     hal.driver_reset = driverReset;
