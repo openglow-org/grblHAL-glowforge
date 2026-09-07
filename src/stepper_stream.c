@@ -127,12 +127,17 @@
  * (due_now > produced); a lead large enough to keep production ahead of the
  * cursor across an idle gap skips that re-base, so the overshoot survives the
  * cycle and accumulates as dark pad bytes. Measured on the churn harness: 2 and
- * 10 ms both give an identical 64790-byte stream, 15 ms and above inflate it to
- * ~225k and stop being deterministic. Raising this past 10 ms needs the re-base
- * to reclaim the overshoot first. */
+ * 10 ms both give an identical 64790-byte stream, 2301 ms of playout; 15 ms
+ * inflates it to 5899 ms and 50 ms to 8005 ms, and every added byte is dark pad
+ * the machine still has to play after the sender has been told the job is done.
+ * The overshoot cannot be taken back once the bytes are the kernel's, so the
+ * ceiling is ENFORCED here rather than only described: raising it needs the
+ * producer to pace against the absolute cursor instead of the cycle's own
+ * epoch, so a cycle cannot inherit the lead of the one before it. The churn
+ * stream's length is held by rule 17 of the laser stream harness. */
 #define GFSINK_LEAD_MS_DEFAULT 10
 #define GFSINK_LEAD_MS_MIN 2
-#define GFSINK_LEAD_MS_MAX 200
+#define GFSINK_LEAD_MS_MAX 10
 
 /* Soft real time for the two threads whose wakeup latency IS step timing.
  * The shipper sits above the producer because its writes carry a hard
