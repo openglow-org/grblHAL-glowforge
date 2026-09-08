@@ -5,7 +5,8 @@
   AF_INET6 socket. bind_addr_parse() turns the -b option's literal into
   the address that socket binds.
 
-  Copyright (c) 2026 Scott Wiederhold <s.e.wiederhold@gmail.com>
+  Copyright 2026 514 LLC d/b/a OpenGlow
+  Written by Scott Wiederhold
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 

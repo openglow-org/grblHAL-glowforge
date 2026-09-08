@@ -12,7 +12,8 @@
     - anything that is not a literal is rejected: a host name, an empty
       string, a short dotted form, a bad hex group
 
-  Copyright (c) 2026 Scott Wiederhold <s.e.wiederhold@gmail.com>
+  Copyright 2026 514 LLC d/b/a OpenGlow
+  Written by Scott Wiederhold
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
