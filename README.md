@@ -1,102 +1,86 @@
 # grblHAL-glowforge
 
 A [grblHAL](https://github.com/grblHAL) driver for the **stock Glowforge
-(Basic/Plus/Pro) control board**: the factory NXP i.MX6 SOM running Linux.
-Part of the **ForgeFIRM** project, which replaces the cloud-dependent
-factory firmware with an open, locally-controlled image, with no hardware
-modification.
+(Basic, Plus, Pro) control board**: the factory NXP i.MX6 SOM running Linux.
+It is the GRBL-mode controller of
+[ForgeFIRM](https://github.com/openglow-org/forgefirm), which replaces the
+cloud-dependent factory firmware with an open, locally controlled image, with
+no hardware modification.
 
-The unmodified grblHAL core (git submodule at `src/grbl`) runs as a Linux
-userspace process. Steps are not fired from a GPIO ISR: the driver streams
-**pulse bytes** (one byte per machine tick) into the factory kernel module's
-SDMA + EPIT playback engine (`glowforge.ko`, `/dev/glowforge`), the same
-jitter-free hardware step generator the factory firmware used, fed live
-from grblHAL's planner instead of a cloud-generated file.
+The unmodified grblHAL core (a git submodule at `src/grbl`) runs as a Linux
+userspace process. Steps are not fired from a GPIO interrupt handler: the
+driver streams **pulse bytes**, one byte per machine tick, into the kernel
+module's SDMA and EPIT playback engine. That is the same jitter-free hardware
+step generator the factory firmware used, fed live from grblHAL's planner
+instead of from a cloud-generated file.
 
-## Architecture
+The machine constants (steps per millimeter, maximum rates, accelerations) are
+measured from the factory machine and its own pulse streams;
+`src/boards/glowforge.h` names the sources.
 
-- **grbl protocol thread**: parser/planner/protocol loop; Grbl 1.1
-  protocol over raw TCP (`-p 23`, LightBurn/UGS/cncjs-compatible) or stdio.
-- **stepper producer thread** (`SCHED_FIFO`): replaces a hardware step
-  timer: runs the core's stepper interrupt callback against a virtual step
-  clock (1000 x machine tick), wall-clock paced, and maps each step event
-  onto the pulse-byte grid.
-- **shipper thread** (`SCHED_FIFO`): writes due bytes to `/dev/glowforge`
-  with a bounded queue (default 200 ms = feed-hold latency), and owns the
-  kernel run/stop/streaming/underrun state machine plus the factory's PIC
-  run/hold stepper-current scheme.
-- **cooling reporter thread**: reports the job state to the forgectrl
-  cooling engine at 1 Hz.
+## Documentation
 
-Machine constants (steps/mm, max rates, accelerations) are measured from
-the factory machine and its pulse streams - see `src/boards/glowforge.h`
-for sources.
+Everything is on **<https://docs.forgefirm.org/>**. This README is an index
+card.
 
-**Laser control** (`src/glowforge_laser.c`): grblHAL laser mode (M3/M4,
-`$32`) maps spindle power onto the pulse stream's power bytes and fire
-bits. The first laser-on of a job requires the **operator's physical
-button press** (the kernel laser latch stays locked until then, and
-relocks on disarm/alarm/reset); fire only ever rides motion segments of
-laser blocks, and an armed underrun fails safe. The hardware safety
-AND-chain remains authoritative regardless.
+| Subject | Page |
+|---|---|
+| This driver: the threads, G-code to pulse bytes, the laser path, the armed window, the lid and button, faults, the cooling client | [The grblHAL driver](https://docs.forgefirm.org/technical/forgefirm/grblhal-driver/) |
+| The byte format and the playback engine | [The step engine](https://docs.forgefirm.org/technical/machine/step-engine/) |
+| What a feeder must obey | [Pulse feeder contract](https://docs.forgefirm.org/technical/forgefirm/pulse-feeder-contract/) |
+| The laser hardware and the tube's own thresholds | [The laser](https://docs.forgefirm.org/technical/machine/laser/) |
+| Geometry, speeds, limits, the lens | [Motion hardware](https://docs.forgefirm.org/technical/machine/motion-hardware/) |
+| Building it, and every environment variable | [Build](https://docs.forgefirm.org/developers/building/) |
+| Connecting a sender | [GRBL mode](https://docs.forgefirm.org/usage/grbl-mode/), [LightBurn](https://docs.forgefirm.org/usage/lightburn/) |
 
-**Safety inputs** (`src/glowforge_switches.c`): the lid switches and the
-remote-interlock loop drive the core's safety-door signal. By default
-(`lid_policy = cancel`) opening the lid mid-job cancels it: a controlled
-stop, the head back at the job's start, the laser latch relocked. With
-`lid_policy = hold` the job parks in the door state and closing the lid
-resumes it after a button press, the way the hardware chain treats the
-beam. The `hv_enable` bit is the
-readback of the board's HV_ENABLE output (high only while a run feeds the
-charge-pump watchdog with the lid closed); it is telemetry and gates
-nothing.
-
-**Cooling** is enforced in-process but owned by the forgectrl cooling
-engine: the driver reports job state, gates fire and issues hold/resume
-from the engine's published verdict (a missing or stale verdict reads as
-fire-blocked), and carries a compiled-in fallback fan write for the case
-where the engine is provably absent while the laser is armed. The
-contract is [the cooling engine](https://docs.forgefirm.org/technical/forgefirm/cooling-engine/) on the documentation site.
-
-Under the ForgeFIRM image the driver runs as a **supervised child of
-forgectrl** and receives `/dev/glowforge` as a broker-inherited fd
-(`GF_PULSE_FD`) - handovers such as the `$H` homing session then never
-close the device or cycle the 40 V motor rail. Standalone (no
-`GF_PULSE_FD`), it opens the device itself and every takeover runs a
-deliberate rail-off settle (`rail_settle_s`).
-
-## Building
+## Build and test
 
 ```sh
-cmake -B build && cmake --build build      # host (null-sink mode for testing)
+cmake -B build && cmake --build build
+./build/switch_map_test
+./build/laser_arm_test
 ```
 
-Cross-compile for the board with your i.MX6 toolchain (the ForgeFIRM
-project builds it via the Yocto SDK; see `forgefirm/scripts/bench/`).
+On a host without `GFSINK` the driver runs the real core, planner and stream
+code against a **null sink**, which is what makes the laser path testable
+without hardware. Two harnesses drive that build over TCP and live in the
+`forgefirm` repository, under `scripts/bench/`:
 
-## Running (on the board)
+```sh
+python3 laser_stream_test.py build/grblHAL_glowforge
+python3 laser_lifecycle_test.py build/grblHAL_glowforge
+```
+
+The board binary is a cross-build with the i.MX6 toolchain:
+`forgefirm/scripts/bench/build-glowforge.sh`.
+
+## Run it on the board
+
+Under the ForgeFIRM image the driver is a supervised child of `forgectrl`,
+which hands it the pulse device. You do not start it yourself. For bench work
+it runs standalone once the supervisor has released the device:
 
 ```sh
 GFSINK=/dev/glowforge grblHAL_glowforge -p 23 -e /data/forgefirm/EEPROM-glowforge.DAT
 ```
 
-Environment: `GFSINK` (pulse device; unset = null-sink test mode),
-`GFSINK_RATE` (machine tick override; the default is the XY microstep
-mode's: 28160 Hz at x8, the factory's own travel-move tick, doubled at
-x16 and quadrupled at x32, from `xy_microsteps` in the shared config;
-accepted 1000-165000), `GFSINK_DEPTH_MS` (queue depth,
-default 200; at least 20 and no more than half the stream ring at the
-chosen rate), `GF_PULSE_FD` (an inherited pulse-device fd, set by the
-forgectrl broker), `FORGECTRL_PORT` (the cooling engine's HTTP port). An
-out-of-range value is reported and the default is used. Test hooks for the
-host harnesses: `GFSINK_LEAD_MS`, `GF_SWITCH_FILE`, `GF_VERDICT_FILE`,
-`GF_STATE_DIR`, and the config keys `laser_power_model`,
-`laser_floor_analog` and `gfcloud_home_cmd` (the last honored only without
-`GFSINK`).
+## Safety
 
-## Lineage & license
+The first laser-on of a job requires the **operator's physical button press**.
+The kernel laser latch stays locked until then and relocks on disarm, alarm
+and reset; fire only ever rides the motion segments of laser blocks; and an
+armed underrun fails safe. The hardware safety chain is authoritative
+regardless of anything this driver does.
 
-Derived from the [grblHAL Simulator](https://github.com/grblHAL/Simulator)
-(platform layer, stream/NVS shape). GPL-3.0-or-later; see
-`COPYING`. grblHAL core © Terje Io and contributors; Simulator platform
-code © Jens Geisler, Adam Shelly; Glowforge driver © Scott Wiederhold.
+## Contributing
+
+[AGENTS.md](AGENTS.md) carries the rules for this repository and for the
+project. They apply to human contributors too.
+
+## Lineage and license
+
+Derived from the [grblHAL Simulator](https://github.com/grblHAL/Simulator):
+the platform layer, and the shape of the stream and NVS code.
+GPL-3.0-or-later; see `COPYING`. The grblHAL core is copyright Terje Io and
+contributors; the Simulator platform code is copyright Jens Geisler and Adam
+Shelly; the Glowforge driver is copyright Scott Wiederhold.

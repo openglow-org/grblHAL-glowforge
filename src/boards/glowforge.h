@@ -4,11 +4,13 @@
   Part of grblHAL-glowforge, the ForgeFIRM grblHAL driver for the stock
   Glowforge (Basic/Plus/Pro) i.MX6 control board.
 
-  Every value below is measured/derived from the factory machine, not
-  guessed. Sources: the pulse feeder contract
+  Every value below is measured/derived on the bench reference, not
+  guessed. Sources: the motion hardware page
+  (https://docs.forgefirm.org/technical/machine/motion-hardware/), the pulse
+  feeder contract
   (https://docs.forgefirm.org/technical/forgefirm/pulse-feeder-contract/),
-  forgefirm/docs/BRINGUP.md (hardware facts bank), and the factory pulse
-  streams analyzed with forgefirm/scripts/bench/puls_profile.py:
+  and the factory pulse streams analyzed with
+  forgefirm/scripts/bench/puls_profile.py:
   - XY: 0.15 mm per full step; 53.333 usteps/mm at x8 microstepping.
   - Z: 0.70612 mm per full step, driven in half-steps (0.3531 mm) -> 2.832 half-steps/mm, ~10.6 mm travel.
   - Travel moves peak 202 mm/s vector with ~700 mm/s2 ramps on v2.6.0
