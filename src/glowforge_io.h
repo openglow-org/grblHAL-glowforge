@@ -47,7 +47,7 @@ void gfio_analog_config (void);
 void gfio_currents_run (void);
 void gfio_currents_hold (void);
 
-// The shared machine config /data/forgefirm.conf ("key = value" lines,
+// The shared machine config /data/forgefirm/forgefirm.conf ("key = value" lines,
 // '#' comments; GFHOME_CONF overrides the path). Written by the
 // forgectrl web UI; consumers re-read at their natural boundaries
 // (homing per $H, cooling per flood start). Returns 0 when the key

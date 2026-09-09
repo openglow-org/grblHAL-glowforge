@@ -26,7 +26,7 @@
 #include <unistd.h>
 
 #define FFLOG_SOCK      "/dev/log"
-#define FFLOG_CONF_DEF  "/data/forgefirm.conf"
+#define FFLOG_CONF_DEF  "/data/forgefirm/forgefirm.conf"
 #define FFLOG_FACILITY  LOG_DAEMON
 #define FFLOG_MSG_MAX   2048
 #define RECONNECT_MIN_S 1.0

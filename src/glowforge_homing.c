@@ -3,7 +3,7 @@
 
   Part of grblHAL-glowforge. The machine has no limit or home switches;
   homing method is selected at runtime by the operator (forgectrl web
-  UI) through the shared config file /data/forgefirm.conf:
+  UI) through the shared config file /data/forgefirm/forgefirm.conf:
 
     homing_mode = gfcloud   $H runs the Glowforge web-service homing
                             sequence via the external one-shot runner

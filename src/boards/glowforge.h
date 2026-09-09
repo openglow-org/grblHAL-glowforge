@@ -31,7 +31,7 @@
 #define BOARD_GLOWFORGE
 
 // XY: 0.15 mm per full step. The microstep mode is the operator's
-// (xy_microsteps in /data/forgefirm.conf: 8, 16 or 32; unset or anything
+// (xy_microsteps in /data/forgefirm/forgefirm.conf: 8, 16 or 32; unset or anything
 // else reads as 8), read once at the controller's start and applied to
 // the DRV8825 MODE pins at idle. Three quantities are derived from it
 // and never typed: $100/$101 (glowforge_io.h, re-asserted from the
@@ -69,7 +69,7 @@
 #define DEFAULT_Z_MAX_TRAVEL 12.32f
 
 // The lens is placed in that frame by one per-head number in
-// /data/forgefirm.conf, measured and written by the commissioning focus
+// /data/forgefirm/forgefirm.conf, measured and written by the commissioning focus
 // card: lens_hall_edge_z_mm, the focal height above the tray when the
 // lens sits on the hall sensor's rising edge, the one reference the head
 // has (every head shares the screw and the travel; where along the
@@ -108,7 +108,7 @@
 #define DEFAULT_SPINDLE_PWM_MIN_VALUE 10.0f // Percent
 
 // The machine has no limit or home switches; the operator selects the
-// homing method at runtime (homing_mode in /data/forgefirm.conf, set
+// homing method at runtime (homing_mode in /data/forgefirm/forgefirm.conf, set
 // from the forgectrl web UI - see glowforge_homing.c):
 // - gfcloud: $H runs the Glowforge web-service homing session. The
 //   cloud's camera homing ends with the head at the factory home

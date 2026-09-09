@@ -15,7 +15,7 @@
  *
  * Levels are the syslog severities (<syslog.h> LOG_ERR .. LOG_DEBUG).
  * The emit level comes from the shared machine config
- * (/data/forgefirm.conf): log_<ident>_disk and log_<ident>_remote,
+ * (/data/forgefirm/forgefirm.conf): log_<ident>_disk and log_<ident>_remote,
  * each off|error|warning|notice|info|debug - the process emits at the
  * more verbose of the two and rsyslog filters per destination. Read
  * once at start; a change takes effect at the next process start
@@ -39,7 +39,7 @@
 /* Initialize: ident is the program name rsyslog routes on (also the
  * key fragment: log_<ident>_disk / _remote). Reads the level from the
  * config file (FFLOG_CONF env overrides the path; default
- * /data/forgefirm.conf). Safe to call once, before any threads. */
+ * /data/forgefirm/forgefirm.conf). Safe to call once, before any threads. */
 void fflog_init(const char *ident);
 
 /* Current emit level (a LOG_* severity; messages above it are not

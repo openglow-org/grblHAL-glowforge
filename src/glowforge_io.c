@@ -179,7 +179,7 @@ void gfio_currents_hold (void)
 
 /* --- the shared machine config ("key = value", '#' comments) --------- */
 
-#define CONF_DEFAULT "/data/forgefirm.conf"
+#define CONF_DEFAULT "/data/forgefirm/forgefirm.conf"
 
 static const char *conf_path (void)
 {

@@ -54,7 +54,7 @@ void gfhome_apply_z_limit (void);
 void gfhome_startup_reference (void);
 
 // Register the "$H" system command (shadows the core's; dispatches on
-// the homing_mode key in /data/forgefirm.conf, GFHOME_CONF overrides
+// the homing_mode key in /data/forgefirm/forgefirm.conf, GFHOME_CONF overrides
 // the path). Called from driver_init().
 void gfhome_init (void);
 
