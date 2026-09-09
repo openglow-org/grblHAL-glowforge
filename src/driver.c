@@ -299,16 +299,6 @@ static void onSettingsChanged (settings_t *settings, settings_changed_flags_t ch
     if(settings_changed_chain)
         settings_changed_chain(settings, changed);
 
-    /* The lens reference is taken here, not at driver_init: the step
-     * scale it converts through is only loaded by the time settings
-     * first change. One shot, so a later settings write never re-takes a
-     * reference the machine has since moved away from. */
-    static bool lens_referenced = false;
-    if(!lens_referenced) {
-        lens_referenced = true;
-        gfhome_startup_reference();
-    }
-
     /* The Z soft limit is the driver's, whatever $20 says: the core's
      * own recomputation on a settings change would drop it. The chain
      * runs first, so this is the last write of the dispatch. */
@@ -358,6 +348,19 @@ static bool motion_parked (uint_fast16_t state)
  * rest of the single-core i.MX6. */
 static void glowforge_process_realtime (uint_fast16_t state)
 {
+    /* The lens reference forgectrl left before this controller started.
+     * Taken here rather than at driver_init or the settings-changed hook:
+     * the step scale it converts through is not loaded at the first, and
+     * core init settles sys.position after the second, which would leave
+     * the controller holding a Z it had already overwritten. One shot, so
+     * nothing re-takes a reference the machine has since moved away
+     * from. */
+    static bool lens_referenced = false;
+    if(!lens_referenced && state != STATE_ALARM) {
+        lens_referenced = true;
+        gfhome_startup_reference();
+    }
+
     if(delay_callback && (int32_t)(millis() - delay_deadline_ms) >= 0) {
         void (*cb)(void) = delay_callback;
         delay_callback = NULL;
