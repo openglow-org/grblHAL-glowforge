@@ -299,6 +299,16 @@ static void onSettingsChanged (settings_t *settings, settings_changed_flags_t ch
     if(settings_changed_chain)
         settings_changed_chain(settings, changed);
 
+    /* The lens reference is taken here, not at driver_init: the step
+     * scale it converts through is only loaded by the time settings
+     * first change. One shot, so a later settings write never re-takes a
+     * reference the machine has since moved away from. */
+    static bool lens_referenced = false;
+    if(!lens_referenced) {
+        lens_referenced = true;
+        gfhome_startup_reference();
+    }
+
     /* The Z soft limit is the driver's, whatever $20 says: the core's
      * own recomputation on a settings change would drop it. The chain
      * runs first, so this is the last write of the dispatch. */

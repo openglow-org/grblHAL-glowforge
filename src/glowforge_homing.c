@@ -141,6 +141,42 @@ void gfhome_reference_z (float z_mm, int below, int above)
           (double)sys.home_position[Z_AXIS], below, above);
 }
 
+static void anchor_write (const float *home, uint8_t axes);
+
+/* The lens reference forgectrl took before this controller started. The
+ * daemon sweeps the lens onto the hall sensor's rising edge in the
+ * motion-verify window and leaves this marker in the state directory; a
+ * lens that could not reach its edge is a motion fault there, so no
+ * controller starts at all and this is never read on a machine whose lens
+ * did not home. The focal height of the edge is ours to know, not the
+ * daemon's: it comes from the same settings a gfcloud home reads. */
+void gfhome_startup_reference (void)
+{
+    const char *dir = getenv("GF_STATE_DIR");
+    char path[160], buf[64];
+    snprintf(path, sizeof(path), "%s/lens.home",
+             dir && *dir ? dir : "/run/forgefirm");
+    FILE *f = fopen(path, "r");
+    if(f == NULL)
+        return;
+    char *line = fgets(buf, sizeof(buf), f);
+    fclose(f);
+    if(line == NULL || strncmp(buf, "edge", 4) != 0)
+        return;
+    gfhome_reference_z(cfg_read_float("lens_hall_edge_z_mm",
+                                      DEFAULT_LENS_HALL_EDGE_Z_MM), 0, 0);
+
+    /* The daemon stepped the lens over GPIO, which the kernel counters
+     * never saw, so they no longer describe where the lens is. Zero
+     * them and anchor Z on the edge: the counters and the anchor agree
+     * again from here, and a reader adding them lands on the same Z the
+     * controller holds. X and Y carry no reference and stay relative. */
+    float home[N_AXIS] = {0};
+    home[Z_AXIS] = sys.home_position[Z_AXIS];
+    gf_stream_clear_position();
+    anchor_write(home, Z_AXIS_BIT);
+}
+
 void gfhome_invalidate (void)
 {
     unlink(HOMED_ANCHOR);
@@ -148,12 +184,15 @@ void gfhome_invalidate (void)
     gfhome_apply_z_limit();
 }
 
-static void anchor_write (const float *home)
+/* `axes` names which components carry a reference: a full home writes
+ * all three, the lens reference at startup writes Z alone. A reader
+ * that takes only the three coordinates sees what it always saw. */
+static void anchor_write (const float *home, uint8_t axes)
 {
     FILE *f = fopen(HOMED_ANCHOR, "w");
     if(f) {
-        fprintf(f, "%.3f %.3f %.3f\n",
-                home[X_AXIS], home[Y_AXIS], home[Z_AXIS]);
+        fprintf(f, "%.3f %.3f %.3f %u\n",
+                home[X_AXIS], home[Y_AXIS], home[Z_AXIS], axes);
         fclose(f);
     }
 }
@@ -327,7 +366,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     sync_position();
 
     gf_stream_clear_position();
-    anchor_write(home);
+    anchor_write(home, X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT);
 
     if(grbl.on_homing_completed)
         grbl.on_homing_completed(

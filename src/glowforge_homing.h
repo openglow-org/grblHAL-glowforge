@@ -38,14 +38,20 @@ static inline int gfhome_park_steps (float edge_z_mm, float park_z_mm, float z_s
 // always on: until Z is referenced it holds Z where it is (a jog is
 // refused, a program move raises the soft-limit alarm before it starts);
 // a home references the lens on its hall edge and opens the envelope to
-// the head's free travel; a commissioning card that referenced the lens
-// itself says so with M103 Z<focal height at the edge> P<free half-steps
-// below> Q<above> (P and Q optional: the settings, else the fallback).
-// gfhome_reference_z applies that; gfhome_apply_z_limit re-applies the
-// standing state (after a settings change, at the driver's start, and
-// when the reference is dropped).
+// the head's free travel. gfhome_reference_z applies a reference (the
+// focal height at the edge, and the free half-steps below and above it:
+// pass 0 for either to take the settings, else the fallback);
+// gfhome_apply_z_limit re-applies the standing state (after a settings
+// change, at the driver's start, and when the reference is dropped).
 void gfhome_reference_z (float z_mm, int below, int above);
 void gfhome_apply_z_limit (void);
+
+// Take the lens reference forgectrl left before this controller started
+// (the lens stands on its hall edge, and the marker says so). Called once
+// from the driver's settings-changed hook, where the step scale the
+// reference needs is finally loaded. Silent when there is no marker: the
+// lens then stays unreferenced and Z stays pinned where it stands.
+void gfhome_startup_reference (void);
 
 // Register the "$H" system command (shadows the core's; dispatches on
 // the homing_mode key in /data/forgefirm.conf, GFHOME_CONF overrides

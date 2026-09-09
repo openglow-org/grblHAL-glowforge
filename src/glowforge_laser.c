@@ -137,7 +137,6 @@
 #include "fflog.h"
 #include "glowforge_laser.h"
 #include "glowforge_cooling.h"
-#include "glowforge_homing.h"
 #include "glowforge_io.h"
 #include "glowforge_switches.h"
 #include "glowforge_switch_map.h"
@@ -1091,24 +1090,13 @@ static user_mcode_ptrs_t user_mcode;
 
 static user_mcode_type_t mcodeCheck (user_mcode_t mcode)
 {
-    if(mcode == UserMCode_Generic2 || mcode == UserMCode_Generic3)
+    if(mcode == UserMCode_Generic2)
         return UserMCode_Normal;
     return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
 }
 
 static status_code_t mcodeValidate (parser_block_t *gc_block)
 {
-    if(gc_block->user_mcode == UserMCode_Generic3) {
-        /* M103 Z<focal height at the hall edge> [P<free half-steps below>]
-         * [Q<above>]: the lens was referenced by the sender's own means
-         * (a commissioning card). */
-        if(!gc_block->words.z)
-            return Status_GcodeValueWordMissing;
-        gc_block->words.z = Off;
-        gc_block->words.p = gc_block->words.q = Off;
-        gc_block->user_mcode_sync = true;
-        return Status_OK;
-    }
     if(gc_block->user_mcode == UserMCode_Generic2) {
         gc_block->user_mcode_sync = true;
         return Status_OK;
@@ -1118,10 +1106,7 @@ static status_code_t mcodeValidate (parser_block_t *gc_block)
 
 static void mcodeExecute (sys_state_t state, parser_block_t *gc_block)
 {
-    if(gc_block->user_mcode == UserMCode_Generic3) {
-        gfhome_reference_z(gc_block->values.xyz[Z_AXIS], (int)gc_block->values.p,
-                           (int)gc_block->values.q);
-    } else if(gc_block->user_mcode == UserMCode_Generic2) {
+    if(gc_block->user_mcode == UserMCode_Generic2) {
         char msg[112];
         spindleConfig(hal_spindle);     /* the floor, the curve, the gamma, the PWM mapping */
         snprintf(msg, sizeof(msg), "laser keys reloaded: corner gamma %.2f, curve %s, floor %g %%",
