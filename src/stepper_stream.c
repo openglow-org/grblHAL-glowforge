@@ -1350,6 +1350,7 @@ bool gf_stream_resume (void)
     bool ok = apply_tick();
     lseek(fd, 1, SEEK_SET);           /* clear pulse data + byte counters */
     gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
+    gfio_wr_attr("cnc/streaming", "0");   /* and a stale stream flag with it */
     if(!gfio_pulse_inherited())
         gfio_wr_attr("cnc/enable", "1");  /* standalone: steppers on; under the broker the rail is forgectrl's */
 
@@ -1465,6 +1466,12 @@ void gf_stream_init (void)
         /* Fresh stream state. */
         lseek(gf.fd, 1, SEEK_SET);        /* clear pulse data + byte counters */
         gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
+        /* The flag says a stream is live, and only the end of one clears
+         * it. A controller that died mid-stream never reached that end,
+         * and the fd is the broker's, so nothing closed the device on its
+         * way out: the kernel is left believing the dead session is still
+         * feeding it. This session is the one feeding it now. */
+        gfio_wr_attr("cnc/streaming", "0");
         if(!gfio_pulse_inherited())
             gfio_wr_attr("cnc/enable", "1");  /* standalone: steppers on; under the broker the rail is forgectrl's */
 
