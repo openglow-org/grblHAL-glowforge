@@ -59,6 +59,8 @@ static unsigned client_generation = 0;  /* bumps on every connect/disconnect */
 static char client_peer[48];            /* the sender's address, "" when none */
 static double client_since;             /* CLOCK_MONOTONIC at the accept */
 static bool stdin_eof = false;  /* stdio mode: stop polling stdin at EOF */
+static bool banner_pending = false; /* a sender connected: welcome it from a top-level poll */
+static bool tx_blocked = false;     /* serialPutC is waiting on the ring: no nested writes */
 static bool rx_discarding = false;  /* dropping the rest of an overrun line */
 static bool rx_overrun = false;     /* an overrun happened, not yet taken */
 
@@ -155,9 +157,12 @@ static void serialRxCancel (void)
  * must NEVER block the caller indefinitely: status reports are written
  * mid-motion, and a blocked write here would stall the protocol thread
  * for the length of a network stall while the machine keeps moving. On
- * a healthy link the ring drains in microseconds; 100 ms with no
- * progress means the peer is gone or wedged. */
-#define TX_STALL_MS 100
+ * a healthy link the ring drains in microseconds; a second with no
+ * progress means the peer is gone or wedged (a busy access point or a
+ * settings dump into a slow reader pauses for less). The drop bumps the
+ * client generation, which disarms and holds a running laser job, so
+ * the bound is a safety action and stays a whole second, not tighter. */
+#define TX_STALL_MS 1000
 
 static bool serialPutC (const uint8_t c)
 {
@@ -169,6 +174,7 @@ static bool serialPutC (const uint8_t c)
         struct timespec t0, t;
         uint_fast16_t seen_tail = txbuffer.tail;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        tx_blocked = true;
 
         while(txbuffer.tail == next_head) {
             // hal.stream_blocking_callback -> protocol_execute_realtime ->
@@ -188,6 +194,7 @@ static bool serialPutC (const uint8_t c)
                 break;
             }
         }
+        tx_blocked = false;
     }
 
     txbuffer.data[txbuffer.head] = c;                           // Add data to buffer
@@ -334,6 +341,7 @@ static void rx_poll (void)
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
             client_fd = fd;
             client_generation++;
+            banner_pending = true;
         }
 
         if(client_fd >= 0) {
@@ -387,9 +395,24 @@ static void tx_drain (void)
     }
 }
 
+/* The welcome banner goes to every sender that connects, the way a UART
+ * build prints it at power-up: a sender that waits for "Grbl" before it
+ * speaks would otherwise sit on a running controller in silence. It is
+ * written from a top-level poll only. A poll can run inside a blocked
+ * serialPutC (through the blocking callback), and a banner written from
+ * there would land in the middle of the line that is waiting. */
+static void welcome (void)
+{
+    if(banner_pending && !tx_blocked && client_fd >= 0) {
+        banner_pending = false;
+        grbl.report.init_message(serialWriteS);
+    }
+}
+
 void serial_poll (void)
 {
     rx_poll();
+    welcome();
     tx_drain();
 }
 

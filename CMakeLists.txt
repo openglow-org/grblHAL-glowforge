@@ -8,6 +8,12 @@ endif()
 
 # PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP and friends.
 add_compile_definitions(_GNU_SOURCE)
+# The Grbl TX ring (the core's default is 512): a $$ dump is about 750
+# bytes on this machine, and a report that does not fit the ring waits
+# on the sender's reading, up to the stall bound that drops it. 2048
+# holds the dump whole, and the ring lives in a process, not a
+# microcontroller.
+add_compile_definitions(TX_BUFFER_SIZE=2048)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # The stepper producer thread runs core "ISR" code concurrently with the

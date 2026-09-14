@@ -1,6 +1,7 @@
 /*
-  serial_test.c - host unit test for the RX ring under a sender that
-  ignores flow control
+  serial_test.c - host unit test for the Grbl stream: the RX ring under a
+  sender that ignores flow control, the welcome banner on a connect, and
+  the TX ring's stall bound
 
   grblHAL is free software: you can redistribute it and/or modify it
   under the terms of the GNU General Public License as published by the
@@ -19,9 +20,13 @@
   passing while the ring is full, and the overrun is reported once
   through serial_rx_overflow_take() so the driver can abort the job.
 
-  The transport pump is not exercised: the test pushes bytes into
-  rx_byte() the way rx_poll() does and reads them back through the
-  stream's read function.
+  The RX cases push bytes into rx_byte() the way rx_poll() does and read
+  them back through the stream's read function. The TX cases run the
+  pump: a sender that connects to the listening socket is welcomed with
+  the banner (from a top-level poll, never from inside a blocked write),
+  a settings dump queues in the ring without waiting on the sender, a
+  sender that pauses under a second keeps its connection, and one that
+  pauses longer is dropped with the ring flushed.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -51,9 +56,94 @@ bool gflaser_resume_gate(void) { return false; }   /* no held laser job here */
 
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 grbl_hal_t hal;
+grbl_t grbl;
 bool stream_rx_suspend(stream_rx_buffer_t *rx, bool suspend)
 { (void)rx; (void)suspend; return false; }
 bool stream_connected(void) { return true; }
+
+/* The core's banner, as the report module writes it through the stream. */
+#define BANNER "\r\nGrblHAL test ['$' for help]\r\n"
+static int banners;
+static void fake_banner(stream_write_ptr write) { banners++; write(BANNER); }
+
+/* The blocking callback the core gives a full ring: the real one runs
+   the protocol loop's real-time pass, which polls the stream. The stand-in
+   polls, and plays the sender: a peer that starts reading `peer_after_s`
+   after the write blocked (never, when peer_reads is false). */
+static int peer_rd = -1;
+static bool peer_reads;
+static double peer_after_s, blocked_at;
+static int cb_calls;
+
+static double now_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + t.tv_nsec / 1e9;
+}
+
+static bool blocking_cb(void)
+{
+    if(cb_calls++ == 0)
+        blocked_at = now_s();
+    if(peer_reads && now_s() - blocked_at >= peer_after_s) {
+        char buf[512];
+        (void)!read(peer_rd, buf, sizeof(buf));
+    }
+    serial_poll();
+    struct timespec ts = { 0, 1000000 };
+    nanosleep(&ts, NULL);
+    return true;
+}
+
+static int listen_loopback(uint16_t *port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = 0,
+                              .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t sl = sizeof(sa);
+    if(fd < 0 || bind(fd, (struct sockaddr *)&sa, sl) != 0 || listen(fd, 4) != 0 ||
+       getsockname(fd, (struct sockaddr *)&sa, &sl) != 0)
+        return -1;
+    *port = ntohs(sa.sin_port);
+    return fd;
+}
+
+static int connect_loopback(uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(port),
+                              .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    if(fd < 0 || connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0)
+        return -1;
+    return fd;
+}
+
+/* What a sender receives within `ms`; "" when nothing comes. */
+static const char *received(int fd, int ms)
+{
+    static char buf[256];
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    size_t len = 0;
+    while(len < sizeof(buf) - 1 && poll(&pfd, 1, ms) > 0) {
+        ssize_t n = read(fd, buf + len, sizeof(buf) - 1 - len);
+        if(n <= 0)
+            break;
+        len += (size_t)n;
+        ms = 50;                         /* the rest of the same burst */
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Bytes serialPutC accepted; a drop ends the count. */
+static int put_bytes(int n)
+{
+    int i = 0;
+    while(i < n && serialPutC('x'))
+        i++;
+    return i;
+}
 
 /* --- test driver ----------------------------------------------------- */
 
@@ -156,9 +246,102 @@ int main(void)
     n = drain(got, 200, &bad, "G1 X-30 F1500", "G1 Y0.3 F1500");
     CHECK(n == 1 && bad == 0, "the ring recovers to whole lines");
 
+    /* --- the banner on a connect --------------------------------------- */
+    printf("The welcome banner on a connect:\n");
+    grbl.report.init_message = fake_banner;
+    hal.stream_blocking_callback = blocking_cb;
+    uint16_t port;
+    int lfd = listen_loopback(&port);
+    CHECK(lfd >= 0, "a listening socket on the loopback");
+    serial_set_listen_fd(lfd);
+
+    int sender = connect_loopback(port);
+    CHECK(sender >= 0, "a sender connects");
+    serial_poll();                                  /* accept, welcome, drain */
+    CHECK(banners == 1, "the connect writes the banner once");
+    CHECK(strcmp(received(sender, 500), BANNER) == 0, "the sender receives the banner unasked");
+    serial_poll();
+    CHECK(banners == 1 && received(sender, 100)[0] == '\0', "a later poll writes nothing more");
+
+    /* A second connect displaces the first and is welcomed in turn - but
+       not from a poll that runs inside a blocked write. */
+    int sender2 = connect_loopback(port);
+    tx_blocked = true;                              /* as serialPutC leaves it while it waits */
+    serial_poll();
+    CHECK(client_fd >= 0 && banners == 1 && received(sender2, 100)[0] == '\0',
+          "a poll inside a blocked write accepts the sender but holds the banner");
+    tx_blocked = false;
+    serial_poll();
+    CHECK(banners == 2 && strcmp(received(sender2, 500), BANNER) == 0,
+          "the next top-level poll writes the banner to the new sender");
+    CHECK(received(sender, 100)[0] == '\0', "the displaced sender gets nothing");
+    close(sender);
+    close(sender2);
+    drop_client();
+    serial_set_listen_fd(-1);
+    close(lfd);
+
+    /* --- the TX ring and its stall bound --------------------------------- */
+    printf("The TX ring under a sender that stops reading:\n");
+    CHECK(TX_BUFFER_SIZE >= 2048, "the ring holds 2048 bytes");
+
+    /* The sender is a pipe with a 4 KiB capacity, already full: every
+       byte from here on waits in the ring for the reader. */
+    int pfd[2];
+    CHECK(pipe2(pfd, O_NONBLOCK | O_CLOEXEC) == 0 && fcntl(pfd[1], F_SETPIPE_SZ, 4096) >= 0,
+          "a pipe stands in for the sender's socket");
+    {
+        char fill[4096];
+        memset(fill, 'f', sizeof(fill));
+        while(write(pfd[1], fill, sizeof(fill)) > 0)
+            ;
+    }
+    peer_rd = pfd[0];
+    client_fd = pfd[1];
+    txbuffer.head = txbuffer.tail = 0;
+
+    /* A $$ dump is about 750 bytes on the machine; twice that queues
+       without a single wait on the sender. */
+    cb_calls = 0;
+    peer_reads = false;
+    CHECK(put_bytes(1500) == 1500 && cb_calls == 0 && serialTxCount() == 1500,
+          "a 1500-byte report queues in the ring without waiting on the sender");
+
+    /* The ring fills; a sender that resumes reading 900 ms later keeps
+       its connection and every byte. */
+    cb_calls = 0;
+    peer_reads = true;
+    peer_after_s = 0.9;
+    int accepted = put_bytes(1200);
+    double waited = now_s() - blocked_at;
+    CHECK(accepted == 1200 && client_fd == pfd[1], "a 900 ms pause in the sender's reading drops nothing");
+    CHECK(cb_calls > 0 && waited >= 0.9 && waited < 1.5,
+          "the write waited for the sender, in the blocking callback");
+
+    /* Drain everything the reader can take, then fill the ring again
+       with a sender that reads only after 1100 ms: the bound drops it at
+       one second, with the ring flushed. */
+    {
+        char buf[512];
+        while(read(pfd[0], buf, sizeof(buf)) > 0)
+            serial_poll();
+        while(write(pfd[1], buf, sizeof(buf)) > 0)
+            ;
+    }
+    cb_calls = 0;
+    peer_after_s = 1.1;
+    put_bytes(TX_BUFFER_SIZE);                      /* fills, then blocks on the last byte */
+    waited = now_s() - blocked_at;
+    CHECK(client_fd < 0, "a sender that pauses past the bound is dropped");
+    CHECK(waited >= 1.0 && waited < 1.1, "the drop comes at the one-second bound");
+    CHECK(serialTxCount() == 1, "the ring is flushed with the drop; only the byte that waited remains");
+    close(pfd[0]);
+
     printf(failures ? "FAIL: %d check(s) failed\n"
-                    : "PASS: an overrun drops the overrunning line whole, keeps every "
-                      "earlier line, passes real-time characters and is reported once\n",
+                    : "PASS: an overrun drops the overrunning line whole, keeps every earlier "
+                      "line, passes real-time characters and is reported once; a connect is "
+                      "welcomed from a top-level poll; the ring holds a settings dump and "
+                      "drops a sender only after a second without progress\n",
            failures);
     return failures ? 1 : 0;
 }
