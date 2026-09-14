@@ -103,9 +103,16 @@ void gfhome_apply_z_limit (void)
         sys.work_envelope.max.values[Z_AXIS] = z;
     }
     /* The core checks the limit on homed axes only: Z is always
-     * referenced, to the edge or to where it stands. */
+     * referenced, to the edge or to where it stands. X and Y are
+     * limited to the bed while they are homed (a gfcloud home sets
+     * them, an invalidated position clears them): the core's own $20
+     * cannot be turned on with $22 off, so the mask is the driver's. */
     sys.homed.mask |= Z_AXIS_BIT;
     sys.soft_limits.mask |= Z_AXIS_BIT;
+    if(sys.homed.mask & X_AXIS_BIT)
+        sys.soft_limits.mask |= X_AXIS_BIT;
+    if(sys.homed.mask & Y_AXIS_BIT)
+        sys.soft_limits.mask |= Y_AXIS_BIT;
 }
 
 /* The free travel each way from the edge: the values given, else the
@@ -181,6 +188,10 @@ void gfhome_invalidate (void)
 {
     unlink(HOMED_ANCHOR);
     z_referenced = false;
+    /* The position is not trusted: X and Y are no longer homed, and
+     * their soft limits go with the reference. */
+    sys.homed.mask &= (uint8_t)~(X_AXIS_BIT | Y_AXIS_BIT);
+    sys.soft_limits.mask &= (uint8_t)~(X_AXIS_BIT | Y_AXIS_BIT);
     gfhome_apply_z_limit();
 }
 
@@ -219,8 +230,12 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
        cfg_read("gfcloud_home_cmd", cmd, sizeof(cmd)) != 0 || cmd[0] == '\0')
         strcpy(cmd, CMD_DEFAULT);
 
-    uint32_t timeout_ms =
-        (uint32_t)(cfg_read_float("gfcloud_home_timeout_s", TIMEOUT_S_DEFAULT) * 1000.0f);
+    float timeout_key = cfg_read_float("gfcloud_home_timeout_s", TIMEOUT_S_DEFAULT);
+    float timeout_s = gfhome_clamp_timeout_s(timeout_key, TIMEOUT_S_DEFAULT);
+    if(timeout_s != timeout_key)
+        fflog(LOG_WARNING, "gfhome: gfcloud_home_timeout_s %g is out of range; using %g s",
+              (double)timeout_key, (double)timeout_s);
+    uint32_t timeout_ms = (uint32_t)(timeout_s * 1000.0f);
 
     state_set(STATE_HOMING);
     gfhome_invalidate();   /* the session moves the machine */
@@ -345,8 +360,14 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
      * NOTE: settings.axis[].max_travel is stored negative. */
     long edge_steps = gfhome_z_steps(edge_z, z_spm);
     float home[N_AXIS];
-    home[X_AXIS] = cfg_read_float("gfcloud_home_x", 0.0f);
-    home[Y_AXIS] = cfg_read_float("gfcloud_home_y", 0.0f);
+    static const char *const home_keys[] = { "gfcloud_home_x", "gfcloud_home_y" };
+    for(uint_fast8_t a = X_AXIS; a <= Y_AXIS; a++) {
+        float key = cfg_read_float(home_keys[a], 0.0f);
+        home[a] = gfhome_clamp_home_mm(key, -settings.axis[a].max_travel);
+        if(home[a] != key)
+            fflog(LOG_WARNING, "gfhome: %s %g is off the bed; using %g", home_keys[a],
+                  (double)key, (double)home[a]);
+    }
     home[Z_AXIS] = (float)(edge_steps + park) / z_spm;
 
     uint_fast8_t idx;

@@ -287,7 +287,7 @@ static void button_led (uint32_t val)
     snprintf(v, sizeof(v), "%u", val);
     for(uint32_t led = 1; led <= 3; led++) {
         snprintf(path, sizeof(path), "/sys/class/leds/button_led_%u/target", led);
-        int fd = open(path, O_WRONLY);
+        int fd = open(path, O_WRONLY | O_CLOEXEC);
         if(fd >= 0) {
             if(write(fd, v, strlen(v)) < 0) { /* LED only; ignore */ }
             close(fd);

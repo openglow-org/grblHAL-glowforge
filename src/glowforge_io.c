@@ -8,6 +8,12 @@
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
+/* The project headers first: glibc's stat.h (via fcntl.h) defines an
+ * st_mtime macro that would otherwise mangle the field of that name in
+ * the core's vfs.h, which the settings header below reaches. */
+#include "glowforge_io.h"
+#include "fflog.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,9 +23,6 @@
 #include <string.h>
 #include <sys/file.h>
 #include <unistd.h>
-
-#include "glowforge_io.h"
-#include "fflog.h"
 
 #define GF_SYSFS "/sys/glowforge/"
 
@@ -73,7 +76,7 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     int fd;
     ssize_t n;
     snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
-    if((fd = open(path, O_RDONLY)) < 0)
+    if((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
         return -1;
     n = read(fd, buf, len - 1);
     close(fd);
@@ -85,11 +88,14 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     return 0;
 }
 
+/* Standalone: the device is this process's alone and must never reach
+ * a child (the homing runner gets it through the broker's inherited fd
+ * only, and standalone the suspend closes it first). */
 static int open_pulse_dev (const char *path, int lock_flags)
 {
     int fd;
 
-    if((fd = open(path, O_WRONLY)) < 0)
+    if((fd = open(path, O_WRONLY | O_CLOEXEC)) < 0)
         return -1;
 
     if(flock(fd, lock_flags) != 0) {
@@ -124,23 +130,31 @@ bool gfio_pulse_inherited (void)
     return inherited_pulse_fd() >= 0;
 }
 
+/* The inherited fd rides the broker's open file description, which
+ * already carries the lock, so the relock is a no-op there; one that
+ * fails anyway is said, never hidden. The fd stays inheritable: the
+ * supervisor cleared its close-on-exec for this child, and the homing
+ * runner needs it the same way. */
+static int inherited_locked (int fd)
+{
+    if(flock(fd, LOCK_EX) != 0)
+        fflog(LOG_WARNING, "gfio: flock on the inherited pulse fd failed: %s", strerror(errno));
+    return fd;
+}
+
 int gfio_open_pulse_dev (const char *path)
 {
     int fd = inherited_pulse_fd();
-    if(fd >= 0) {
-        flock(fd, LOCK_EX);
-        return fd;
-    }
+    if(fd >= 0)
+        return inherited_locked(fd);
     return open_pulse_dev(path, LOCK_EX);
 }
 
 int gfio_open_pulse_dev_nb (const char *path)
 {
     int fd = inherited_pulse_fd();
-    if(fd >= 0) {
-        flock(fd, LOCK_EX);
-        return fd;
-    }
+    if(fd >= 0)
+        return inherited_locked(fd);
     return open_pulse_dev(path, LOCK_EX | LOCK_NB);
 }
 

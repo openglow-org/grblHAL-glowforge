@@ -96,6 +96,7 @@
 #include "glowforge_switch_map.h"
 #include "glowforge_io.h"
 #include "glowforge_laser.h"
+#include "stepper_stream.h"
 
 #include "grbl/hal.h"
 #include "grbl/planner.h"
@@ -368,14 +369,9 @@ static void cancel_job (void)
 /* The kernel is still playing the queued tail of the hold's deceleration
    for up to a stream depth after the core parks; the reset waits for it
    (bounded), so nothing stops it short and the park runs on an idle
-   kernel. Without a device (null-sink) there is nothing to wait for. */
-static bool kernel_idle (void)
-{
-    char state[16] = "";
-    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
-        return false;                   /* unreadable: not idle; the 2 s bound ends the wait */
-    return strcmp(state, "idle") == 0;
-}
+   kernel. The stream engine's reading of the kernel is the one used
+   everywhere: idle when there is no device, not idle when the state
+   cannot be read (the 2 s bound ends that wait). */
 
 static void send_reset (void)
 {
@@ -411,7 +407,7 @@ static void cancel_poll (sys_state_t st)
             /* Idle kernel, the bounded wait, or the core leaving the door
                state under us (a cycle start; the latch is already locked):
                the job is cancelled either way - reset now. */
-            if(kernel_idle() || st != STATE_SAFETY_DOOR || wall_s() - park_at > DRAIN_WAIT_S)
+            if(gf_stream_kernel_idle() || st != STATE_SAFETY_DOOR || wall_s() - park_at > DRAIN_WAIT_S)
                 send_reset();
             break;
 
@@ -465,8 +461,16 @@ void gfsw_poll (void)
     control_signals_t now = {0}, want, on, off;
     sys_state_t st = state_get();
 
-    if(!gfsw_available() || !read_signals(&now))
+    if(!gfsw_available())
         return;
+
+    /* A read that fails keeps the previous state (no false edge), but a
+     * cancel in flight keeps going: its reset and its park must not
+     * wait on a switch device that has stopped answering. */
+    if(!read_signals(&now)) {
+        cancel_poll(st);
+        return;
+    }
 
     state = now;
 

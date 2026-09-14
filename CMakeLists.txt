@@ -82,7 +82,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(${DRIVER_SOURCES}
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
         tests/bind_addr_test.c tests/lens_home_test.c tests/xy_scale_test.c
-        tests/latch_test.c tests/cooling_test.c
+        tests/latch_test.c tests/cooling_test.c tests/switches_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
 
@@ -163,3 +163,11 @@ target_link_libraries(latch_test m pthread)
 add_executable(cooling_test tests/cooling_test.c)
 target_include_directories(cooling_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(cooling_test pthread)
+
+# Host unit test for the switch poll's cancel path
+# (src/glowforge_switches.c): a lid cancel in flight sends its reset and
+# runs its park on polls whose switch read fails. Includes the switch
+# source, drives the file-backed test source; must not link the core.
+add_executable(switches_test tests/switches_test.c)
+target_include_directories(switches_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(switches_test m)

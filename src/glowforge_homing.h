@@ -34,6 +34,31 @@ static inline int gfhome_park_steps (float edge_z_mm, float park_z_mm, float z_s
     return k < -down ? -down : k > up ? up : (int)k;
 }
 
+// The homing session's budget, seconds, held to 10..3600: a value out of
+// range lands on the nearer end, and one that is not a number (NaN, an
+// unparsable key) takes `dflt`. The session runs with the pulse device
+// handed over, so it is always bounded.
+#define GFHOME_TIMEOUT_MIN_S 10.0f
+#define GFHOME_TIMEOUT_MAX_S 3600.0f
+
+static inline float gfhome_clamp_timeout_s (float s, float dflt)
+{
+    if(!(s == s))
+        return dflt;
+    return s < GFHOME_TIMEOUT_MIN_S ? GFHOME_TIMEOUT_MIN_S
+         : s > GFHOME_TIMEOUT_MAX_S ? GFHOME_TIMEOUT_MAX_S : s;
+}
+
+// The post-homing coordinate of an axis, held to the bed: 0 to `travel`
+// (the axis's travel, positive). A value that is not a number is the
+// origin.
+static inline float gfhome_clamp_home_mm (float mm, float travel)
+{
+    if(!(mm == mm))
+        return 0.0f;
+    return mm < 0.0f ? 0.0f : mm > travel ? travel : mm;
+}
+
 // The lens is never moved without a reference. The Z soft limit is
 // always on: until Z is referenced it holds Z where it is (a jog is
 // refused, a program move raises the soft-limit alarm before it starts);
@@ -43,6 +68,9 @@ static inline int gfhome_park_steps (float edge_z_mm, float park_z_mm, float z_s
 // pass 0 for either to take the settings, else the fallback);
 // gfhome_apply_z_limit re-applies the standing state (after a settings
 // change, at the driver's start, and when the reference is dropped).
+// The X and Y soft limits are the driver's as well: on after a
+// successful home (the envelope is the bed), off while the position is
+// not trusted. The core's $20 stays off ($22 is off by design).
 void gfhome_reference_z (float z_mm, int below, int above);
 void gfhome_apply_z_limit (void);
 

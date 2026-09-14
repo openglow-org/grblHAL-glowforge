@@ -424,10 +424,13 @@ static void rt_log (const char *msg)
  * a bounded time; EINTR is retried; a partial write is completed. The
  * bound is generous because the wall-clock pacing keeps the queue
  * shallow, so a ring that stays full is a kernel that has stopped
- * consuming and is caught by check_kernel_state(). Returns 0 or -1 with
- * errno set. */
+ * consuming: every few back-offs the kernel state is read, and a
+ * faulted or underrun kernel ends the write at once. The shipper calls
+ * this without gf.lock, so the producer and a reset are never held up
+ * by the back-off. Returns 0 or -1 with errno set. */
 #define PULSE_WRITE_BACKOFF_NS 2000000L   /* 2 ms */
 #define PULSE_WRITE_BACKOFF_MAX 250       /* ~0.5 s of ring-full retries */
+#define PULSE_WRITE_STATE_EVERY 10        /* back-offs between kernel state reads */
 
 static int pulse_write (int fd, const unsigned char *buf, size_t len)
 {
@@ -444,12 +447,42 @@ static int pulse_write (int fd, const unsigned char *buf, size_t len)
             continue;
         if(w < 0 && (errno == ENOMEM || errno == EAGAIN) &&
             ++backoffs <= PULSE_WRITE_BACKOFF_MAX) {
+            if(backoffs % PULSE_WRITE_STATE_EVERY == 0) {
+                char state[16] = "";
+                if(gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
+                   (strcmp(state, "fault") == 0 || strcmp(state, "underrun") == 0)) {
+                    errno = EIO;
+                    return -1;
+                }
+            }
             sleep_ns(PULSE_WRITE_BACKOFF_NS);
             continue;
         }
         if(w == 0)
             errno = EIO;
         return -1;
+    }
+    return 0;
+}
+
+/* Host-only stall knobs for the harnesses, read at init (never with a
+ * device). GFSINK_STALL_MS starves the producer once, that long, half a
+ * second into a run: the scheduling stall that maps events behind the
+ * ship cursor. GFSINK_WRITE_STALL_MS holds the null sink's write that
+ * long once, the way a full kernel ring holds the real one: the
+ * back-off the shipper must serve without gf.lock. */
+static uint32_t stall_ms, write_stall_ms;
+static bool stalled, write_stalled;
+
+/* The sink's write: the pulse device, or the null sink (a no-op that
+ * can stall once for the harness). Called without gf.lock. */
+static int sink_write (bool active, int fd, const unsigned char *buf, size_t len, double run_s)
+{
+    if(active)
+        return pulse_write(fd, buf, len);
+    if(write_stall_ms && !write_stalled && run_s > 0.5) {
+        write_stalled = true;
+        sleep_ns((long)write_stall_ms * 1000000L);
     }
     return 0;
 }
@@ -469,6 +502,31 @@ uint32_t gf_stream_rate (void)
 void gf_stream_cycles_per_tick (uint32_t cycles)
 {
     gf.period_latched = cycles == 0 ? 1 : cycles;
+}
+
+/* A producer event that maps behind the ship cursor: the lead was
+ * exhausted (the producer was kept off the CPU), and pushing the event
+ * forward compresses it onto later bytes, a step burst the counters
+ * still trust. Unarmed that is counted and warned; inside an armed
+ * window it is a fault (the hook disarms, drops the homing anchor and
+ * alarms), because the burst is also energy where it was not commanded.
+ * Returns true when the caller must drop the event. Call under gf.lock. */
+static bool clamp_locked (void)
+{
+    gf.clamped++;
+    if(!laser_armed)
+        return false;
+    if(!gf.failed) {
+        rt_log("gfstream: late events while the laser is armed - faulting the stream\n");
+        gf.failed = true;
+        fault_flag = true;
+        /* The bytes already in the kernel play on until it is told to
+         * stop: the ramp starts here, the hook locks the latch, and the
+         * reset clears what the ramp did not reach. */
+        if(gf.active)
+            gfio_wr_attr("cnc/stop", "1");
+    }
+    return true;
 }
 
 /* Producer/pulse: map a step event at the current virtual time onto the
@@ -500,8 +558,11 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits)
         if(margin < gf.min_margin)
             gf.min_margin = margin;
         if(idx < gf.shipped) {          /* produced late vs wall clock: push forward */
+            if(clamp_locked()) {
+                pthread_mutex_unlock(&gf.lock);
+                return;
+            }
             idx = gf.shipped;
-            gf.clamped++;
         }
         if(idx < gf.produced)           /* same machine tick as a previous event */
             idx = gf.produced;
@@ -609,8 +670,11 @@ static void laser_event_locked (uint8_t power, bool fire)
 {
     if(gf.streaming) {
         uint64_t idx = gf.base + gf.vticks / VTICKS_PER_BYTE;
-        if(idx < gf.shipped)
+        if(idx < gf.shipped) {
+            if(clamp_locked())
+                return;
             idx = gf.shipped;
+        }
 
         uint32_t pending = gf.lev_tail - gf.lev_head;
         if(pending > 0 && gf.lev[(gf.lev_tail - 1) & LEV_MASK].idx == idx) {
@@ -856,6 +920,12 @@ static void *producer_thread (void *arg)
             if(behind > max_behind)
                 max_behind = behind;
 
+            /* The harness's scheduling stall: once, half a second in. */
+            if(stall_ms && !stalled && !gf.active && wall_s() - t_run > 0.5) {
+                stalled = true;
+                sleep_ns((long)stall_ms * 1000000L);
+            }
+
             /* Pace: keep virtual time within [wall, wall + slack] of the
              * wakeup epoch. Sleeps are sliced so disarm is noticed fast
              * even inside a multi-second G4 tick. Yield when running flat
@@ -1049,6 +1119,18 @@ static void ship_pass (void)
     pthread_mutex_lock(&gf.lock);
 
     if(gf.failed || gf.suspended) {
+        /* A faulted stream still ends dark: one pad tick behind the last
+         * lit byte it shipped, so the kernel's queue ends with FIRE clear
+         * whatever the ramp reaches; the end-of-data backstop covers a
+         * pad that does not land. */
+        if(gf.failed && gf.last_lit) {
+            unsigned char dark = 0x00;
+            if(gf.dump_fd >= 0 && write(gf.dump_fd, &dark, 1) < 0) { /* debug copy only */ }
+            if(gf.active && pulse_write(gf.fd, &dark, 1) < 0)
+                rt_log("gfstream: the dark pad after the fault did not land; the end-of-data backstop covers it\n");
+            gf.last_lit = false;
+            gf.cur_fire = false;
+        }
         pthread_mutex_unlock(&gf.lock);
         return;
     }
@@ -1084,7 +1166,15 @@ static void ship_pass (void)
                  * dark pad tick. */
                 unsigned char dark = 0x00;
                 if(gf.dump_fd >= 0 && write(gf.dump_fd, &dark, 1) < 0) { /* debug copy only */ }
-                if(gf.active && write(gf.fd, &dark, 1) < 0) { /* end-of-data still lands */ }
+                /* The one write kept under gf.lock: a full ring at a
+                 * stream's end is a kernel that stopped consuming, and
+                 * the end-of-data backstop still lands if this does not. */
+                if(gf.active && pulse_write(gf.fd, &dark, 1) < 0) {
+                    char msg[96];
+                    snprintf(msg, sizeof(msg), "gfstream: the dark pad did not land (%s); the "
+                             "end-of-data backstop covers it\n", strerror(errno));
+                    rt_log(msg);
+                }
                 gf.shipped++;
                 gf.produced = gf.shipped;
                 gf.cur_fire = false;
@@ -1188,8 +1278,22 @@ static void ship_pass (void)
         }
         if(n == 0)
             break;
-        if(gf.dump_fd >= 0 && write(gf.dump_fd, chunk, n) < 0) { /* debug copy only */ }
-        if(gf.active && pulse_write(gf.fd, chunk, n) < 0) {
+        /* The bytes are the kernel's from here: a reset that lands under
+         * the write below then stops the kernel and clears the ring
+         * residue, run or no run yet. */
+        bool first = !gf.kernel_running;
+        gf.kernel_running = true;
+        int fd = gf.fd, dump_fd = gf.dump_fd;
+        bool active = gf.active;
+        double run_s = wall_s() - gf.ship_t0;
+        /* The write and its back-off run without gf.lock: the producer
+         * keeps mapping events at wall pace behind a full ring, the fault
+         * poll keeps its cadence, and a reset can drop the backlog. */
+        pthread_mutex_unlock(&gf.lock);
+        if(dump_fd >= 0 && write(dump_fd, chunk, n) < 0) { /* debug copy only */ }
+        int wrc = sink_write(active, fd, chunk, n, run_s);
+        pthread_mutex_lock(&gf.lock);
+        if(wrc < 0) {
             char msg[96];
             snprintf(msg, sizeof(msg), "gfstream: pulse write failed: %s\n",
                      strerror(errno));
@@ -1198,10 +1302,11 @@ static void ship_pass (void)
             fault_flag = true;
             break;
         }
-        if(!gf.kernel_running) {
+        if(gf.failed || gf.suspended || gf.clear_pending)
+            break;                      /* a fault or a reset landed under the write */
+        if(first)
             start_run = true;
-            gf.kernel_running = true;
-        }
+        streaming = gf.streaming;
     }
 
     pthread_mutex_unlock(&gf.lock);
@@ -1575,6 +1680,14 @@ void gf_stream_init (void)
     /* Producer lead. Tunable so the bench can sweep it against the measured
      * min margin without a rebuild; the ring holds seconds, so the ceiling
      * is about feed-hold responsiveness, not capacity. */
+    /* The harness stall knobs, host only. */
+    if(dev == NULL || *dev == '\0') {
+        if((opt = getenv("GFSINK_STALL_MS")) && *opt)
+            stall_ms = (uint32_t)strtoul(opt, NULL, 10);
+        if((opt = getenv("GFSINK_WRITE_STALL_MS")) && *opt)
+            write_stall_ms = (uint32_t)strtoul(opt, NULL, 10);
+    }
+
     uint32_t lead_ms = GFSINK_LEAD_MS_DEFAULT;
     if((opt = getenv("GFSINK_LEAD_MS")) && *opt) {
         long v = strtol(opt, NULL, 10);

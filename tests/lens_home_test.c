@@ -13,6 +13,10 @@
     - the park is a whole number of half-steps from the edge's grid step
       to the park height's (gfhome_park_steps), kept inside the window
       every head reaches without touching a stop
+    - the session's budget is held to 10..3600 s and the post-homing
+      coordinates to the bed (gfhome_clamp_timeout_s,
+      gfhome_clamp_home_mm): a key that is not a number takes the
+      default, or the origin
 
   Copyright 2026 514 LLC d/b/a OpenGlow
   Written by Scott Wiederhold
@@ -118,6 +122,52 @@ int main (void)
             failures++;
         } else {
             printf("ok   %ld parks stay inside the window\n", checked);
+        }
+    }
+
+    /* The session budget: 10..3600 s, the nearer end for a value out of
+     * range, the default for a value that is not a number. */
+    {
+        const float dflt = 300.0f;
+        struct { float in, want; const char *what; } cases[] = {
+            { 300.0f, 300.0f, "the default stands" },
+            { 60.0f, 60.0f, "an in-range budget stands" },
+            { 5.0f, 10.0f, "a budget under 10 s lands on 10" },
+            { 0.0f, 10.0f, "a zero budget lands on 10, never wait-forever" },
+            { -30.0f, 10.0f, "a negative budget lands on 10" },
+            { 90000.0f, 3600.0f, "a huge budget lands on 3600" },
+            { NAN, 300.0f, "a budget that is not a number takes the default" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            float got = gfhome_clamp_timeout_s(cases[i].in, dflt);
+            if (fabsf(got - cases[i].want) > 1e-4f) {
+                printf("FAIL timeout %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
+                failures++;
+            } else {
+                printf("ok   timeout %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
+            }
+        }
+    }
+
+    /* The post-homing coordinates: 0..travel, the origin for a value
+     * that is not a number. */
+    {
+        const float travel = 495.0f;
+        struct { float in, want; const char *what; } cases[] = {
+            { 0.0f, 0.0f, "the origin stands" },
+            { 12.5f, 12.5f, "a point on the bed stands" },
+            { -3.0f, 0.0f, "a point off the near edge lands on it" },
+            { 600.0f, 495.0f, "a point past the far edge lands on it" },
+            { NAN, 0.0f, "a coordinate that is not a number is the origin" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            float got = gfhome_clamp_home_mm(cases[i].in, travel);
+            if (fabsf(got - cases[i].want) > 1e-4f) {
+                printf("FAIL home %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
+                failures++;
+            } else {
+                printf("ok   home %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
+            }
         }
     }
 

@@ -10,7 +10,10 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
+
+#include "grbl/settings.h"
 
 // Attribute paths are relative to /sys/glowforge/ (e.g. "cnc/state",
 // "pic/x_step_current"). All return 0 on success, -1 on failure.
@@ -119,4 +122,31 @@ static inline unsigned gfio_xy_ramp_for_tick (unsigned tick_hz)
 static inline float gfio_xy_rate_ceiling (unsigned tick_hz, float steps_per_mm)
 {
     return (float)tick_hz * 60.0f / steps_per_mm;
+}
+
+// The machine's pinned $-settings, re-asserted on every settings
+// dispatch, in RAM only (the stored values are never written from here,
+// and a typed one is overwritten on the spot): $100/$101 from the XY
+// microstep mode, $110/$111 held under the feed the tick carries, $102
+// the lens screw's constant (a typed 0 would turn the Z envelope into
+// NaN and silently drop the Z soft limit), and $32 laser mode (the
+// laser's M3/M4 semantics are the machine's, not a sender's choice).
+// Returns the axes whose max rate was held down, for the caller to log.
+static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, unsigned tick_hz)
+{
+    float spm = gfio_xy_steps_per_mm_of(mode);
+    float ceiling = gfio_xy_rate_ceiling(tick_hz, spm);
+    uint8_t held = 0;
+    const uint_fast8_t axes[] = { X_AXIS, Y_AXIS };
+
+    for(uint_fast8_t i = 0; i < 2; i++) {
+        s->axis[axes[i]].steps_per_mm = spm;
+        if(s->axis[axes[i]].max_rate > ceiling) {
+            s->axis[axes[i]].max_rate = ceiling;
+            held |= (uint8_t)(1u << axes[i]);
+        }
+    }
+    s->axis[Z_AXIS].steps_per_mm = DEFAULT_Z_STEPS_PER_MM;
+    s->mode = Mode_Laser;
+    return held;
 }

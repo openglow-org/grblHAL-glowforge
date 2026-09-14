@@ -14,6 +14,11 @@
     - the feed ceiling the stream carries: one step per tick per axis,
       which is what holds $110/$111 down when the bench lowers the tick
 
+  And the pins the settings dispatch re-asserts (gfio_apply_machine_pins):
+  $100/$101 from the mode, $110/$111 under the ceiling, $102 the lens
+  screw's constant (a typed 0 or 999 is overwritten), $32 laser mode (a
+  typed 0 is overwritten).
+
   Copyright 2026 514 LLC d/b/a OpenGlow
   Written by Scott Wiederhold
   SPDX-License-Identifier: GPL-3.0-or-later
@@ -24,6 +29,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int failures = 0;
 
@@ -105,6 +111,34 @@ int main (void)
     expect_f("ceiling x32 at 112640 Hz", gfio_xy_rate_ceiling(112640, gfio_xy_steps_per_mm_of(32)), 31680.0f, 0.5f);
     expect_f("ceiling x32 at 28160 Hz", gfio_xy_rate_ceiling(28160, gfio_xy_steps_per_mm_of(32)), 7920.0f, 0.5f);
     expect_f("ceiling x16 at 1000 Hz", gfio_xy_rate_ceiling(1000, gfio_xy_steps_per_mm_of(16)), 562.5f, 0.05f);
+
+    /* The pins: whatever a sender typed, the dispatch puts the machine's
+     * values back. $102 at 0 (the NaN envelope) or 999, and $32 off, are
+     * the typed values that matter. */
+    settings_t s;
+    memset(&s, 0, sizeof(s));
+    s.axis[X_AXIS].steps_per_mm = 1.0f;
+    s.axis[Y_AXIS].steps_per_mm = 1.0f;
+    s.axis[X_AXIS].max_rate = 99999.0f;
+    s.axis[Y_AXIS].max_rate = 6000.0f;
+    s.axis[Z_AXIS].steps_per_mm = 0.0f;
+    s.mode = Mode_Standard;
+    uint8_t held = gfio_apply_machine_pins(&s, 8, 28160);
+    expect_f("$100 pinned from the mode", s.axis[X_AXIS].steps_per_mm, 53.333f, 1e-4f);
+    expect_f("$101 pinned from the mode", s.axis[Y_AXIS].steps_per_mm, 53.333f, 1e-4f);
+    expect_f("$110 held under the ceiling", s.axis[X_AXIS].max_rate, 31680.0f, 0.5f);
+    expect_f("$111 under the ceiling is left alone", s.axis[Y_AXIS].max_rate, 6000.0f, 1e-3f);
+    expect_u("the held axes are reported", held, 1u << X_AXIS);
+    expect_f("$102 typed to 0 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
+    expect_u("$32 typed to 0 is re-asserted", (unsigned)s.mode, (unsigned)Mode_Laser);
+    s.axis[Z_AXIS].steps_per_mm = 999.0f;
+    s.mode = Mode_Lathe;
+    s.axis[X_AXIS].max_rate = 12000.0f;
+    held = gfio_apply_machine_pins(&s, 32, 112640);
+    expect_f("$102 typed to 999 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
+    expect_u("$32 is re-asserted again", (unsigned)s.mode, (unsigned)Mode_Laser);
+    expect_f("$100 follows the mode", s.axis[X_AXIS].steps_per_mm, 213.333f, 1e-4f);
+    expect_u("nothing held at the mode's own tick", held, 0);
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);
