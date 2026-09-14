@@ -462,7 +462,7 @@ static bool dither_tick (void)
     return false;
 }
 
-/* Ticks of the x8 reference tick (the commissioned laser keys) into
+/* Ticks of the x8 reference tick (the unit of the setup's laser keys) into
  * ticks of the stream in force: a whole number, never below one. */
 static uint32_t ref_ticks_to_stream (uint32_t ref_ticks)
 {

@@ -93,7 +93,7 @@
     laser_floor_density inside an armed job, after every buffered
     motion has played (synchronized), through the same spindle
     configuration the arm runs, so the PWM mapping is precomputed
-    against the new floor: the commissioning sheet's corner card burns
+    against the new floor: the setup sheet's corner card burns
     one pattern per gamma in a single press, and its floor and
     dose-curve cards burn their text under the machine's keys and
     switch the floor and the curve off for their rungs, the daemon

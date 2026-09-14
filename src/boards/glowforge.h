@@ -69,7 +69,7 @@
 #define DEFAULT_Z_MAX_TRAVEL 12.32f
 
 // The lens is placed in that frame by one per-head number in
-// /data/forgefirm/forgefirm.conf, measured and written by the commissioning focus
+// /data/forgefirm/forgefirm.conf, measured and written by the setup focus
 // card: lens_hall_edge_z_mm, the focal height above the tray when the
 // lens sits on the hall sensor's rising edge, the one reference the head
 // has (every head shares the screw and the travel; where along the
@@ -103,7 +103,7 @@
 // re-strike at all. Under the analog fallback the same setting is a
 // DUTY floor and wants ~16 instead, the duty this tube lases at; the
 // wrong pairing is a dead band either way, so a machine switched to
-// analog must raise it. Both are tube properties, commissioned per
+// analog must raise it. Both are tube properties, measured per
 // machine with the ladder drills in forgefirm scripts/bench.
 #define DEFAULT_SPINDLE_PWM_MIN_VALUE 10.0f // Percent
 

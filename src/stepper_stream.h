@@ -51,7 +51,7 @@ void gf_stream_laser (uint8_t power, bool fire);
 // commanded level lands in the band.
 //
 // Both tick counts are ticks of the x8 reference tick (28160 Hz, the
-// unit the commissioned laser keys are in) and are scaled to the tick
+// unit the setup's laser keys are in) and are scaled to the tick
 // in force, so the laser timing is the same at every microstep mode.
 //
 // min_ticks is the shortest pulse worth emitting: below it a period is
