@@ -30,6 +30,10 @@ jobs:
         run: ./build/lens_home_test
       - name: XY microstep scale derivations
         run: ./build/xy_scale_test
+      - name: Laser latch writer (retries, ownership, the run-start relight)
+        run: ./build/latch_test
+      - name: Cooling client verdict tiers
+        run: ./build/cooling_test
       # The safety harnesses live in the forgefirm repo (scripts/bench/)
       # and drive the null-sink build over TCP - no hardware, no root.
       - name: Fetch the test harnesses

@@ -38,9 +38,10 @@ bool gfio_pulse_inherited (void);
 
 // Factory analog machine config (print-header ground truth), with the XY
 // microstep mode in force in place of the factory's x8: mixed-decay mode
-// (decay mode 1), every axis in the pulse stream, laser latched out, PIC
-// hold currents. The kernel does not restore any of this after a module
-// reload.
+// (decay mode 1), every axis in the pulse stream, PIC hold currents. The
+// kernel does not restore any of this after a module reload. The laser
+// latch is not written here: every latch write goes through the stream
+// engine's one writer (gf_stream_laser_latch), which locks it first.
 void gfio_analog_config (void);
 
 // Factory run/idle current scheme: full torque only while motion plays.

@@ -32,6 +32,19 @@ void gfcool_poll (void);
 // no file IO on that path.
 bool gfcool_fire_ok (void);
 
+// The verdict's own fire_ok while it is fresh: the input of the per-tick
+// fire gate. Unlike gfcool_fire_ok() it does not wait on the engine's
+// acknowledgment of the armed window, which is an arm-time
+// precondition and not a mid-job gate.
+bool gfcool_verdict_fire_ok (void);
+
+// True while the pause tier's first hold is still decelerating: the
+// fire gate stays open through it, so the pause leaves no dark gap in
+// the cut (the kernel's queue plays its lit bytes either way). False
+// once the head has stopped, and for every hold taken again under the
+// standing verdict.
+bool gfcool_decel_lit (void);
+
 // True once the engine has answered the armed window this client
 // reported: a fresh verdict carrying the engine's own armed flag. The
 // window opens before the engine has seen the report, and until it has,

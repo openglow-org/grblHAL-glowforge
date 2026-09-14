@@ -35,17 +35,42 @@
   and M5/M3 toggles do not re-prompt) and closes - relocking the
   latch - at program end (M2/M30/%), whenever the sender's connection
   changes (the consent belonged to the displaced session), after
-  laser_disarm_s of spindle-off grace (counting down in Idle and in a
-  job parked in Hold, Door or Tool Change - only a cycle, a jog or a
-  lingering M3 keeps the window open), or immediately on alarm, homing,
-  reset or a stream fault. The coolant fire gate is re-checked after
-  the button wait, so a window can never open against a verdict that
-  went bad during the wait. While unarmed or gated, fire requests are
-  suppressed at the stream and reported.
+  laser_disarm_s of spindle-off grace (counting down in Idle, in a jog,
+  and in a job parked in Hold, Door or Tool Change - only a cycle or a
+  lingering M3 keeps the window open; a jog is not the job the press
+  consented to), on the cooling verdict's fail tier (FIRE, CRASH,
+  AIRFLOW, CRITICAL: the latch locks, the job is reset with ALARM:3
+  and nothing resumes it), or immediately on alarm, homing, reset or a
+  stream fault. The verdict's pause tier (every other fire_ok=false,
+  and a stale verdict) holds the job under the open window, lit through
+  that first deceleration and masked from the stop on, and the clean
+  verdict's resume_ok resumes it with no new press. The pause never
+  writes the latch: a lock sets the hardware button latch, which only a
+  physical press clears, so a lock is a new press by construction and
+  belongs to the fail tier alone. The coolant fire gate is re-checked
+  after the button wait, so a window can never open against a verdict
+  that went bad during the wait. While unarmed or gated, fire requests
+  are suppressed at the stream: the stream engine masks the FIRE bit on
+  every tick with the gate this module publishes (the window, and the
+  verdict past the pause's deceleration), so no fire in flight survives
+  a closed window beyond the bytes already in the kernel's queue.
+
+  The latch has an owner: every lock and unlock this module makes goes
+  through the stream engine's one writer, which records it, and a lock
+  this process did not write (the engine's) is never undone by a run
+  start. A disarm locks the latch whenever this process unlocked it,
+  whether or not the window ever opened (the button wait, the re-arm
+  wait), and a state that cannot be read is never "still playing": the
+  relock after a job waits for the kernel to idle, and a kernel whose
+  state stays unreadable is relocked after a bound.
 
   Gates, in order, at the first laser-on of a job: the coolant verdict
   (fire_ok), head presence (the head driver has probed - lens, air assist
-  and beam detector are on the head), then the operator's button press.
+  and beam detector are on the head), a switch device on hardware (no
+  button to read means no arm), then the operator's button press: the
+  button must be seen up before a press counts, so a stuck button
+  never arms a job, and three unreadable reads in a row end the wait.
+  The head and the verdict are checked again after the wait.
 
   Config keys (shared machine config, re-read at each arm):
     laser_button_timeout_s   button wait budget (default 300; clamped
@@ -215,8 +240,19 @@ static _Atomic bool disarm_request = false; /* program end: close the window */
 static _Atomic bool arming = false;         /* blocked in the button wait */
 static bool rearm_pending;                  /* a held job's resume waits for the press */
 static double rearm_deadline;
+static unsigned rearm_client_gen;           /* the sender the re-arm belongs to */
+static int rearm_unreadable;                /* consecutive failed switch reads */
 static double disarmed_at;          /* margin for the sample-window lag */
 static bool rearm_released;         /* the button came up since the re-arm began */
+static bool fail_alarm_pending;     /* a fail-tier reset from a standstill still owes its alarm */
+
+/* How long an unreadable kernel state may defer the relock at a job's
+ * end (the tail the relock waits for is one queue depth, 200 ms). */
+#ifndef DISARM_UNREADABLE_S
+#define DISARM_UNREADABLE_S 2.0
+#endif
+/* Consecutive unreadable switch reads that end a button wait. */
+#define SWITCH_READ_FAILS_MAX 3
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
 static spindle_ptrs_t *hal_spindle;         /* the registered spindle's table entry */
@@ -261,15 +297,17 @@ static void button_led (uint32_t val)
 
 /* One reading of the switches for the arm wait. A press only counts with
  * the lid closed and the interlock loop closed - the same condition under
- * which the hardware button latch would clear on it. */
-enum { Arm_Waiting = 0, Arm_Pressed, Arm_LidOpen, Arm_InterlockOpen };
+ * which the hardware button latch would clear on it. An unreadable
+ * device is its own outcome: the callers bound how long they tolerate
+ * it. */
+enum { Arm_Waiting = 0, Arm_Pressed, Arm_LidOpen, Arm_InterlockOpen, Arm_Unreadable };
 
 static int arm_switches (void)
 {
     uint8_t sw[SW_BYTES];
 
     if(!gfsw_read_raw(sw))
-        return Arm_Waiting;             /* unreadable: keep waiting */
+        return Arm_Unreadable;
 
     if(!gfsw_bit_set(sw, SW_BIT_DOORS))
         return Arm_LidOpen;
@@ -290,10 +328,21 @@ static bool pump (long timeout_us)
 
 /* All latch writes go through the stream engine's serialized writer:
  * the shipper's run-start relight must be atomic against a concurrent
- * disarm here, or it can re-unlock a latch this module just locked. */
-static void latch_lock (bool lock)
+ * disarm here, or it can re-unlock a latch this module just locked.
+ * The writer records the owner and retries; a lock that still fails
+ * faults the stream, an unlock that fails returns false. */
+static bool latch_lock (bool lock)
 {
-    gf_stream_laser_latch(lock);
+    return gf_stream_laser_latch(lock);
+}
+
+/* The per-tick fire gate the stream engine masks FIRE with: the window
+ * and the verdict's own fire_ok, held open through the pause tier's
+ * first deceleration so a pause leaves no gap in the cut. Published on
+ * every poll and on every arm and disarm. */
+static void fire_gate_publish (void)
+{
+    gf_stream_fire_gate(laser_ok && (gfcool_verdict_fire_ok() || gfcool_decel_lit()));
 }
 
 bool gflaser_arming (void)
@@ -301,20 +350,30 @@ bool gflaser_arming (void)
     return atomic_load(&arming);
 }
 
+/* Close the window and lock the latch. Idempotent, and the lock does not
+ * depend on the window: the latch is locked whenever this process
+ * unlocked it, so a reset or a stream fault inside the button wait or
+ * the re-arm wait relocks too. */
 void gflaser_disarm (void)
 {
-    if(!laser_ok)
-        return;
+    bool was = laser_ok;
+    bool unlocked = !gf_stream_latch_locked_by_us();
 
     laser_ok = false;
     gf_stream_laser_arm(false);
-    latch_lock(true);
+    gf_stream_fire_gate(false);
+    if(unlocked)
+        latch_lock(true);
+    if(!was && !unlocked)
+        return;
+
     button_led(0);
     gfcool_laser_armed(false);
     disarm_at = 0.0;
     disarm_request = false;
     disarmed_at = wall_s();
-    report_message("laser disarmed - latch locked", Message_Info);
+    if(was)
+        report_message("laser disarmed - latch locked", Message_Info);
 }
 
 /* --- dose model ---------------------------------------------------------- */
@@ -543,6 +602,23 @@ static void report_model (const char *what)
 /* The first laser-on of a job: gate, unlock, wait for the operator's
  * button press. Runs on the protocol thread with the planner synced
  * (the core syncs every spindle state change, laser mode included). */
+/* No head, no beam: the lens, air assist and beam detector live on the
+ * head, and the hardware safety chain does not include head presence.
+ * Presence is the head driver having probed - its sysfs group exists -
+ * not the EV_SW head line. Checked before the latch is unlocked and
+ * before the button ever lights, and again after the wait. */
+static bool head_present (void)
+{
+    char hall[16];
+    if(!hw_active)
+        return true;
+    if(gfio_rd_attr("head/hall_sensor", hall, sizeof(hall)) == 0)
+        return true;
+    report_message("laser fire blocked: no head detected", Message_Warning);
+    system_raise_alarm(Alarm_AbortCycle);
+    return false;
+}
+
 static bool arm_gates (void)
 {
     if(!gfcool_fire_ok()) {
@@ -551,18 +627,17 @@ static bool arm_gates (void)
         return false;
     }
 
-    /* No head, no beam: the lens, air assist and beam detector live on
-     * the head, and the hardware safety chain does not include head
-     * presence. Presence is the head driver having probed - its sysfs
-     * group exists - not the EV_SW head line. Checked before the latch
-     * is unlocked and before the button ever lights. */
-    if(hw_active) {
-        char hall[16];
-        if(gfio_rd_attr("head/hall_sensor", hall, sizeof(hall)) != 0) {
-            report_message("laser fire blocked: no head detected", Message_Warning);
-            system_raise_alarm(Alarm_AbortCycle);
-            return false;
-        }
+    if(!head_present())
+        return false;
+
+    /* On hardware the button is the consent, and a machine with no
+     * switch device has no button to read: no arm. The host build (no
+     * GFSINK) keeps the null-sink auto-arm. */
+    if(hw_active && !gfsw_available()) {
+        report_message("laser fire blocked: no switch device (the button cannot be read)", Message_Warning);
+        fflog(LOG_ERR, "gflaser: arm refused - no switch device");
+        system_raise_alarm(Alarm_AbortCycle);
+        return false;
     }
 
     return true;
@@ -631,6 +706,14 @@ static bool arm_complete (void)
         return false;
     }
 
+    /* The head is checked again: the wait can run for minutes, and a
+     * head lifted during it must not arm. */
+    if(!head_present()) {
+        latch_lock(true);
+        gfcool_laser_armed(false);
+        return false;
+    }
+
     /* Put the dose model in force for this window - rendering and
      * floor both - before any fire reaches the stream. A floor of 0 is
      * a deliberate setting (the threshold ladders run that way) and
@@ -645,9 +728,23 @@ static bool arm_complete (void)
     disarm_at = 0.0;
     armed_client_gen = serial_client_generation();
     gf_stream_laser_arm(true);
+    fire_gate_publish();
     report_model("laser armed");
 
     return true;
+}
+
+/* The arm's unlock of the latch. An unlock that does not take refuses
+ * the arm: the window never opens against a latch of unknown state. */
+static bool arm_unlock (void)
+{
+    if(latch_lock(false))
+        return true;
+    gfcool_laser_armed(false);
+    report_message("laser fire blocked: the laser latch did not unlock", Message_Warning);
+    fflog(LOG_ERR, "gflaser: arm refused - the latch unlock write failed");
+    system_raise_alarm(Alarm_AbortCycle);
+    return false;
 }
 
 static bool gflaser_arm (void)
@@ -658,7 +755,8 @@ static bool gflaser_arm (void)
     /* Fan run profile + flow interrogation cover the whole armed
      * window, whatever the sender's M8/M9 state. */
     gfcool_laser_armed(true);
-    latch_lock(false);
+    if(!arm_unlock())
+        return false;
 
     if(gfsw_available()) {
         /* The wait runs with the latch unlocked, so it must always be
@@ -676,8 +774,11 @@ static bool gflaser_arm (void)
          * the wait runs at Idle, where the door signal is hidden from
          * the core, and an open lid or loop cancels the job outright
          * (the factory does the same; the hardware button latch sets on
-         * the lid and would ignore a press anyway). */
-        bool pressed = false, aborted = false;
+         * the lid and would ignore a press anyway). The press counts
+         * only after the button has been seen up: a button held down
+         * from before the job, or stuck, is not consent. */
+        bool pressed = false, aborted = false, released = false;
+        int unreadable = 0;
         unsigned sender_gen = serial_client_generation();
         arming = true;
         while(!pressed && !aborted) {
@@ -690,7 +791,30 @@ static bool gflaser_arm (void)
                 aborted = true;
                 break;
             }
-            switch(arm_switches()) {
+            /* An alarm raised under the wait (a stream fault) ends it:
+             * the disarm has locked the latch already. */
+            if(state_get() & (STATE_ALARM | STATE_ESTOP)) {
+                report_message("alarm during arm - job canceled", Message_Warning);
+                aborted = true;
+                break;
+            }
+            int sw = arm_switches();
+            if(sw == Arm_Waiting)
+                released = true;
+            else if(sw == Arm_Pressed && !released)
+                sw = Arm_Waiting;           /* down since before the wait: not consent */
+            if(sw == Arm_Unreadable) {
+                if(++unreadable >= SWITCH_READ_FAILS_MAX) {
+                    report_message("laser arm canceled: the switches cannot be read", Message_Warning);
+                    fflog(LOG_ERR, "gflaser: arm canceled - %d consecutive switch reads failed",
+                          unreadable);
+                    system_raise_alarm(Alarm_AbortCycle);
+                    aborted = true;
+                    break;
+                }
+            } else
+                unreadable = 0;
+            switch(sw) {
                 case Arm_Pressed:
                     pressed = true;
                     gfsw_button_consumed();   /* not a pause press */
@@ -769,7 +893,8 @@ bool gflaser_resume_gate (void)
         return true;                    /* refused: the alarm ends the job */
 
     gfcool_laser_armed(true);
-    latch_lock(false);
+    if(!arm_unlock())
+        return true;                    /* refused: the alarm ends the job */
 
     if(!gfsw_available())
         return !arm_complete();         /* no button (host builds): straight through */
@@ -780,6 +905,8 @@ bool gflaser_resume_gate (void)
     rearm_deadline = wall_s() + (double)timeout_s;
     rearm_pending = true;
     rearm_released = false;             /* the press that asked for this must end first */
+    rearm_client_gen = serial_client_generation();
+    rearm_unreadable = 0;
     arming = true;
     button_led(255);
     report_message("press the button to resume the laser job", Message_Info);
@@ -797,7 +924,30 @@ static void rearm_poll (void)
         return;
     }
 
-    switch(arm_switches()) {
+    /* The consent belongs to the sender whose resume asked for it: a
+     * sender change ends the re-arm, so a press never resumes another
+     * session's held job. */
+    if(serial_client_generation() != rearm_client_gen) {
+        rearm_end(false);
+        report_message("sender changed - the resume is canceled; the job stays held",
+                       Message_Warning);
+        return;
+    }
+
+    int sw = arm_switches();
+    if(sw == Arm_Unreadable) {
+        if(++rearm_unreadable >= SWITCH_READ_FAILS_MAX) {
+            rearm_end(false);
+            report_message("laser re-arm canceled: the switches cannot be read", Message_Warning);
+            fflog(LOG_ERR, "gflaser: re-arm canceled - %d consecutive switch reads failed",
+                  rearm_unreadable);
+            system_raise_alarm(Alarm_AbortCycle);
+        }
+        return;
+    }
+    rearm_unreadable = 0;
+
+    switch(sw) {
         case Arm_Pressed:
             if(!rearm_released)
                 break;                  /* still the press that started the re-arm */
@@ -824,6 +974,29 @@ static void rearm_poll (void)
             }
             break;
     }
+}
+
+/* --- the cooling verdict's fail tier -------------------------------------- */
+
+/* The job cannot continue. The window closes and the latch locks first
+ * (the lock sets the hardware button latch too: the next job needs its
+ * own press); the job is then reset the way an incoming ^X resets it
+ * (a controlled stop; ALARM:3 from motion). A reset from a standstill
+ * raises no alarm of its own, so the alarm is owed until the reset has
+ * landed (gflaser_poll pays it). The pause tier has no hook here: the
+ * cooling client holds the job and the fire gate masks the stream. */
+void gflaser_verdict_fail (const char *name)
+{
+    if(!laser_ok)
+        return;
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "cooling verdict %s - job aborted, laser disarmed", name);
+    gflaser_disarm();
+    report_message(msg, Message_Warning);
+    fflog(LOG_WARNING, "gflaser: %s", msg);
+    protocol_enqueue_realtime_command(CMD_RESET);
+    fail_alarm_pending = true;
 }
 
 /* --- spindle backends ----------------------------------------------------- */
@@ -868,7 +1041,11 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
      * arrived) must prompt again at the next laser-on, or the job runs
      * with no press, no run report and no airflow. */
     if(state.on && !laser_ok) {
-        if(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR)) {
+        if(state_get() == STATE_CHECK_MODE) {
+            /* A dry run: nothing unlocks, nothing lights. */
+            state.on = Off;
+            report_message("laser not armed in check mode", Message_Info);
+        } else if(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR)) {
             /* A spindle restore inside a held state, against a closed
              * window: a cycle start the resume gate did not see. The
              * blocking arm wait cannot run here (its pump enters the
@@ -946,8 +1123,49 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
 
 /* --- lifecycle ------------------------------------------------------------ */
 
+/* True when the latch may relock at a job's end: the kernel is idle or
+ * disabled, or has faulted or underrun (nothing left to sever), or its
+ * state has stayed unreadable for the bound. Unreadable is never "still
+ * playing" for longer than that. */
+static bool relock_ready (void)
+{
+    static double unreadable_since;
+    char state[16] = "";
+
+    if(!hw_active)
+        return true;
+    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0) {
+        double now = wall_s();
+        if(unreadable_since == 0.0)
+            unreadable_since = now;
+        if(now - unreadable_since < DISARM_UNREADABLE_S)
+            return false;
+        fflog(LOG_WARNING, "gflaser: kernel state unreadable for %.1f s - relocking anyway",
+              now - unreadable_since);
+        unreadable_since = 0.0;
+        return true;
+    }
+    unreadable_since = 0.0;
+    return strcmp(state, "idle") == 0 || strcmp(state, "disabled") == 0 ||
+           strcmp(state, "fault") == 0 || strcmp(state, "underrun") == 0;
+}
+
 void gflaser_poll (void)
 {
+    fire_gate_publish();
+
+    /* A fail-tier reset from a standstill owes its alarm once the reset
+     * has landed; a reset from motion raised ALARM:3 itself. */
+    if(fail_alarm_pending) {
+        sys_state_t st = state_get();
+        if(st & (STATE_ALARM | STATE_ESTOP))
+            fail_alarm_pending = false;
+        else if(st == STATE_IDLE && !sys.reset_pending) {
+            fail_alarm_pending = false;
+            system_raise_alarm(Alarm_AbortCycle);
+        }
+    }
+
     {
         int note = atomic_exchange(&suppressed, Suppress_None);
         double t = wall_s();
@@ -1012,22 +1230,22 @@ void gflaser_poll (void)
 
     /* Program end closes the window too - the consent is spent with
      * the job. The relock waits for the kernel to finish the queue
-     * tail, so the request stays pending until the device is idle. */
+     * tail, so the request stays pending until the device is idle (or
+     * faulted, or unreadable past the bound). */
     if(disarm_request) {
-        char state[16] = "";
-        if(!hw_active || (gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
-                           strcmp(state, "idle") == 0)) {
+        if(relock_ready()) {
             gflaser_disarm();
             return;
         }
     }
 
     /* Otherwise the window closes after a spindle-off grace. The grace
-     * counts down whenever the spindle is off - including a job parked
-     * in Hold, Door or Tool Change - and only a cycle, a jog or a
-     * lingering M3 keeps the window open. */
+     * counts down whenever the spindle is off - including a jog, and a
+     * job parked in Hold, Door or Tool Change - and only a cycle or a
+     * lingering M3 keeps the window open: a jog is not the job the
+     * press consented to, so it never widens the window. */
     spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
-    if(cur.on || (st & (STATE_CYCLE | STATE_JOG))) {
+    if(cur.on || (st & STATE_CYCLE)) {
         disarm_at = 0.0;
         return;
     }
@@ -1041,13 +1259,12 @@ void gflaser_poll (void)
     } else if(now >= disarm_at) {
         /* Never relock while the kernel still plays a queue tail - a
          * severed FIRE there would truncate the job's last bytes. The
-         * grace makes this unreachable in practice; check anyway. */
-        char state[16] = "";
-        if(!hw_active || (gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
-                           strcmp(state, "idle") == 0))
+         * grace makes this unreachable in practice; check anyway, with
+         * the same bound on an unreadable state. */
+        if(relock_ready())
             gflaser_disarm();
         else
-            disarm_at = now + 1.0;
+            disarm_at = now + 0.5;
     }
 }
 

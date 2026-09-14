@@ -82,6 +82,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(${DRIVER_SOURCES}
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
         tests/bind_addr_test.c tests/lens_home_test.c tests/xy_scale_test.c
+        tests/latch_test.c tests/cooling_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
 
@@ -143,3 +144,22 @@ target_link_libraries(lens_home_test m)
 add_executable(xy_scale_test tests/xy_scale_test.c)
 target_include_directories(xy_scale_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(xy_scale_test m)
+
+# Host unit test for the laser latch writer (src/stepper_stream.c): a
+# lock is retried and faults the stream when it still fails, an unlock
+# that fails unlocks nothing, an unlock of a latch believed unlocked
+# writes nothing, and a run start relights only a lock this process
+# wrote under an open fire gate. Includes the stream source, stubs the
+# sysfs layer; must not link the core.
+add_executable(latch_test tests/latch_test.c)
+target_include_directories(latch_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(latch_test m pthread)
+
+# Host unit test for the cooling client's verdict tiers
+# (src/glowforge_cooling.c): the fail tier ends the job, the pause tier
+# locks the latch under the window and resumes on the clean verdict,
+# and every armed change is reported at once. Includes the client
+# source, publishes verdict files; must not link the core.
+add_executable(cooling_test tests/cooling_test.c)
+target_include_directories(cooling_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(cooling_test pthread)

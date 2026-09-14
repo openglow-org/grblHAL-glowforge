@@ -78,6 +78,12 @@
   state on a healthy machine is not characterized, and a false assertion would
   wedge every job. The hardware chain enforces it regardless.
 
+  The device is the gpio-keys node the device tree names "switches";
+  GF_SWITCH_DEV overrides its path (the same name forgectrl uses). A
+  device at that path that does not report that name is not the
+  machine's switches, and is not used: on hardware the laser arm then
+  refuses, because there is no button to read.
+
   Test hook: with GF_SWITCH_FILE set (and no device, i.e. a null-sink host
   build), the EV_SW word is read from that file instead - an integer,
   decimal or 0x-hex, holding the bitmask exactly as EVIOCGSW would return
@@ -108,6 +114,7 @@
 #include <unistd.h>
 
 #define SWITCH_DEV        "/dev/input/event0"
+#define SWITCH_DEV_NAME   "switches"      /* the gpio-keys node's name in the device tree */
 
 /* Config key: what an open lid / interlock loop does to a running job.
    "cancel" (default) = the factory's abort + return to the job start;
@@ -255,7 +262,24 @@ void gfsw_init (void)
     /* Nothing on this hardware is an e-stop input. */
     hal.signals_cap.e_stop = Off;
 
-    if((sw_fd = open(SWITCH_DEV, O_RDONLY | O_CLOEXEC)) < 0) {
+    const char *dev = getenv("GF_SWITCH_DEV");
+    if(dev == NULL || *dev == '\0')
+        dev = SWITCH_DEV;
+    if((sw_fd = open(dev, O_RDONLY | O_CLOEXEC)) >= 0) {
+        /* The device must be the machine's switches: an input device
+         * of another name at this path is not read, and the arm flow
+         * treats the machine as having no button. */
+        char name[32] = "";
+        if(ioctl(sw_fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 ||
+           strcmp(name, SWITCH_DEV_NAME) != 0) {
+            fflog(LOG_ERR, "gfswitch: %s reports '%s', not the '%s' switch device - no switch source",
+                  dev, name, SWITCH_DEV_NAME);
+            close(sw_fd);
+            sw_fd = -1;
+        }
+    } else
+        fflog(LOG_INFO, "gfswitch: cannot open %s - no switch source", dev);
+    if(sw_fd < 0) {
         const char *p = getenv("GF_SWITCH_FILE");
         if(p != NULL && *p != '\0')
             fake_path = p;

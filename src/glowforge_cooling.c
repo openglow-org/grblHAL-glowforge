@@ -14,18 +14,36 @@
     armed window: fire must never run without the cut airflow and the
     flow interrogation that only lives inside a run session.
 
-  - reads the engine's verdict from /run/forgefirm/cooling.state and
-    enforces it in-process: gfcool_fire_ok() gates the laser (the
-    stepper producer thread reads a cached flag with a monotonic
-    freshness deadline - no file IO on that path), a hold verdict
-    takes a real feed hold (jogs are canceled instead - grblHAL never
-    holds a jog), and resume_ok auto-resumes a hold this client took.
+  - reads the engine's verdict from /run/forgefirm/cooling.state every
+    500 ms and enforces it in-process on every poll from the cached
+    flags: gfcool_fire_ok() gates the laser (the stepper producer
+    thread reads a cached flag with a monotonic freshness deadline - no
+    file IO on that path), a hold verdict takes a real feed hold in the
+    same tick the fire gate closes (jogs are canceled instead - grblHAL
+    never holds a jog), and resume_ok auto-resumes a hold this client
+    took.
     A job resumed under a standing hold (the button, a ~, a sender) is
     held again within the next poll: fire is blocked either way, and a
     verdict with no resume is a reset, never a pause.
     A missing or stale verdict (ts_mono older than 2 s) is treated as
     fire_ok=false, hold=true: the engine being gone must look exactly
     like a fault.
+
+  - the verdict has two tiers inside an open armed window, keyed on its
+    name. The fail tier (FIRE, CRASH, AIRFLOW, CRITICAL) ends the job:
+    the window closes, the latch locks, the job is reset with ALARM:3,
+    and nothing resumes it. Every other fire_ok=false verdict, and a
+    stale one, is a pause: this client holds the job and keeps the
+    window, and the stream engine masks FIRE on every tick from the
+    same verdict from the moment the head has stopped (the first
+    deceleration runs lit, as a feed hold's does: the segments already
+    planned at speed would otherwise play dark and leave a gap in the
+    cut, while the kernel's queue plays its 200 ms of lit bytes either
+    way). A resume under the standing verdict moves dark and is held
+    again; resume_ok with fire_ok resumes the hold this client took,
+    lit from the first step, with no new button press. The pause never
+    writes the latch: a lock sets the hardware button latch, which only
+    a press clears.
 
   - EMERGENCY FALLBACK: if the verdict goes stale while the laser is
     armed, the engine is provably absent and nobody else will move the
@@ -66,6 +84,7 @@
 #include "grbl/protocol.h"
 #include "grbl/report.h"
 #include "grbl/state_machine.h"
+#include "grbl/system.h"
 
 /* After the grbl headers: glibc's stat.h (via fcntl.h) defines an
  * st_mtime macro that would otherwise mangle the field of that name in
@@ -116,6 +135,14 @@ static _Atomic bool v_armed = false;
 static _Atomic uint32_t v_fresh_until_ms = 0;
 static char v_reason[112];
 static char v_reason_shown[112];
+static char v_name[16];                 /* the verdict's name (its tier) */
+static bool pause_said;                 /* one message per pause-tier episode */
+/* The pause tier's first hold decelerates lit: set when this client
+ * takes the hold on a fresh verdict flip, cleared once the head has
+ * stopped (or the job left the hold another way). Read by the laser
+ * module's fire gate on the protocol thread; atomic for the same
+ * reason the other flags are. */
+static _Atomic bool decel_lit = false;
 
 static bool hold_ours = false;
 static bool rehold_said = false;        /* one message per resume under a hold */
@@ -152,8 +179,29 @@ static void hold_take (bool stale)
         warn(stale ? "cooling service lost - job held again"
                    : "cooling hold stands - job held again; reset the job");
     }
+    /* The first hold of the episode decelerates lit; a hold taken again
+     * under the standing verdict (after a ~ or a press) does not. */
+    if(!hold_ours)
+        decel_lit = true;
     hold_ours = true;
     protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+}
+
+/* The lit deceleration ends when the head has stopped, or the job has
+ * left the cycle and the hold by another way. */
+static void decel_track (sys_state_t st)
+{
+    if(!decel_lit)
+        return;
+    if(st == STATE_HOLD && sys.holding_state == Hold_Complete)
+        decel_lit = false;
+    else if(!(st & (STATE_CYCLE | STATE_HOLD)))
+        decel_lit = false;
+}
+
+bool gfcool_decel_lit (void)
+{
+    return decel_lit;
 }
 
 /* ------------------------------------------------------- job reports */
@@ -355,6 +403,7 @@ static void verdict_read (void)
     atomic_store_explicit(&v_fire_ok, json_bool(body, "fire_ok", false), memory_order_relaxed);
     atomic_store_explicit(&v_armed, json_bool(body, "armed", false), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
+    json_str(body, "verdict", v_name, sizeof(v_name));
     atomic_store_explicit(&v_fresh_until_ms,
         mono_ms() + (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),
         memory_order_release);
@@ -364,6 +413,14 @@ static bool verdict_fresh (void)
 {
     return (int32_t)(mono_ms() -
         atomic_load_explicit(&v_fresh_until_ms, memory_order_acquire)) < 0;
+}
+
+/* The fail tier: the verdicts a job cannot continue from. Everything
+ * else with fire_ok=false, and a stale verdict, is a pause. */
+static bool verdict_fail_tier (const char *name)
+{
+    return !strcmp(name, "FIRE") || !strcmp(name, "CRASH") ||
+           !strcmp(name, "AIRFLOW") || !strcmp(name, "CRITICAL");
 }
 
 /* Stale verdict while the laser is armed: the engine is gone with the
@@ -423,19 +480,25 @@ void gfcool_laser_armed (bool armed)
         return;
     bool was = coolant_reported.flood || laser_on_window;
     laser_on_window = armed;
-    if((coolant_reported.flood || armed) != was) {
-        if(!was)
-            was_run = true;
-        report_now();
-    }
+    if(!was && (coolant_reported.flood || armed))
+        was_run = true;
+    /* Every change of the armed bit is reported at once, whatever the
+     * sender's M8/M9 state: the engine's crash watch and its
+     * acknowledgment both follow the reported bit. */
+    report_now();
+}
+
+bool gfcool_verdict_fire_ok (void)
+{
+    return verdict_fresh() &&
+           atomic_load_explicit(&v_fire_ok, memory_order_relaxed);
 }
 
 bool gfcool_fire_ok (void)
 {
     /* Freshness (acquire) first: the flags read below are then at least
      * as new as the verdict that set the deadline. */
-    if(!verdict_fresh() ||
-        !atomic_load_explicit(&v_fire_ok, memory_order_relaxed))
+    if(!gfcool_verdict_fire_ok())
         return false;
 
     /* Inside our armed window the verdict must be one the engine
@@ -460,13 +523,40 @@ bool gfcool_run_ack (void)
 void gfcool_poll (void)
 {
     uint32_t now = mono_ms();
+    bool read_now = (int32_t)(now - next_verdict_ms) >= 0;
 
-    if((int32_t)(now - next_verdict_ms) >= 0) {
-        next_verdict_ms = now + 500;    /* half the staleness window: no gap between reads */
+    /* The file is read at half the staleness window, so no gap opens
+     * between reads. The verdict is enforced on EVERY poll from the
+     * cached flags: a cache that expires between two reads closes the
+     * fire gate on its own clock, and the hold must land in that same
+     * tick, or the head cuts dark until the next read. */
+    if(read_now) {
+        next_verdict_ms = now + 500;
         verdict_read();
+    }
 
+    {
         bool fresh = verdict_fresh();
         sys_state_t st = state_get();
+        bool blocked = !gfcool_verdict_fire_ok();
+        bool armed = gflaser_armed();
+
+        /* The tiers, inside an open window. The fail tier ends the job;
+         * the pause tier (a named pause, or a stale verdict) is the hold
+         * below with the stream's fire gate masking the beam, said once
+         * per episode. */
+        if(armed && blocked) {
+            if(fresh && verdict_fail_tier(v_name))
+                gflaser_verdict_fail(v_name);
+            else if(!pause_said) {
+                pause_said = true;
+                warn("cooling verdict blocks fire - fire masked, job held");
+            }
+        } else {
+            pause_said = false;
+            decel_lit = false;
+        }
+        decel_track(st);
 
         if(!fresh) {
             /* No verdict: fire is blocked (freshness), motion holds,
@@ -499,11 +589,15 @@ void gfcool_poll (void)
             }
 
             /* Relay the engine's reason to the sender once per change. */
-            if(v_reason[0] && strcmp(v_reason, v_reason_shown))
-                warn(v_reason);
-            strcpy(v_reason_shown, v_reason);
+            if(read_now) {
+                if(v_reason[0] && strcmp(v_reason, v_reason_shown))
+                    warn(v_reason);
+                strcpy(v_reason_shown, v_reason);
+            }
 
-            if(v_hold) {
+            /* A verdict that blocks fire inside the window holds the
+             * job whether or not it asks for the hold itself. */
+            if(v_hold || (armed && blocked)) {
                 if(st == STATE_CYCLE) {
                     hold_take(false);
                 } else if(st & STATE_HOLD) {

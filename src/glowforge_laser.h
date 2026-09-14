@@ -20,7 +20,16 @@ void gflaser_init (void);
 void gflaser_poll (void);
 
 // Immediate disarm + latch relock (driver reset / stream fault paths).
+// Idempotent; the relock does not depend on the window: the latch is
+// locked whenever this process unlocked it.
 void gflaser_disarm (void);
+
+// The cooling verdict's fail tier, from the cooling client: the window
+// closes, the latch locks, and the job is reset with ALARM:3; nothing
+// resumes it. The pause tier needs no hook: the client holds the job
+// and the fire gate masks the stream, and the latch is never written
+// (a lock sets the hardware button latch, which only a press clears).
+void gflaser_verdict_fail (const char *name);
 
 // The dose model in force: true for density, which is every machine
 // (false only in the host harness's analog reference mode). The cooling

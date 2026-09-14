@@ -34,17 +34,32 @@
   its own 16), a typed $35 is overwritten, and the stored settings are
   never touched. Density is the only model on hardware; the analog
   branch exists for the harness's conservatism reference.
+
+  And the gates the audit added: on hardware a missing switch device
+  refuses the arm; the head is checked again after the wait; a press
+  counts only after the button has been seen up; three unreadable
+  switch reads end the wait; a latch that does not unlock refuses the
+  arm; the disarm locks the latch whenever this process unlocked it,
+  window or no window; the relock at a job's end treats a faulted or
+  underrun kernel as done and an unreadable one as done after a bound;
+  the verdict's pause tier closes the fire gate and writes no latch,
+  the fail tier disarms, resets and alarms; a sender change during a
+  re-arm cancels it; check mode never arms; a jog does not hold the
+  window open.
 */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 /* The acknowledgment wait, shortened so the never-acknowledged case
    refuses in a fraction of a second instead of spinning out the
    shipped bound. */
 #define COOL_ACK_S 0.2
+/* The unreadable-kernel bound on the relock, shortened the same way. */
+#define DISARM_UNREADABLE_S 0.05
 
 /* --- controllable + observable stubs (defined before the include so the
    driver source links against them) ------------------------------------ */
@@ -53,27 +68,40 @@
 static bool fire_ok_script[4];
 static int  fire_ok_n;
 static int  fire_ok_calls;
+static bool verdict_fire_ok_val = true;     /* gfcool_verdict_fire_ok() */
 
 static int   alarms_raised;
 static char  last_message[128];
+static char  all_messages[4096];        /* every report, for the multi-step cases */
 static bool  stream_armed;          /* gf_stream_laser_arm(true) reached? */
+static bool  fire_gate_last;        /* gf_stream_fire_gate() argument */
 static uint32_t dose_period_last = 1;  /* gf_stream_laser_model() argument */
-static bool  latch_locked_last;
+static bool  latch_locked_last;     /* the stream engine's ownership record */
+static int   latch_writes;
+static bool  latch_lock_fail;       /* a lock write does not take */
+static bool  latch_unlock_fail;     /* an unlock write does not take */
+static int   cool_armed_calls;      /* gfcool_laser_armed() calls */
+static bool  cool_armed_last;
+static const char *rd_state;            /* cnc/state as gfio_rd_attr reads it, NULL = unreadable */
+static int   rd_head_ok_calls = 1 << 30; /* head/hall_sensor reads that succeed before failing */
 static const char *conf_model_val;      /* laser_power_model in the config, NULL = absent */
 static const char *conf_curve_val;      /* laser_dose_curve, NULL = absent */
 static float conf_gamma = -1.0f;        /* laser_corner_gamma, < 0 = absent */
 static float conf_floor_analog = -1.0f; /* laser_floor_analog, < 0 = absent */
 static float conf_floor_density = -1.0f;
+static float conf_button_timeout = -1.0f;   /* laser_button_timeout_s, < 0 = absent */
 static float precomputed_min = -1.0f;   /* pwm_min_value at the last precompute */
 static int   precompute_calls;
 static int   settings_stores;           /* any EEPROM write would count here */
 
 /* Switch source: gfsw_read_raw() plays this script of EV_SW words, one
-   per call, holding the last entry. sw_present = gfsw_available(). */
+   per call, holding the last entry. sw_present = gfsw_available().
+   Reads from sw_fail_from on fail (unreadable device). */
 static bool     sw_present;
 static unsigned sw_script[8];
 static int      sw_n;
 static int      sw_calls;
+static int      sw_fail_from = 1 << 30;
 
 bool gfcool_fire_ok(void)
 {
@@ -81,6 +109,10 @@ bool gfcool_fire_ok(void)
     fire_ok_calls++;
     return fire_ok_script[i];
 }
+
+bool gfcool_verdict_fire_ok(void) { return verdict_fire_ok_val; }
+static bool decel_lit_val;              /* gfcool_decel_lit() */
+bool gfcool_decel_lit(void) { return decel_lit_val; }
 
 /* The cooling engine's acknowledgment of the armed window. False for the
  * first ack_hold calls, so 0 is an engine that has already taken the job
@@ -99,24 +131,46 @@ void gfsw_button_consumed(void) {}
 bool gfsw_read_raw(uint8_t *sw)
 {
     int i = sw_calls < sw_n ? sw_calls : sw_n - 1;
+    bool ok = sw_calls < sw_fail_from;
     sw_calls++;
     sw[0] = (uint8_t)sw_script[i];
     sw[1] = (uint8_t)(sw_script[i] >> 8);
-    return true;
+    return ok;
 }
 
-void gfcool_laser_armed(bool armed) { (void)armed; }
+void gfcool_laser_armed(bool armed) { cool_armed_calls++; cool_armed_last = armed; }
 void gf_stream_laser(unsigned char power, bool fire) { (void)power; (void)fire; }
 void gf_stream_laser_arm(bool armed) { stream_armed = armed; }
 void gf_stream_jog(bool jog) { (void)jog; }   /* the jog mask lives in the stream */
-void gf_stream_laser_latch(bool lock) { latch_locked_last = lock; }
+void gf_stream_fire_gate(bool open) { fire_gate_last = open; }
+bool gf_stream_laser_latch(bool lock)
+{
+    latch_writes++;
+    if (lock ? latch_lock_fail : latch_unlock_fail)
+        return false;
+    latch_locked_last = lock;
+    return true;
+}
+bool gf_stream_latch_locked_by_us(void) { return latch_locked_last; }
 int  gfio_rd_attr(const char *a, char *b, size_t l)
-{ (void)a; if (l) b[0] = '\0'; return -1; }
+{
+    if (l) b[0] = '\0';
+    if (!strcmp(a, "cnc/state") && rd_state != NULL) {
+        snprintf(b, l, "%s", rd_state);
+        return 0;
+    }
+    if (!strcmp(a, "head/hall_sensor") && rd_head_ok_calls-- > 0) {
+        snprintf(b, l, "1");
+        return 0;
+    }
+    return -1;
+}
 float gfio_conf_read_float(const char *k, float fb)
 {
     if (!strcmp(k, "laser_floor_analog") && conf_floor_analog >= 0.0f) return conf_floor_analog;
     if (!strcmp(k, "laser_floor_density") && conf_floor_density >= 0.0f) return conf_floor_density;
     if (!strcmp(k, "laser_corner_gamma") && conf_gamma >= 0.0f) return conf_gamma;
+    if (!strcmp(k, "laser_button_timeout_s") && conf_button_timeout >= 0.0f) return conf_button_timeout;
     return fb;
 }
 int gfio_conf_read(const char *k, char *v, size_t n)
@@ -151,16 +205,26 @@ bool protocol_execute_realtime(void) { return resets_requested == 0; }
 settings_t settings;
 grbl_t grbl;
 parser_state_t gc_state;
+system_t sys;
 static spindle_ptrs_t test_spindle;
 static spindle_param_t test_param;      /* the active spindle's param: the segment's velocity ratio */
+static sys_state_t cur_state = STATE_IDLE;  /* what state_get() reports */
 
 void report_message(const char *msg, message_type_t type)
 {
     (void)type;
     snprintf(last_message, sizeof(last_message), "%s", msg ? msg : "");
+    size_t n = strlen(all_messages);
+    snprintf(all_messages + n, sizeof(all_messages) - n, "%s\n", msg ? msg : "");
 }
 void system_raise_alarm(alarm_code_t alarm) { (void)alarm; alarms_raised++; }
-sys_state_t state_get(void) { return STATE_IDLE; }
+sys_state_t state_get(void) { return cur_state; }
+
+static void sleep_s(double s)
+{
+    struct timespec ts = { .tv_sec = (time_t)s, .tv_nsec = (long)((s - (double)(time_t)s) * 1e9) };
+    nanosleep(&ts, NULL);
+}
 bool spindle_precompute_pwm_values(spindle_ptrs_t *s, spindle_pwm_t *p,
                                    spindle_pwm_settings_t *cfg, uint32_t hz)
 { (void)s; (void)p; (void)hz; precomputed_min = cfg->pwm_min_value; precompute_calls++; return true; }
@@ -186,16 +250,34 @@ static void reset_state(void)
     alarms_raised = 0;
     resets_requested = 0;
     last_message[0] = '\0';
+    all_messages[0] = '\0';
     stream_armed = false;
+    fire_gate_last = false;
     latch_locked_last = true;
+    latch_writes = 0;
+    latch_lock_fail = latch_unlock_fail = false;
+    cool_armed_calls = 0;
+    cool_armed_last = false;
+    rd_state = NULL;
+    rd_head_ok_calls = 1 << 30;
+    verdict_fire_ok_val = true;
+    decel_lit_val = false;
+    conf_button_timeout = -1.0f;
+    cur_state = STATE_IDLE;
+    memset(&sys, 0, sizeof(sys));
     laser_ok = false;
     disarm_request = false;
+    disarm_at = 0.0;
+    rearm_pending = false;
+    fail_alarm_pending = false;
+    arming = false;
     atomic_store(&cur_state_value, 0);
     client_gen = 1;
     hw_active = false;              /* host: no GFSINK */
     sw_present = false;             /* no switch source: no button wait */
     sw_calls = 0;
     sw_n = 0;
+    sw_fail_from = 1 << 30;
     conf_model_val = NULL;
     conf_curve_val = NULL;
     conf_gamma = -1.0f;
@@ -516,6 +598,227 @@ int main(void)
         CHECK(corner_gamma == 2.0f, "an out-of-range gamma falls back to 2");
         test_param.rate_ratio = 1.0f;
     }
+
+    printf("the switch device on hardware:\n");
+
+    /* Case S1 - hardware with no switch device refuses the arm outright:
+       no unlock, no LED, an alarm. The host build (no GFSINK) keeps the
+       null-sink auto-arm (Case B above). */
+    reset_state();
+    script(true, true, 2);
+    hw_active = true;
+    sw_present = false;
+    CHECK(!gflaser_arm(), "hardware with no switch device refuses the arm");
+    CHECK(!laser_ok && !stream_armed, "no window opens without a switch device");
+    CHECK(latch_locked_last && latch_writes == 0, "the latch is never unlocked without a switch device");
+    CHECK(alarms_raised == 1, "the refusal is an alarm");
+    CHECK(strstr(last_message, "no switch device") != NULL, "the refusal names the missing switch device");
+    CHECK(cool_armed_calls == 0, "the engine is never told armed without a switch device");
+
+    /* Case S16 - the head is checked again after the wait: present at
+       the gates, lifted during the wait, refused at the completion. */
+    reset_state();
+    script(true, true, 2);
+    hw_active = true;
+    rd_head_ok_calls = 1;
+    switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+    CHECK(!gflaser_arm(), "a head lifted during the wait refuses the arm");
+    CHECK(!laser_ok && latch_locked_last, "the window stays closed and the latch relocks on the late head check");
+    CHECK(strstr(last_message, "no head") != NULL, "the late refusal names the head");
+    CHECK(alarms_raised == 1, "the late head refusal is an alarm");
+
+    printf("the button must be seen up before a press counts:\n");
+
+    /* Case S11 - a button already down when the wait starts is not a
+       press: the wait runs on (here to the lid opening); a release and
+       a fresh press arms. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_PRESSED, W_PRESSED, W_LID_OPEN, 3);
+    CHECK(!gflaser_arm(), "a button held from before the wait does not arm");
+    CHECK(sw_calls >= 3, "the wait ran past the held button");
+    CHECK(!laser_ok && latch_locked_last, "the held button leaves the window closed and the latch locked");
+    reset_state();
+    script(true, true, 2);
+    switches(W_PRESSED, W_CLOSED, W_PRESSED, 3);
+    CHECK(gflaser_arm() && laser_ok, "a release and a fresh press arm");
+
+    /* Case S17 - three unreadable switch reads in a row end the wait:
+       relock, alarm, never armed. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+    sw_fail_from = 0;
+    CHECK(!gflaser_arm(), "unreadable switches end the wait");
+    CHECK(sw_calls == 3, "the wait ends at the third failed read");
+    CHECK(!laser_ok && latch_locked_last, "the unreadable wait leaves the window closed and the latch locked");
+    CHECK(alarms_raised == 1, "the unreadable wait is an alarm");
+    CHECK(strstr(last_message, "cannot be read") != NULL, "the refusal names the switches");
+
+    printf("the latch writes:\n");
+
+    /* Case S6 - an unlock that does not take refuses the arm. */
+    reset_state();
+    script(true, true, 2);
+    latch_unlock_fail = true;
+    CHECK(!gflaser_arm(), "a latch that does not unlock refuses the arm");
+    CHECK(!laser_ok && !stream_armed, "no window opens on a failed unlock");
+    CHECK(latch_locked_last, "the ownership record still says locked after the failed unlock");
+    CHECK(alarms_raised == 1, "the failed unlock is an alarm");
+    CHECK(strstr(last_message, "did not unlock") != NULL, "the refusal names the latch");
+    CHECK(cool_armed_last == false, "the engine is told the window is not armed after the failed unlock");
+
+    /* Case S5 - the disarm locks the latch whenever this process
+       unlocked it, window or no window (a reset in the button wait); a
+       latch already locked and no window is left alone. */
+    reset_state();
+    latch_locked_last = false;      /* the arm wait's unlock, no window yet */
+    gflaser_disarm();
+    CHECK(latch_locked_last && latch_writes == 1, "a disarm with no window relocks a latch this process unlocked");
+    CHECK(strstr(all_messages, "disarmed") == NULL, "no disarm message when no window was open");
+    reset_state();
+    gflaser_disarm();
+    CHECK(latch_writes == 0, "a disarm with the latch locked and no window writes nothing");
+
+    printf("the relock at a job's end:\n");
+
+    /* Case S4 - program end on hardware: an idle, faulted or underrun
+       kernel relocks at once; a running one waits; an unreadable one
+       relocks after the bound, never "still playing" forever. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed for the program-end cases");
+    hw_active = true;
+    disarm_request = true;
+    rd_state = "running";
+    gflaser_poll();
+    CHECK(laser_ok, "the relock waits while the kernel plays the tail");
+    rd_state = "fault";
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last, "a faulted kernel relocks at once");
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed again");
+    hw_active = true;
+    disarm_request = true;
+    rd_state = "underrun";
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last, "an underrun kernel relocks at once");
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed again");
+    hw_active = true;
+    disarm_request = true;
+    rd_state = NULL;
+    gflaser_poll();
+    CHECK(laser_ok, "an unreadable kernel state defers the relock inside the bound");
+    sleep_s(0.08);
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last, "an unreadable kernel state relocks after the bound");
+
+    printf("the cooling verdict's tiers under an open window:\n");
+
+    /* Case V1 - the pause tier: the fire gate follows the verdict down
+       and up again; the window stays open and the latch is never
+       written (a lock would set the hardware button latch). */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed for the verdict cases");
+    CHECK(fire_gate_last, "the fire gate opens with the window");
+    CHECK(!latch_locked_last && latch_writes == 1, "the latch is unlocked inside the window");
+    verdict_fire_ok_val = false;
+    decel_lit_val = true;
+    gflaser_poll();
+    CHECK(fire_gate_last, "the fire gate stays open through the pause's first deceleration");
+    decel_lit_val = false;
+    gflaser_poll();
+    CHECK(!fire_gate_last, "the fire gate follows the verdict down once the head has stopped");
+    CHECK(laser_ok && stream_armed && !latch_locked_last && latch_writes == 1,
+          "a blocked verdict keeps the window open and writes no latch");
+    verdict_fire_ok_val = true;
+    gflaser_poll();
+    CHECK(fire_gate_last, "the fire gate follows the verdict up");
+    CHECK(laser_ok && !latch_locked_last && latch_writes == 1,
+          "the clean verdict finds the window open and the latch untouched");
+    CHECK(alarms_raised == 0 && resets_requested == 0, "the pause tier neither alarms nor resets");
+
+    /* Case V2 - the fail tier: disarm, latch locked, the job reset, and
+       the alarm once the reset has landed at a standstill. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed for the fail tier");
+    gflaser_verdict_fail("AIRFLOW");
+    CHECK(!laser_ok && !stream_armed && latch_locked_last, "the fail tier closes the window and locks the latch");
+    CHECK(!fire_gate_last, "the fail tier closes the fire gate");
+    CHECK(resets_requested == 1, "the fail tier resets the job");
+    CHECK(strstr(all_messages, "AIRFLOW") != NULL, "the fail tier names the verdict");
+    gflaser_poll();
+    CHECK(alarms_raised == 1, "the fail tier alarms once the reset has landed");
+    gflaser_poll();
+    CHECK(alarms_raised == 1, "the fail-tier alarm is raised once");
+    gflaser_verdict_fail("CRASH");
+    CHECK(resets_requested == 1, "a fail tier with no window open does nothing");
+
+    printf("the re-arm of a held job:\n");
+
+    /* Case S12 - a sender change during the re-arm cancels it: the
+       press must not resume another session's held job. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_CLOSED, 3);
+    cur_state = STATE_HOLD;
+    gc_state.modal.spindle[0].state.on = On;
+    CHECK(gflaser_resume_gate() && rearm_pending, "the resume gate takes a held job's resume");
+    CHECK(!latch_locked_last, "the re-arm unlocks the latch for the press");
+    client_gen++;
+    gflaser_poll();
+    CHECK(!rearm_pending && latch_locked_last, "a sender change during the re-arm cancels it and relocks");
+    CHECK(!laser_ok, "the canceled re-arm opens no window");
+    CHECK(strstr(all_messages, "sender changed") != NULL, "the canceled re-arm names the sender change");
+    gc_state.modal.spindle[0].state.on = Off;
+
+    /* Case S17b - unreadable switches during the re-arm cancel it too. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_CLOSED, 3);
+    cur_state = STATE_HOLD;
+    gc_state.modal.spindle[0].state.on = On;
+    CHECK(gflaser_resume_gate() && rearm_pending, "the resume gate takes the resume again");
+    sw_fail_from = 0;
+    gflaser_poll();
+    gflaser_poll();
+    CHECK(rearm_pending, "two unreadable reads keep the re-arm waiting");
+    gflaser_poll();
+    CHECK(!rearm_pending && latch_locked_last && alarms_raised == 1,
+          "the third unreadable read cancels the re-arm, relocks and alarms");
+    gc_state.modal.spindle[0].state.on = Off;
+
+    printf("check mode and the jog grace:\n");
+
+    /* Case S15 - $C check mode never arms: no wait, no unlock. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+    cur_state = STATE_CHECK_MODE;
+    spindleSetState(NULL, on, 1000.0f);
+    CHECK(!laser_ok && sw_calls == 0 && latch_writes == 0, "check mode never arms, waits or unlocks");
+    CHECK(!((spindle_state_t){ .value = atomic_load(&cur_state_value) }).on,
+          "check mode records the spindle off");
+
+    /* Case S10 - a jog does not hold the window open: a running grace
+       expires under STATE_JOG; a cycle still resets it. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed for the grace cases");
+    atomic_store(&cur_state_value, 0);          /* spindle off */
+    cur_state = STATE_CYCLE;
+    disarm_at = 1.0;                            /* a grace that has expired */
+    gflaser_poll();
+    CHECK(laser_ok && disarm_at == 0.0, "a cycle resets the grace");
+    cur_state = STATE_JOG;
+    disarm_at = 1.0;
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last, "a jog does not reset the grace: the window closes");
 
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the arm re-checks the coolant gate after the wait, "

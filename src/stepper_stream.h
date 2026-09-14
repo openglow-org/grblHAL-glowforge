@@ -68,15 +68,33 @@ void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks);
 // Laser arming state (glowforge_laser.c owns the policy). While armed an
 // underrun faults the stream instead of the stop/run retry: a restarted
 // run resets the hardware PWM duty, so replaying queued fire bits would
-// fire at ~full power.
+// fire at ~full power. Fire events are masked with it at the producer
+// as well: a transition queued after the window closed carries no fire.
 void gf_stream_laser_arm (bool armed);
 void gf_stream_jog (bool jog);
 bool gf_stream_kernel_idle (void);
 
+// The per-tick fire gate: the armed window AND the cooling verdict, as
+// glowforge_laser.c publishes them (refreshed on every poll and on every
+// arm and disarm). The shipper masks the FIRE bit with it on every tick;
+// on its falling edge it clears the fire state in flight and every
+// queued fire-on, so fire returns only when the core asserts it again.
+void gf_stream_fire_gate (bool open);
+
 // Serialized cnc/laser_latch write (lock = 1 locks the latch). Every
-// latch write in the process goes through here so the shipper's
-// run-start relight decision is atomic against a concurrent disarm.
-void gf_stream_laser_latch (bool lock);
+// latch write in the process goes through here: the writer records which
+// way this process last wrote the latch, and the shipper's run-start
+// relight undoes only a lock this process wrote. A lock is retried and,
+// if it still fails, faults the stream (the realtime hook alarms and
+// disarms). An unlock that fails returns false and unlocks nothing; an
+// unlock of a latch this process already believes unlocked writes
+// nothing (it would undo someone else's lock). With GFSINK_LATCH_LOG
+// set, every write appends one line to that file (the host harnesses'
+// sideband).
+bool gf_stream_laser_latch (bool lock);
+
+// True while this process's last latch write was a lock.
+bool gf_stream_latch_locked_by_us (void);
 
 // hal.driver_reset hook body: abort the stream (drop unshipped backlog,
 // kernel controlled stop). Call only when sys.reset_pending.

@@ -32,6 +32,21 @@
   retry (a restarted run resets the duty - queued fire bits would
   replay at ~full power).
 
+  The FIRE bit is a request, never a permission. The core's fire state
+  (cur_fire) says what the job asked for; the fire gate says whether it
+  may leave the process: the armed window AND the cooling verdict,
+  published by glowforge_laser.c and sampled by the shipper on every
+  tick. A gate that falls clears the fire state in flight and every
+  queued fire-on, so fire returns only when the core asserts it again
+  (the first segment after a hold does), never because the gate rose.
+
+  The latch has an owner. Every cnc/laser_latch write in the process
+  goes through gf_stream_laser_latch, which records which way this
+  process last wrote it. A run start relights (unlocks) only a lock this
+  process wrote inside an open window; a lock it did not write, the
+  cooling engine's fail tier, is never undone here: the job goes dark
+  and the verdict closes the window.
+
   Threading model (three actors):
 
   - The grbl protocol thread runs the planner and calls the hal.stepper
@@ -220,7 +235,9 @@ static struct {
     uint32_t lev_head;        /* consumer (shipper) */
     uint32_t lev_tail;        /* producer */
     uint8_t cur_power;
-    bool cur_fire;
+    bool cur_fire;            /* the core's fire request in force at the cursor */
+    bool gate_seen;           /* the fire gate as of the last ship pass (edge detect) */
+    bool last_lit;            /* the last shipped tick byte carried FIRE */
     bool power_sent;
     bool lev_overflow_warned;
 
@@ -268,6 +285,9 @@ static _Atomic bool armed = false;
 static _Atomic bool quit = false;
 static _Atomic bool fault_flag = false;
 static _Atomic bool laser_armed = false;
+/* The per-tick fire gate (gf_stream_fire_gate): the armed window and
+ * the cooling verdict, as glowforge_laser.c last published them. */
+static _Atomic bool fire_gate = false;
 
 /* Serializes every cnc/laser_latch write in this process. The shipper's
  * run-start relight decision (sample laser_armed, then unlock) must be
@@ -275,13 +295,16 @@ static _Atomic bool laser_armed = false;
  * a latch the disarm just closed while FIRE bytes still sit in the
  * ring. Leaf lock: never held while taking gf.lock or the core lock. */
 static pthread_mutex_t latch_mx = PTHREAD_MUTEX_INITIALIZER;
+/* Which way this process last wrote the latch (under latch_mx). The
+ * latch is locked by default and at init, so the record starts locked.
+ * Nothing but this process ever unlocks the latch, so a record of
+ * "unlocked" that the hardware does not share means someone else locked
+ * it: that lock is never undone here. */
+static bool latch_locked_by_us = true;
+static bool latch_fail_reported;
+static int latch_log_fd = -1;       /* GFSINK_LATCH_LOG: one line per latch write */
 
-void gf_stream_laser_latch (bool lock)
-{
-    pthread_mutex_lock(&latch_mx);
-    gfio_wr_attr("cnc/laser_latch", lock ? "1" : "0");
-    pthread_mutex_unlock(&latch_mx);
-}
+static void rt_log (const char *msg);
 
 static double wall_s (void)
 {
@@ -294,6 +317,88 @@ static void sleep_ns (long ns)
 {
     struct timespec ts = { .tv_sec = 0, .tv_nsec = ns };
     nanosleep(&ts, NULL);
+}
+
+/* The latch sideband for the host harnesses: with GFSINK_LATCH_LOG set,
+ * every latch write appends one line, so a harness can assert the
+ * ownership sequence against the null-sink build. */
+static void latch_log (const char *what)
+{
+    if(latch_log_fd < 0)
+        return;
+    char line[32];
+    int n = snprintf(line, sizeof(line), "%s\n", what);
+    if(n > 0 && write(latch_log_fd, line, (size_t)n) < 0) { /* sideband only */ }
+}
+
+/* One latch write with retries. A sysfs store that fails is retried
+ * LATCH_RETRIES times, LATCH_RETRY_NS apart; the record follows only a
+ * write that took. An unlock of a latch this process already believes
+ * unlocked writes nothing: the write would undo a lock someone else
+ * made. Call with latch_mx held. */
+#define LATCH_RETRIES 3
+#define LATCH_RETRY_NS 10000000L    /* 10 ms */
+
+static bool latch_write_locked (bool lock)
+{
+    if(!lock && !latch_locked_by_us) {
+        latch_log("unlock-skipped");
+        return true;
+    }
+    const char *val = lock ? "1" : "0";
+    int rc = gfio_wr_attr("cnc/laser_latch", val);
+    for(int i = 0; rc != 0 && i < LATCH_RETRIES; i++) {
+        sleep_ns(LATCH_RETRY_NS);
+        rc = gfio_wr_attr("cnc/laser_latch", val);
+    }
+    if(rc == 0) {
+        latch_locked_by_us = lock;
+        latch_fail_reported = false;
+        latch_log(lock ? "lock" : "unlock");
+    } else
+        latch_log(lock ? "lock-failed" : "unlock-failed");
+    return rc == 0;
+}
+
+/* A latch write that failed after its retries faults the stream: the
+ * realtime hook disarms, drops the homing anchor and alarms. Reported
+ * once per episode; a write that takes clears it. */
+static void latch_fault (const char *msg)
+{
+    pthread_mutex_lock(&latch_mx);
+    bool report = !latch_fail_reported;
+    latch_fail_reported = true;
+    pthread_mutex_unlock(&latch_mx);
+    if(!report)
+        return;
+    rt_log(msg);
+    pthread_mutex_lock(&gf.lock);
+    gf.failed = true;
+    pthread_mutex_unlock(&gf.lock);
+    fault_flag = true;
+}
+
+bool gf_stream_laser_latch (bool lock)
+{
+    pthread_mutex_lock(&latch_mx);
+    bool ok = latch_write_locked(lock);
+    pthread_mutex_unlock(&latch_mx);
+    if(!ok && lock)
+        latch_fault("gfstream: laser latch lock failed after retries - faulting the stream\n");
+    return ok;
+}
+
+bool gf_stream_latch_locked_by_us (void)
+{
+    pthread_mutex_lock(&latch_mx);
+    bool locked = latch_locked_by_us;
+    pthread_mutex_unlock(&latch_mx);
+    return locked;
+}
+
+void gf_stream_fire_gate (bool open)
+{
+    fire_gate = open;
 }
 
 /* Logging from the SCHED_FIFO shipper, or from under gf.lock: a raw
@@ -541,7 +646,7 @@ void gf_stream_laser (uint8_t power, bool fire)
     pthread_mutex_lock(&gf.lock);
     gf.want_power = power;
     gf.want_fire = fire;
-    laser_event_locked(power, fire && !gf.jogging);
+    laser_event_locked(power, fire && laser_armed && !gf.jogging);
     pthread_mutex_unlock(&gf.lock);
 }
 
@@ -811,16 +916,24 @@ static int issue_run (void)
     int rc = 1;
 
     /* The kernel parks the FIRE line Hi-Z at every run end (its
-     * laser-safe stop) and only a latch-unlock write restores SDMA
-     * drive - the factory flow re-unlocks before every run. An
-     * armed window spanning kernel runs must do the same, or the
-     * next run's fire bits play into a tri-stated pin. The armed
-     * check and the unlock are made atomic against a concurrent
-     * disarm by latch_mx (see gf_stream_laser_latch). */
+     * laser-safe stop) and restores the drive at the next run start by
+     * itself while the latch is unlocked. The relight here undoes only
+     * a lock THIS process wrote inside a still-open window; a latch
+     * this process believes unlocked is left alone, so a lock the
+     * cooling engine wrote is never re-opened by a run start (the job
+     * plays dark and the verdict closes the window). A lock this
+     * process wrote for the verdict's pause tier comes off only once
+     * the gate is open again. The armed check and the unlock are made
+     * atomic against a concurrent disarm by latch_mx (see
+     * gf_stream_laser_latch). An unlock that fails refuses the run:
+     * the hook disarms and alarms. */
     pthread_mutex_lock(&latch_mx);
-    bool relight = laser_armed;
-    if(relight)
-        gfio_wr_attr("cnc/laser_latch", "0");
+    bool relight = laser_armed && fire_gate && latch_locked_by_us;
+    if(relight && !latch_write_locked(false)) {
+        pthread_mutex_unlock(&latch_mx);
+        latch_fault("gfstream: laser latch unlock failed at a run start - refusing the run\n");
+        return -1;
+    }
     if(gfio_wr_attr("cnc/run", "1") != 0) {
         int err = errno;
         gfio_rd_attr("cnc/state", state, sizeof(state));
@@ -865,7 +978,7 @@ static int issue_run (void)
         }
     }
     if(relight && !laser_armed)
-        gfio_wr_attr("cnc/laser_latch", "1");  /* disarmed meanwhile - relock */
+        latch_write_locked(true);   /* disarmed meanwhile - relock */
     pthread_mutex_unlock(&latch_mx);
 
     return rc;
@@ -940,6 +1053,22 @@ static void ship_pass (void)
         return;
     }
 
+    /* The fire gate, sampled once per pass. On its falling edge the fire
+     * state in flight and every queued fire-on are cleared: the bytes
+     * from here on ship dark, and fire returns only once the core
+     * asserts it again (the first segment after a hold does), never
+     * because the gate rose. */
+    bool gate = atomic_load(&fire_gate);
+    if(gate != gf.gate_seen) {
+        gf.gate_seen = gate;
+        if(!gate) {
+            gf.cur_fire = false;
+            for(uint32_t i = gf.lev_head; i != gf.lev_tail; i++)
+                gf.lev[i & LEV_MASK].fire = false;
+            dither_reset();
+        }
+    }
+
     bool streaming = gf.streaming;
     uint64_t backlog = gf.produced > gf.shipped ? gf.produced - gf.shipped : 0;
 
@@ -947,11 +1076,11 @@ static void ship_pass (void)
         bool drop_hold = false;
         /* stream finished: tell the kernel the next end-of-data is normal */
         if(gf.kernel_running) {
-            if(gf.cur_fire) {
+            if(gf.last_lit) {
                 /* Termination per the UAPI: a stream's last bytes must
                  * carry FIRE clear - the end-of-data backstop is the
                  * underrun safety net, never the normal path. If the
-                 * final commanded byte fired, close the run with one
+                 * final shipped byte fired, close the run with one
                  * dark pad tick. */
                 unsigned char dark = 0x00;
                 if(gf.dump_fd >= 0 && write(gf.dump_fd, &dark, 1) < 0) { /* debug copy only */ }
@@ -959,6 +1088,7 @@ static void ship_pass (void)
                 gf.shipped++;
                 gf.produced = gf.shipped;
                 gf.cur_fire = false;
+                gf.last_lit = false;
             }
             if(gf.active)
                 gfio_wr_attr("cnc/streaming", "0");
@@ -1046,11 +1176,13 @@ static void ship_pass (void)
             uint32_t slot = gf.shipped & RING_MASK;
             uint8_t b = gf.ring[slot];
             gf.ring[slot] = 0;           /* re-zero for the next lap */
-            /* The density model can only ever withhold a fire tick the
-             * core asked for: it masks cur_fire, it is never a source of
-             * one. Emission stays exactly where the core commanded it. */
-            if(gf.cur_fire && (!gf.dith_period || dither_tick()))
+            /* The core's fire request, masked twice, never sourced: the
+             * gate (armed window and cooling verdict) withholds it as
+             * permission, the density model withholds ticks of it as
+             * dose. Emission stays exactly where the core commanded it. */
+            if(gf.cur_fire && gate && (!gf.dith_period || dither_tick()))
                 b |= 0x10;
+            gf.last_lit = (b & 0x10) != 0;
             chunk[n++] = b;
             gf.shipped++;
         }
@@ -1208,14 +1340,21 @@ void gf_stream_reset (void)
         gf.power_sent = false;
         dither_reset();
     }
+    gf.last_lit = false;
     pthread_mutex_unlock(&gf.lock);
 
     if(stop_kernel) {
         gfio_wr_attr("cnc/stop", "1");
         gfio_wr_attr("cnc/streaming", "0");
     }
-    if(acknowledged)
+    if(acknowledged) {
+        /* A latch write that failed is reported again after the
+         * acknowledgment: the next failure is a new episode. */
+        pthread_mutex_lock(&latch_mx);
+        latch_fail_reported = false;
+        pthread_mutex_unlock(&latch_mx);
         rt_log("gfstream: fault acknowledged by the reset; the stream is armed again\n");
+    }
 }
 
 bool gf_stream_fault_take (void)
@@ -1236,7 +1375,7 @@ bool gf_stream_suspend (void)
     if(!gf.active)
         return true;
 
-    bool idle, drop_hold = false;
+    bool idle, drop_hold = false, closed = false;
 
     pthread_mutex_lock(&gf.lock);
     /* A pending residue clear must land before the device changes hands:
@@ -1264,12 +1403,22 @@ bool gf_stream_suspend (void)
         if(!gfio_pulse_inherited()) {
             close(gf.fd);
             gf.fd = -1;
+            closed = true;
         }
     }
     pthread_mutex_unlock(&gf.lock);
 
     if(drop_hold)
         gfio_currents_hold();   /* PIC-SPI: never under gf.lock */
+
+    /* Standalone, the close was the final close of the pulse device and
+     * the kernel relocked the latch on it: a lock this process made. */
+    if(closed) {
+        pthread_mutex_lock(&latch_mx);
+        latch_locked_by_us = true;
+        latch_log("lock");
+        pthread_mutex_unlock(&latch_mx);
+    }
 
     return idle;
 }
@@ -1345,9 +1494,12 @@ bool gf_stream_resume (void)
         rail_settle();
 
     /* The homing session reconfigured the machine; re-apply the full
-     * analog config and stream state exactly as at init. */
+     * analog config and stream state exactly as at init. The latch is
+     * locked first, through the process's one writer; a lock that does
+     * not take is a lost device. */
+    bool ok = gf_stream_laser_latch(true);
     gfio_analog_config();
-    bool ok = apply_tick();
+    ok = apply_tick() && ok;
     lseek(fd, 1, SEEK_SET);           /* clear pulse data + byte counters */
     gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
     gfio_wr_attr("cnc/streaming", "0");   /* and a stale stream flag with it */
@@ -1365,12 +1517,13 @@ bool gf_stream_resume (void)
     gf.lev_head = gf.lev_tail;
     gf.cur_power = 0;
     gf.cur_fire = false;
+    gf.last_lit = false;
     gf.power_sent = false;
     dither_reset();
     pthread_mutex_unlock(&gf.lock);
 
     if(!ok)
-        fflog(LOG_ERR, "gfstream: cannot restore step_freq");
+        fflog(LOG_ERR, "gfstream: cannot restore the latch lock or step_freq");
 
     return ok;
 }
@@ -1434,9 +1587,12 @@ void gf_stream_init (void)
     gf.lead_s = (double)lead_ms / 1000.0;
 
     /* Bench/debug: mirror every shipped byte to a file for offline
-     * stream inspection (works in null-sink mode too). */
+     * stream inspection (works in null-sink mode too), and every latch
+     * write to the sideband the harnesses read. */
     if((opt = getenv("GFSINK_DUMP")) && *opt)
         gf.dump_fd = open(opt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if((opt = getenv("GFSINK_LATCH_LOG")) && *opt)
+        latch_log_fd = open(opt, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
 
     if(dev != NULL && *dev != '\0') {
 
@@ -1456,8 +1612,14 @@ void gf_stream_init (void)
             fflog(LOG_INFO, "gfstream: pulse device inherited from the broker");
 
         /* Laser latch locked at init (glowforge_laser.c unlocks it only
-         * inside an operator-armed job window); then the full factory
-         * analog config (modes, decay, motor lock, hold currents). */
+         * inside an operator-armed job window), through the process's
+         * one writer: a controller whose lock does not take does not
+         * start. Then the full factory analog config (modes, decay,
+         * motor lock, hold currents). */
+        if(!gf_stream_laser_latch(true)) {
+            fflog(LOG_ERR, "gfstream: cannot lock the laser latch");
+            exit(1);
+        }
         gfio_analog_config();
         if(!apply_tick()) {
             fflog(LOG_ERR, "gfstream: cannot set step_freq");
@@ -1520,9 +1682,15 @@ void gf_stream_shutdown (void)
     }
     /* Under the broker this close is not the final close of the pulse
      * device, so the kernel's close-relock does not fire; relock
-     * explicitly (a no-op when already locked). */
-    if(gf.active)
-        gfio_wr_attr("cnc/laser_latch", "1");
+     * explicitly (a no-op when already locked), with the retries. The
+     * supervisor's exit safing writes the same lock again on the reap. */
+    if(gf.active) {
+        pthread_mutex_lock(&latch_mx);
+        bool ok = latch_write_locked(true);
+        pthread_mutex_unlock(&latch_mx);
+        if(!ok)
+            fflog(LOG_CRIT, "gfstream: laser latch relock failed at exit");
+    }
     if(gf.clamped)
         fflog(LOG_WARNING, "gfstream: %llu late events clamped",
               (unsigned long long)gf.clamped);

@@ -148,7 +148,6 @@ void gfio_analog_config (void)
 {
     char mode[8];
     snprintf(mode, sizeof(mode), "%u", gfio_xy_microsteps());
-    gfio_wr_attr("cnc/laser_latch", "1");
     gfio_wr_attr("cnc/x_mode", mode);
     gfio_wr_attr("cnc/y_mode", mode);
     gfio_wr_attr("cnc/x_decay", "1");
