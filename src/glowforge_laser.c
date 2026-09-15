@@ -1340,6 +1340,16 @@ void gflaser_init (void)
     const char *dev = getenv("GFSINK");
     hw_active = dev != NULL && *dev != '\0';
 
+    /* A fresh controller establishes the button lamp off: it starts
+     * disarmed, so the lamp reflects that. A controller ended mid-arm
+     * (a fail-tier stop, a kill) never ran its disarm, which is what
+     * clears the arming lamp, and the pulse device is the broker's, so
+     * nothing closed it on the way out - without this the ring would
+     * glow "press to arm" on the disarmed machine the supervisor just
+     * respawned. The same reasoning as clearing a dead session's stream
+     * flag when this one takes the device. */
+    button_led(0);
+
     on_program_completed = grbl.on_program_completed;
     grbl.on_program_completed = onProgramCompleted;
     on_state_change = grbl.on_state_change;
