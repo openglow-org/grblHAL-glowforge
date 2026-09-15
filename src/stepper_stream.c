@@ -70,7 +70,13 @@
 
   Lock order is strictly core -> gf. The shipper takes only gf.lock and
   NEVER calls core APIs; stream faults are surfaced through an atomic
-  flag polled by the protocol thread's realtime hook.
+  flag polled by the protocol thread's realtime hook. The shipper builds
+  each chunk under gf.lock and writes it to the kernel with the lock
+  released, so a write that blocks never holds the producer. A producer
+  that falls behind real time has its late events clamped forward and
+  counted; inside an armed window the clamp faults the stream, because
+  the burst it compresses onto later bytes is energy where it was not
+  commanded.
 
   Without GFSINK the module runs in null-sink mode: producer, ring and
   shipper all operate identically but no device/sysfs I/O happens -

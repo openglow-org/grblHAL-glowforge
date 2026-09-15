@@ -17,22 +17,30 @@ The site page is
 
 ```sh
 cmake -B build && cmake --build build
-./build/switch_map_test
-./build/laser_arm_test
+for t in switch_map_test laser_arm_test latch_test cooling_test switches_test \
+         serial_test bind_addr_test lens_home_test xy_scale_test; do ./build/$t; done
 ```
 
 On a host without `GFSINK` the driver runs the real core, planner and stream
 code against a **null sink**, which is what makes the laser path testable
-without hardware. `tests/` also holds `xy_scale_test`, `lens_home_test`,
-`serial_test` and `bind_addr_test`.
+without hardware. The nine tests include the driver source they test and
+stub the rest: `laser_arm_test` (the arm flow and the verdict's tiers),
+`latch_test` (the latch writer), `cooling_test` (the verdict client),
+`switches_test` (a lid cancel with the switch device gone), `serial_test`
+(the RX ring, the banner, the TX stall bound).
 
-Two harnesses drive the null-sink build over TCP. They live in the
+Five harnesses drive the null-sink build over TCP. They live in the
 `forgefirm` repository, under `scripts/bench/`:
 
 ```sh
-python3 laser_stream_test.py build/grblHAL_glowforge
-python3 laser_lifecycle_test.py build/grblHAL_glowforge
+for h in laser_stream_test laser_lifecycle_test z_envelope_test xy_mode_test planner_blocks_test; do
+  python3 $h.py build/grblHAL_glowforge
+done
 ```
+
+`GFSINK_STALL_MS` and `GFSINK_WRITE_STALL_MS` starve the producer or hold the
+sink's write once for the stream harness, and `GFSINK_LATCH_LOG` records every
+latch write for its rules.
 
 The board binary is a cross-build:
 `forgefirm/scripts/bench/build-glowforge.sh`.
@@ -46,6 +54,21 @@ The board binary is a cross-build:
   safety argument.
 - **Fire rides the motion segments of laser blocks only.** Rapids, jogs and
   homing are dark by construction, not by convention.
+- **The FIRE bit is a request, never a permission.** The stream engine masks
+  it on every tick with the gate the laser module publishes: the window and
+  the verdict.
+- **The latch has one writer.** Every lock and unlock goes through the stream
+  engine, which records it. A run start relights only a lock this process
+  wrote inside an open window, and a lock the cooling engine wrote is never
+  undone here.
+- **The verdict has two tiers.** `FIRE`, `CRASH`, `AIRFLOW` and `CRITICAL`
+  end the job and lock the latch. Every other `fire_ok=false`, and a stale
+  verdict, holds the job under the open window without a latch write: a
+  lock sets the hardware button latch, which only a press clears.
+- **A stall while armed is a fault.** Late step events are clamped forward;
+  inside an armed window the clamp faults the stream rather than play the
+  burst.
+- **Nothing widens the window.** A jog never restarts the disarm grace.
 - **The core is a submodule, and its fork carries the minimum change.** No
   rationale comments in core code: the reasoning goes in the commit message.
   Never bump the submodule pointer unless asked.
@@ -53,7 +76,7 @@ The board binary is a cross-build:
 
 ### CI coupling that sets the push order
 
-This repository's CI fetches the two laser harnesses from the head of the
+This repository's CI fetches the five harnesses from the head of the
 `forgefirm` default branch, unpinned. **Push a harness change to `forgefirm`
 first**, then the driver change that needs it.
 
@@ -128,6 +151,9 @@ does.
   test with the fix, in the same commit, never after.
 - Position counters, homing anchors, and a homed flag are not proof of
   physical motion. The head accelerometer is, and so are the operator's eyes.
+- Unreadable is fail-closed. A failed read of a safety input, a state file,
+  or a verdict is never treated as "still running" or "keep waiting" without
+  a bound.
 
 ### Proof before done
 
