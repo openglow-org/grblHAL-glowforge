@@ -36,6 +36,7 @@
 
 #include "grbl/hal.h"
 #include "grbl/protocol.h"
+#include "grbl/gcode.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -406,6 +407,19 @@ static void welcome (void)
     if(banner_pending && !tx_blocked && client_fd >= 0) {
         banner_pending = false;
         grbl.report.init_message(serialWriteS);
+        /* A new sender starts with a clean parser error state. With
+         * COMPATIBILITY_LEVEL 0 the core holds every g-code line after a
+         * line that errored, re-reporting that error until a blank line
+         * acknowledges it (the streaming contract). A jog past the bed
+         * now errors (soft limits are armed after a home), and the hold
+         * outlives the connection - the core's last_error is not tied to
+         * the client - so the next sender to connect would get error:15
+         * on its first g-code line for a jog it never sent. This is that
+         * sender's implicit acknowledgment: it did not send the erroring
+         * line, so it does not inherit the hold. Written here, from a
+         * top-level poll between lines (never mid-execution, like the
+         * banner itself), so it cannot clobber a line in flight. */
+        gc_state.last_error = Status_OK;
     }
 }
 

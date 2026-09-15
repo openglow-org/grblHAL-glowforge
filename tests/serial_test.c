@@ -60,6 +60,7 @@ grbl_t grbl;
 bool stream_rx_suspend(stream_rx_buffer_t *rx, bool suspend)
 { (void)rx; (void)suspend; return false; }
 bool stream_connected(void) { return true; }
+parser_state_t gc_state;        /* welcome() clears its last_error on a connect */
 
 /* The core's banner, as the report module writes it through the stream. */
 #define BANNER "\r\nGrblHAL test ['$' for help]\r\n"
@@ -277,6 +278,21 @@ int main(void)
     CHECK(received(sender, 100)[0] == '\0', "the displaced sender gets nothing");
     close(sender);
     close(sender2);
+    drop_client();
+
+    /* --- a new sender starts with a clean parser error state ------------- */
+    printf("A connect clears a held g-code error:\n");
+    /* The core holds every g-code line after one that errored, until a
+       blank line acknowledges it; the hold outlives the connection. A
+       soft-limit-rejected jog leaves it. The sender that connects next
+       never sent that line, so the banner clears it. */
+    gc_state.last_error = 15;                       /* Status_TravelExceeded, from a prior jog */
+    int sender3 = connect_loopback(port);
+    CHECK(sender3 >= 0, "a fresh sender connects");
+    serial_poll();                                  /* accept + welcome */
+    CHECK(gc_state.last_error == Status_OK,
+          "the connect cleared the held error so the new sender's first line is not refused");
+    close(sender3);
     drop_client();
     serial_set_listen_fd(-1);
     close(lfd);
