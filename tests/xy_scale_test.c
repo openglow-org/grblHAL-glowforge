@@ -78,7 +78,7 @@ int main (void)
     expect_parse("", 0);
     expect_parse("abc", 0);
 
-    /* $100/$101: the x8 literal is the board default; every mode is
+    /* $100/$101: the x8 literal is the board's scale base; every mode is
      * 0.15 mm per full step to three decimals. */
     expect_f("$100 at x8", gfio_xy_steps_per_mm_of(8), 53.333f, 1e-4f);
     expect_f("$100 at x16", gfio_xy_steps_per_mm_of(16), 106.667f, 1e-4f);

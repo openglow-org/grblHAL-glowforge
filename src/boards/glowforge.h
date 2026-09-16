@@ -32,16 +32,18 @@
 
 // XY: 0.15 mm per full step. The microstep mode is the operator's
 // (xy_microsteps in /data/forgefirm/forgefirm.conf: 8, 16 or 32; unset or anything
-// else reads as 8), read once at the controller's start and applied to
+// else reads as 32), read once at the controller's start and applied to
 // the DRV8825 MODE pins at idle. Three quantities are derived from it
 // and never typed: $100/$101 (glowforge_io.h, re-asserted from the
 // settings-changed chain like $35), the machine tick (the factory travel
 // tick at x8, scaled with the mode so the ticks per step stay the same
 // and so does the top speed), and the kernel stop ramp (scaled the same
-// way so a controlled stop covers the same distance). The defaults below
-// are the x8 values.
+// way so a controlled stop covers the same distance). XY_MICROSTEPS_BASE
+// is the factory's x8 reference the scaling divides by; the DEFAULT_*
+// values below are that x8 base, scaled to the mode in force at runtime.
 #define XY_MM_PER_FULL_STEP 0.15f
-#define XY_MICROSTEPS_DEFAULT 8
+#define XY_MICROSTEPS_BASE 8            // the factory x8 reference the scaling divides by
+#define XY_MICROSTEPS_DEFAULT 32        // the mode an unset or invalid key reads as
 #define GF_TICK_X8_HZ 28160             // the factory travel tick
 #define GF_RAMP_X8_HZ_PER_S 125000      // the kernel's default stop ramp, at that tick
 #define DEFAULT_X_STEPS_PER_MM 53.333f

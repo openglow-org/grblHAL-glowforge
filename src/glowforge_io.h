@@ -60,7 +60,7 @@ int gfio_conf_read (const char *key, char *val, size_t len);
 float gfio_conf_read_float (const char *key, float fallback);
 
 // The XY microstep mode in force: xy_microsteps in the shared config (8,
-// 16 or 32; unset or anything else reads as x8, logged once). Read at
+// 16 or 32; unset or anything else reads as x32, logged once). Read at
 // the first call and fixed for the session: the DRV8825 MODE pins are
 // written from it at the controller's start, at idle, and $100/$101,
 // the machine tick and the kernel stop ramp are derived from the same
@@ -83,10 +83,10 @@ static inline unsigned gfio_xy_mode_parse (const char *val)
 // The mode over x8: 1, 2 or 4.
 static inline unsigned gfio_xy_scale_of (unsigned mode)
 {
-    return mode / XY_MICROSTEPS_DEFAULT;
+    return mode / XY_MICROSTEPS_BASE;
 }
 
-// $100/$101 for a mode, three decimals like the x8 default so a
+// $100/$101 for a mode, three decimals like the x8 base so a
 // settings dump is stable per mode.
 static inline float gfio_xy_steps_per_mm_of (unsigned mode)
 {
