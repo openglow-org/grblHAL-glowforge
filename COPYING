@@ -1,79 +1,62 @@
 ------------------------------------------------------------------------------
-COPYRIGHT NOTICE FOR grblHAL LPC176x driver:
+COPYRIGHT NOTICE FOR the grblHAL Glowforge driver:
 ------------------------------------------------------------------------------
 
-grblHAL - Embedded CNC g-code interpreter and motion-controller
+grblHAL-glowforge - grblHAL driver for the Glowforge factory control board
 
-Copyright (c) 2016-2021 Terje Io
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 
-Grbl is free software: you can redistribute it and/or modify
+grblHAL-glowforge is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
 
-Grbl is distributed in the hope that it will be useful,
+grblHAL-glowforge is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 ------------------------------------------------------------------------------
 COPYRIGHT NOTICE(S) FOR WORK CONTAINED IN THIS SOFTWARE:
 ------------------------------------------------------------------------------
 
-/*
- * GNU General Public License:
- *  Copyright (c) 2011-2016 Sungeun K. Jeon for Gnea Research LLC
- *  Copyright (c) 2009-2011 Simen Svale Skogsrud
-*/
+Several files in this driver descend from the grblHAL Simulator and say so in
+their own headers. The holders of that work are:
 
-/*
- * Copyright(C) NXP Semiconductors, 2014
- * All rights reserved.
- *
- * Software that is described herein is for illustrative purposes only
- * which provides customers with programming information regarding the
- * LPC products.  This software is supplied "AS IS" without any warranties of
- * any kind, and NXP Semiconductors and its licensor disclaim any and
- * all warranties, express or implied, including all implied warranties of
- * merchantability, fitness for a particular purpose and non-infringement of
- * intellectual property rights.  NXP Semiconductors assumes no responsibility
- * or liability for the use of the software, conveys no license or rights under any
- * patent, copyright, mask work right, or any other intellectual property rights in
- * or to any products. NXP Semiconductors reserves the right to make changes
- * in the software without notification. NXP Semiconductors also makes no
- * representation or warranty that such application will be suitable for the
- * specified use without further testing or modification.
- *
- * Permission to use, copy, modify, and distribute this software and its
- * documentation is hereby granted, under NXP Semiconductors' and its
- * licensor's relevant copyrights in the software, without fee, provided that it
- * is used in conjunction with NXP Semiconductors microcontrollers.  This
- * copyright, permission, and disclaimer notice must appear in all copies of
- * this code.
- */
+  Copyright (c) 2012 Jens Geisler
+  Copyright (c) 2014-2015 Adam Shelly
+  Copyright (c) 2017-2026 Terje Io
 
-/*----------------------------------------------------------------------------/
-/  FatFs - Generic FAT Filesystem Module  R0.13c                              /
-/-----------------------------------------------------------------------------/
-/
-/ Copyright (C) 2018, ChaN, all right reserved.
-/
-/ FatFs module is an open source software. Redistribution and use of FatFs in
-/ source and binary forms, with or without modification, are permitted provided
-/ that the following condition is met:
-/
-/ 1. Redistributions of source code must retain the above copyright notice,
-/    this condition and the following disclaimer.
-/
-/ This software is provided by the copyright holder and contributors "AS IS"
-/ and any warranties related to this software are DISCLAIMED.
-/ The copyright owner or contributors be NOT LIABLE for any damages caused
-/ by use of this software.
-/
-/----------------------------------------------------------------------------*/
+Where each one applies:
+
+  src/driver.c                   HAL-vector shape, from the Simulator driver
+                                 (Terje Io)
+  src/serial.c                   io_stream_t and the ring buffers, from the
+                                 Simulator serial.c (Terje Io)
+  src/main.c                     argument handling and the TCP listener, from
+                                 the Simulator main.c (Jens Geisler,
+                                 Adam Shelly, Terje Io)
+  src/platform.h                 the Simulator platform layer, reduced to its
+  src/platform_linux.c           Linux implementation (Adam Shelly)
+  src/eeprom.c                   file-backed NVS, from the Simulator
+  src/eeprom.h                   (Jens Geisler, Adam Shelly; modified for
+  src/grbl_eeprom_extensions.c   grblHAL by Terje Io)
+
+The grblHAL core is a submodule at src/grbl and is built into the same binary.
+It carries its own notice in src/grbl/COPYING, covering the core and the Grbl
+lineage it descends from:
+
+  Copyright (c) 2016-2026 Terje Io
+  Copyright (c) 2011-2016 Sungeun K. Jeon for Gnea Research LLC
+  Copyright (c) 2009-2011 Simen Svale Skogsrud
+  Copyright (c) 2011 Jens Geisler
+
+Everything else in this repository is original work by the copyright holder
+named at the top of this file, under the same license.
 
 ------------------------------------------------------------------------------
 GNU GPLv3 TERMS AND CONDITIONS REPRODUCED HERE FOR CLARITY:
