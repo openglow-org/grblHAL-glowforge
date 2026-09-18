@@ -84,3 +84,8 @@ the platform layer, and the shape of the stream and NVS code.
 GPL-3.0-or-later; see `COPYING`. The grblHAL core is copyright Terje Io and
 contributors; the Simulator platform code is copyright Jens Geisler and Adam
 Shelly; the Glowforge driver is copyright 514 LLC d/b/a OpenGlow.
+
+---
+
+Glowforge is a trademark of Glowforge, Inc. This project is not affiliated
+with, authorized by, or endorsed by Glowforge, Inc.
