@@ -57,3 +57,5 @@ jobs:
         run: python3 forgefirm/scripts/bench/ctlport_test.py build/grblHAL_glowforge
       - name: Manual home moves nothing and a released gantry stays released
         run: python3 forgefirm/scripts/bench/manual_home_test.py build/grblHAL_glowforge
+      - name: Every cooling report carries the supervisor's secret, and nothing inherits it
+        run: python3 forgefirm/scripts/bench/cool_report_test.py build/grblHAL_glowforge

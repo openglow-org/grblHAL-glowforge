@@ -8,7 +8,11 @@
 
   - reports job state to the engine: POST /cool/state (127.0.0.1,
     FORGECTRL_PORT or 80) with mode=idle|run|cooldown and the armed
-    flag - level-triggered, re-sent every ~1 s from gfcool_poll and
+    flag, and with the secret the supervisor handed this process at its
+    spawn (GF_REPORT_SECRET), which the route asks for: the channel is the
+    running controller's alone, and a loopback peer is not proof of that.
+    The secret is read once and taken out of the environment, so nothing
+    this process starts inherits it. Level-triggered, re-sent every ~1 s from gfcool_poll and
     immediately on every change, so a lost report self-heals. The
     effective run window is the sender's M8/M9 OR'd with the laser
     armed window: fire must never run without the cut airflow and the
@@ -153,6 +157,7 @@ static bool stale_warned = false;
 static uint32_t next_report_ms = 0;
 static uint32_t next_verdict_ms = 0;
 static int http_port = 80;
+static char report_secret[33];      /* from the supervisor, at the spawn; empty when there is none */
 
 static uint32_t mono_ms (void)
 {
@@ -236,13 +241,15 @@ static void report_send (const char *mode, bool armed, bool density)
     }
     if(up) {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
-        char req[224];
+        char req[288], who[64] = "";
+        if(report_secret[0])
+            snprintf(who, sizeof(who), "X-ForgeFIRM-Report: %s\r\n", report_secret);
         int n = snprintf(req, sizeof(req),
             "POST /cool/state?mode=%s&armed=%d&model=%s HTTP/1.1\r\n"
-            "Host: 127.0.0.1\r\nConnection: close\r\n"
+            "Host: 127.0.0.1\r\nConnection: close\r\n%s"
             "Content-Length: 0\r\n\r\n", mode, armed ? 1 : 0,
-            density ? "density" : "analog");
-        if(write(fd, req, (size_t)n) == n) {
+            density ? "density" : "analog", who);
+        if(n > 0 && n < (int)sizeof(req) && write(fd, req, (size_t)n) == n) {
             char resp[128];
             (void)!read(fd, resp, sizeof(resp));    /* let the ack land */
         }
@@ -443,6 +450,14 @@ void gfcool_init (void)
     const char *vf = getenv("GF_VERDICT_FILE");
     if(vf && *vf)
         verdict_file = vf;
+    /* The report secret: 32 hex digits or nothing (it goes into a header
+     * as it is). Out of the environment once read: the homing runner and
+     * anything else this process starts has no use for it. */
+    const char *rs = getenv("GF_REPORT_SECRET");
+    if(rs && strlen(rs) == sizeof(report_secret) - 1 &&
+       strspn(rs, "0123456789abcdef") == sizeof(report_secret) - 1)
+        strcpy(report_secret, rs);
+    unsetenv("GF_REPORT_SECRET");
     next_report_ms = mono_ms();
     next_verdict_ms = mono_ms();
 
