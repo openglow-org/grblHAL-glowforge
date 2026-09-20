@@ -18,6 +18,9 @@
 // Attribute paths are relative to /sys/glowforge/ (e.g. "cnc/state",
 // "pic/x_step_current"). All return 0 on success, -1 on failure.
 void gfio_set_hw (bool active);
+// A null-sink instance writes no attribute. With GFSINK_ATTR_LOG set it
+// appends "<attr> <value>" to that file instead, so a host harness can see
+// what the hardware would have been told.
 // 0 on a complete write; GFIO_ENOATTR when the attribute does not exist
 // (module not loaded / older kernel); GFIO_EREJECT when the store refused
 // or truncated the value.
@@ -50,6 +53,13 @@ void gfio_analog_config (void);
 // Factory run/idle current scheme: full torque only while motion plays.
 void gfio_currents_run (void);
 void gfio_currents_hold (void);
+
+// The motor release (glowforge_release.c): while it is held, the run and
+// hold postures write 0 to the X and Y step currents and nothing else, so
+// no path through the scheme can energize a released gantry. Z is not
+// released. Setting it writes nothing by itself.
+void gfio_xy_released_set (bool released);
+bool gfio_xy_released (void);
 
 // The shared machine config /data/forgefirm/forgefirm.conf ("key = value" lines,
 // '#' comments; GFHOME_CONF overrides the path). Written by the

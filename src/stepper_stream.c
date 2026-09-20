@@ -1757,6 +1757,12 @@ void gf_stream_init (void)
             gfio_wr_attr("cnc/enable", "1");  /* standalone: steppers on; under the broker the rail is forgectrl's */
 
         gf.active = true;
+    } else {
+        /* Null-sink: the writes go nowhere (glowforge_io gates them), but
+         * with GFSINK_ATTR_LOG set a harness sees the start the way the
+         * hardware would: the hold currents, or 0 for X and Y when a
+         * release is being taken over. */
+        gfio_analog_config();
     }
 
     if(pthread_create(&gf.producer_tid, NULL, producer_thread, NULL) != 0 ||

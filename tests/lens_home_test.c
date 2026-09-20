@@ -171,6 +171,29 @@ int main (void)
         }
     }
 
+    /* A camera home's coordinate may lie behind the origin: `travel` either
+     * side of it, the origin for a value that is not a number. */
+    {
+        const float travel = 495.0f;
+        const struct { float in, want; const char *what; } cases[] = {
+            { 0.0f, 0.0f, "the origin stands" },
+            { -4.5f, -4.5f, "a point behind the origin stands" },
+            { 12.5f, 12.5f, "a point on the bed stands" },
+            { -600.0f, -495.0f, "too far behind lands on the limit" },
+            { 600.0f, 495.0f, "a point past the far edge lands on it" },
+            { NAN, 0.0f, "a coordinate that is not a number is the origin" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            float got = gfhome_clamp_cloud_home_mm(cases[i].in, travel);
+            if (fabsf(got - cases[i].want) > 1e-4f) {
+                printf("FAIL camera home %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
+                failures++;
+            } else {
+                printf("ok   camera home %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
+            }
+        }
+    }
+
     if (failures) {
         printf("%d FAILURE(S)\n", failures);
         return EXIT_FAILURE;

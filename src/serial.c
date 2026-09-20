@@ -30,6 +30,7 @@
 // as a macro, which must not be in scope when the core's vfs.h declares
 // its struct field of the same name.
 #include "serial.h"
+#include "ctlport.h"
 #include "driver.h"
 #include "glowforge_laser.h"
 #include "platform.h"
@@ -64,6 +65,29 @@ static bool banner_pending = false; /* a sender connected: welcome it from a top
 static bool tx_blocked = false;     /* serialPutC is waiting on the ring: no nested writes */
 static bool rx_discarding = false;  /* dropping the rest of an overrun line */
 static bool rx_overrun = false;     /* an overrun happened, not yet taken */
+
+/* Line multiplexing (serial.h). An injected line goes into an empty ring
+ * only, so it is the next thing the core reads: inj_left is how many of
+ * its bytes the core has yet to read, and any byte behind them is the
+ * sender's. */
+static bool sender_midline = false;     /* the sender's last stored byte was not an end of line */
+static bool read_midline = false;       /* the last byte the core read was not an end of line */
+static uint8_t sender_eol = '\n';       /* the sender's last end-of-line byte */
+static double sender_last_line = 0;     /* CLOCK_MONOTONIC of it */
+static bool inj_active = false;         /* an injected line is queued or executing */
+static uint_fast16_t inj_left = 0;
+static bool inj_first = false;          /* none of its bytes has been read yet */
+static bool inj_status_due = false;     /* its last byte was read: the next status is its own */
+static status_code_t inj_saved_error;   /* the sender's held parser error, put back after it */
+static bool hold_sender = false;
+static serial_inject_done_ptr inj_done = NULL;
+static status_message_ptr status_message_chain = NULL;
+static on_report_handlers_init_ptr report_handlers_init_chain = NULL;
+
+static inline bool is_eol (uint8_t c)
+{
+    return c == '\n' || c == '\r';
+}
 
 /* Bytes rx_poll() reads from the client per call; serial_wait() only arms
  * client RX while the ring has room for a full read, so a sender that
@@ -122,8 +146,32 @@ static int32_t serialGetC (void)
     if(bptr == rxbuffer.head)
         return -1; // no data available else EOF
 
+    /* The read gate holds the sender's bytes in the ring. An injected line
+     * and a cancel pass it, and so does an empty line: an end-of-line byte
+     * the core meets between lines. LightBurn polls '?' with an end of
+     * line behind it, about twice a second; the core answers an empty line
+     * ok in every state, the jog state included, and held back, those oks
+     * would arrive in a burst when the jog ends. */
+    if(hold_sender && !inj_left && rxbuffer.data[bptr] != ASCII_CAN &&
+        !(is_eol(rxbuffer.data[bptr]) && !read_midline))
+        return -1;
+
     data = (int32_t)rxbuffer.data[bptr++];          // Get next character, increment tmp pointer
     rxbuffer.tail = bptr & (RX_BUFFER_SIZE - 1);    // and update pointer
+    read_midline = !is_eol((uint8_t)data);
+
+    if(inj_left) {
+        /* The core runs a line at its end-of-line byte, before it reads
+         * on. So at the injected line's first byte the sender's last line
+         * has run and its status stands in gc_state, and the status that
+         * follows the injected line's last byte is the injected line's. */
+        if(inj_first) {
+            inj_first = false;
+            inj_saved_error = gc_state.last_error;
+        }
+        if(--inj_left == 0)
+            inj_status_due = true;
+    }
 
     return data;
 }
@@ -145,6 +193,19 @@ static void serialRxFlush (void)
     rxbuffer.tail = rxbuffer.head;
     rxbuffer.overflow = false;
     rx_discarding = false;
+    sender_midline = false;
+    read_midline = false;               // the core flushes its line buffer on the same occasions
+
+    /* An injected line goes with the rest, and its source is told. A line
+     * whose run was aborted gets no status from the core, and the core
+     * flushes on its way back up, so this also clears a status that will
+     * never come. */
+    if(inj_active) {
+        inj_active = inj_status_due = false;
+        inj_left = 0;
+        if(inj_done)
+            inj_done(-1);
+    }
 }
 
 static void serialRxCancel (void)
@@ -295,11 +356,126 @@ static void rx_byte (uint8_t data)
                 break;
             rxbuffer.head = last;           // unwrite the partial line
         }
+        sender_midline = false;             // the ring ends on a line boundary again
         return;
     }
 
     rxbuffer.data[rxbuffer.head] = data;
     rxbuffer.head = bptr;
+
+    if(is_eol(data)) {
+        /* Only a line with something in it is the sender speaking. An end
+         * of line with nothing before it is a keep-alive, the second half
+         * of a CR LF pair, or the end of line behind a '?' poll (the '?'
+         * itself never reaches the ring). */
+        if(sender_midline) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            sender_last_line = (double)ts.tv_sec + ts.tv_nsec / 1e9;
+        }
+        sender_eol = data;
+        sender_midline = false;
+    } else
+        sender_midline = true;
+}
+
+/* --- line multiplexing (serial.h) ---------------------------------------- */
+
+static status_code_t inject_status_message (status_code_t status)
+{
+    if(inj_status_due) {
+        inj_active = inj_status_due = false;
+        /* The sender never saw this line, so it does not inherit its
+         * error: with COMPATIBILITY_LEVEL 0 a held error would refuse the
+         * sender's next g-code line and report this status to it. */
+        gc_state.last_error = inj_saved_error;
+        if(inj_done)
+            inj_done((int)status);
+        return status;
+    }
+
+    return status_message_chain(status);
+}
+
+/* The core puts its own report handlers back at every soft reset and then
+ * calls this, which is where a status hook belongs. */
+static void inject_report_handlers_init (void)
+{
+    if(report_handlers_init_chain)
+        report_handlers_init_chain();
+
+    status_message_chain = grbl.report.status_message;
+    grbl.report.status_message = inject_status_message;
+}
+
+void serial_inject_init (serial_inject_done_ptr done)
+{
+    inj_done = done;
+    if(status_message_chain == NULL) {
+        report_handlers_init_chain = grbl.on_report_handlers_init;
+        grbl.on_report_handlers_init = inject_report_handlers_init;
+        status_message_chain = grbl.report.status_message;
+        grbl.report.status_message = inject_status_message;
+    }
+}
+
+bool serial_inject_busy (void)
+{
+    return inj_active;
+}
+
+bool serial_inject_line (const char *line)
+{
+    size_t len = strlen(line);
+
+    /* An empty ring, and the sender between lines: then the core reads the
+     * injected line next and whole. It ends with the sender's own
+     * end-of-line byte, which leaves the core's CR/LF pairing where the
+     * sender left it, so an empty line that follows is answered (or
+     * skipped as the second half of a pair) exactly as it would have been. */
+    if(inj_active || sender_midline || rx_discarding || len == 0 ||
+        rxbuffer.head != rxbuffer.tail || len + 1 > (size_t)serialRxFree())
+        return false;
+
+    for(size_t i = 0; i <= len; i++) {
+        rxbuffer.data[rxbuffer.head] = i < len ? (uint8_t)line[i] : sender_eol;
+        rxbuffer.head = (rxbuffer.head + 1) & (RX_BUFFER_SIZE - 1);
+    }
+    inj_left = (uint_fast16_t)len + 1;
+    inj_active = inj_first = true;
+    inj_status_due = false;
+
+    return true;
+}
+
+void serial_hold_sender (bool hold)
+{
+    hold_sender = hold;
+}
+
+bool serial_sender_pending (void)
+{
+    /* The sender's bytes are the ones behind an injected line. End-of-line
+     * bytes alone are empty lines, and no claim on the machine. */
+    uint_fast16_t p = (rxbuffer.tail + inj_left) & (RX_BUFFER_SIZE - 1);
+
+    while(p != rxbuffer.head) {
+        if(!is_eol(rxbuffer.data[p]))
+            return true;
+        p = (p + 1) & (RX_BUFFER_SIZE - 1);
+    }
+
+    return false;
+}
+
+bool serial_sender_empty_lines_only (void)
+{
+    return rxbuffer.head != rxbuffer.tail && !inj_left && !serial_sender_pending();
+}
+
+double serial_sender_last_line (void)
+{
+    return sender_last_line;
 }
 
 bool serial_rx_overflow_take (void)
@@ -426,6 +602,7 @@ static void welcome (void)
 void serial_poll (void)
 {
     rx_poll();
+    ctlport_poll();
     welcome();
     tx_drain();
 }
@@ -436,7 +613,7 @@ void serial_wait (long timeout_us)
         timeout_us = 0;
     struct timespec ts = { .tv_sec = timeout_us / 1000000,
                            .tv_nsec = (timeout_us % 1000000) * 1000 };
-    struct pollfd fds[2];
+    struct pollfd fds[4];   /* the sender's listener and client, the controller port's */
     nfds_t n = 0;
 
     tx_drain();     /* flush this iteration's output before blocking */
@@ -457,6 +634,7 @@ void serial_wait (long timeout_us)
         fds[n].events = POLLIN;
         n++;
     }
+    n += ctlport_pollfds(&fds[n]);
 
     /* No fd to wait on (stdio mode at EOF), or a ppoll failure that is
      * not a signal wakeup: plain sleep so pacing can never become a

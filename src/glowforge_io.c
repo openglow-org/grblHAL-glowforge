@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,8 +51,17 @@ int gfio_wr_attr (const char *attr, const char *val)
     char path[128];
     int fd, ret = 0;
     size_t len = strlen(val);
-    if(!gfio_hw)
+    if(!gfio_hw) {
+        const char *log = getenv("GFSINK_ATTR_LOG");
+        if(log != NULL && *log != '\0') {
+            FILE *f = fopen(log, "a");
+            if(f) {
+                fprintf(f, "%s %s\n", attr, val);
+                fclose(f);
+            }
+        }
         return 0;
+    }
     snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
     if((fd = open(path, O_WRONLY | O_CLOEXEC)) < 0)
         return errno == ENOENT ? GFIO_ENOATTR : GFIO_EREJECT;
@@ -176,17 +186,30 @@ void gfio_analog_config (void)
     gfio_currents_hold();
 }
 
+/* Written on the protocol thread, read by the shipper's hold drop. */
+static _Atomic bool xy_released = false;
+
+void gfio_xy_released_set (bool released)
+{
+    xy_released = released;
+}
+
+bool gfio_xy_released (void)
+{
+    return xy_released;
+}
+
 void gfio_currents_run (void)
 {
-    gfio_wr_attr("pic/x_step_current", X_CURRENT_RUN);
-    gfio_wr_attr("pic/y_step_current", Y_CURRENT_RUN);
+    gfio_wr_attr("pic/x_step_current", xy_released ? "0" : X_CURRENT_RUN);
+    gfio_wr_attr("pic/y_step_current", xy_released ? "0" : Y_CURRENT_RUN);
     gfio_wr_attr("head/z_current", "0");
 }
 
 void gfio_currents_hold (void)
 {
-    gfio_wr_attr("pic/x_step_current", X_CURRENT_HOLD);
-    gfio_wr_attr("pic/y_step_current", Y_CURRENT_HOLD);
+    gfio_wr_attr("pic/x_step_current", xy_released ? "0" : X_CURRENT_HOLD);
+    gfio_wr_attr("pic/y_step_current", xy_released ? "0" : Y_CURRENT_HOLD);
     gfio_wr_attr("head/z_current", "1");
 }
 

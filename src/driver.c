@@ -37,10 +37,12 @@
 #include "driver.h"
 #include "glowforge_io.h"
 #include "serial.h"
+#include "ctlport.h"
 #include "stepper_stream.h"
 #include "build_info.h"
 #include "glowforge_cooling.h"
 #include "glowforge_homing.h"
+#include "glowforge_release.h"
 #include "glowforge_laser.h"
 #include "glowforge_status.h"
 #include "glowforge_switches.h"
@@ -385,6 +387,7 @@ static void glowforge_process_realtime (uint_fast16_t state)
     gfcool_poll();
     gflaser_poll();
     gfsw_poll();
+    gfrelease_poll();
     gfstatus_poll();
 
     if(exit_requested) {
@@ -437,13 +440,16 @@ bool driver_setup (settings_t *settings)
 
 bool driver_init (void)
 {
+    gfrelease_adopt();          /* before gf_stream_init writes its first hold current */
     gf_core_lock_init();        /* before gf_stream_init starts its threads */
     gf_stream_init();
     gfcool_init();
     gfstatus_init();
     gfhome_init();
+    gfrelease_init();
     gflaser_init();
     gfsw_init();
+    ctlport_init();             /* after gfstatus_init: the socket lives in the state directory */
 
     hal.info = "Glowforge";
     hal.driver_version = DRV_VERSION;

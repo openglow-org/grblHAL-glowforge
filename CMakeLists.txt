@@ -70,10 +70,12 @@ set(DRIVER_SOURCES
     src/glowforge_io.c
     src/glowforge_cooling.c
     src/glowforge_homing.c
+    src/glowforge_release.c
     src/glowforge_laser.c
     src/glowforge_status.c
     src/glowforge_switches.c
     src/serial.c
+    src/ctlport.c
     src/eeprom.c
     src/grbl_eeprom_extensions.c
     src/platform_linux.c

@@ -72,6 +72,7 @@ static void print_usage (const char *badarg)
       "                       x8, 56320 at x16, 112640 at x32; xy_microsteps in the config file).\n"
       "    GFSINK_DEPTH_MS  : stream queue depth = feed-hold latency (default 200).\n"
       "    GFSINK_DUMP      : mirror the shipped pulse stream to this file (debug).\n"
+      "    GFSINK_ATTR_LOG  : null-sink only: log the sysfs writes the hardware would get.\n"
       "    GFHOME_CONF      : homing config file (default /data/forgefirm/forgefirm.conf).\n"
       "    FFLOG_LEVEL      : log level override (off|error|warning|notice|info|debug);\n"
       "                       default from /data/forgefirm/forgefirm.conf (log_grblhal_*).\n"

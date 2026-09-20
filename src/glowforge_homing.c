@@ -9,14 +9,20 @@
                             sequence via the external one-shot runner
                             (gfhome.py: cloud vision homes X/Y to the
                             factory home corner, Z to the hall sensor).
-    homing_mode = switches  $H falls through to the core homing cycle
-                            (physical limit switches, once installed).
+    homing_mode = manual    $H moves nothing: the operator has pushed the
+                            head to the home corner by hand (with the
+                            motors released, glowforge_release.c), and $H
+                            declares that spot manual_home_x, manual_home_y
+                            (the origin by default, never negative). Z is
+                            left as it is.
+    homing_mode = switches  $H is refused: no limit switch backend exists.
     homing_mode = none      $H falls through to the core, which rejects
                             it while homing is disabled ($22=0).
 
   The registered "H" system command shadows the core's (the command
   chain searches driver registrations first) and re-reads the config on
-  every invocation, so mode changes apply without a restart.
+  every invocation, so mode changes apply without a restart. The modes
+  are rows of one provider table, homing_providers[].
 
   The gfcloud path hands /dev/glowforge to the runner for the whole
   session: the stream engine is suspended (only possible from a fully
@@ -48,6 +54,7 @@
 #include "fflog.h"
 #include "driver.h"
 #include "glowforge_homing.h"
+#include "glowforge_release.h"
 #include "glowforge_io.h"
 #include "stepper_stream.h"
 #include "serial.h"
@@ -89,6 +96,11 @@
 /* The Z reference: whether Z is referenced, and the envelope it opened. */
 static bool z_referenced;
 static float z_env_min, z_env_max;
+
+/* What the anchor file holds, so it can be rewritten for fewer axes. */
+static float anchor_home[N_AXIS];
+static uint8_t anchor_axes;
+static char anchor_source[16];
 
 void gfhome_apply_z_limit (void)
 {
@@ -148,7 +160,7 @@ void gfhome_reference_z (float z_mm, int below, int above)
           (double)sys.home_position[Z_AXIS], below, above);
 }
 
-static void anchor_write (const float *home, uint8_t axes);
+static void anchor_write (const float *home, uint8_t axes, const char *source);
 
 /* The lens reference forgectrl took before this controller started. The
  * daemon sweeps the lens onto the hall sensor's rising edge in the
@@ -181,12 +193,13 @@ void gfhome_startup_reference (void)
     float home[N_AXIS] = {0};
     home[Z_AXIS] = sys.home_position[Z_AXIS];
     gf_stream_clear_position();
-    anchor_write(home, Z_AXIS_BIT);
+    anchor_write(home, Z_AXIS_BIT, "startup");
 }
 
 void gfhome_invalidate (void)
 {
     unlink(HOMED_ANCHOR);
+    anchor_axes = 0;
     z_referenced = false;
     /* The position is not trusted: X and Y are no longer homed, and
      * their soft limits go with the reference. */
@@ -195,17 +208,63 @@ void gfhome_invalidate (void)
     gfhome_apply_z_limit();
 }
 
+void gfhome_invalidate_xy (void)
+{
+    /* The head is about to move without the counters (a motor release):
+     * X and Y lose their reference. The lens is not released, so Z keeps
+     * its own, and the anchor keeps carrying it: the Z counter was not
+     * cleared, so the anchor's Z plus the counter is still the lens. */
+    if(anchor_axes & Z_AXIS_BIT)
+        anchor_write(anchor_home, Z_AXIS_BIT, anchor_source);
+    else {
+        unlink(HOMED_ANCHOR);
+        anchor_axes = 0;
+    }
+    sys.homed.mask &= (uint8_t)~(X_AXIS_BIT | Y_AXIS_BIT);
+    sys.soft_limits.mask &= (uint8_t)~(X_AXIS_BIT | Y_AXIS_BIT);
+    gfhome_apply_z_limit();
+    report_add_realtime(Report_Homed);
+}
+
 /* `axes` names which components carry a reference: a full home writes
- * all three, the lens reference at startup writes Z alone. A reader
- * that takes only the three coordinates sees what it always saw. */
-static void anchor_write (const float *home, uint8_t axes)
+ * all three, the lens reference at startup writes Z alone. `source` names
+ * what set it (a provider id, or "startup"), so a reader can tell a
+ * position a hand declared from one the machine found. A reader that
+ * takes only the three coordinates sees what it always saw. */
+static void anchor_write (const float *home, uint8_t axes, const char *source)
 {
     FILE *f = fopen(HOMED_ANCHOR, "w");
     if(f) {
-        fprintf(f, "%.3f %.3f %.3f %u\n",
-                home[X_AXIS], home[Y_AXIS], home[Z_AXIS], axes);
+        fprintf(f, "%.3f %.3f %.3f %u %s\n",
+                home[X_AXIS], home[Y_AXIS], home[Z_AXIS], axes, source);
         fclose(f);
     }
+    if(home != anchor_home)
+        memcpy(anchor_home, home, sizeof(anchor_home));
+    anchor_axes = axes;
+    snprintf(anchor_source, sizeof(anchor_source), "%s", source);
+}
+
+/* What every provider does once the machine stands at its home and
+ * sys.position says so: the limits, the planner, the counters and the
+ * anchor, the core's completion event, and the state. `homed` is what this
+ * home referenced; `anchored` is what the anchor carries, which also names
+ * an axis whose earlier reference still stands. */
+static void home_completed (const float *home, uint8_t homed, uint8_t anchored, const char *source)
+{
+    gfhome_apply_z_limit();
+    sync_position();
+
+    gf_stream_clear_position();
+    anchor_write(home, anchored, source);
+
+    if(grbl.on_homing_completed)
+        grbl.on_homing_completed((axes_signals_t){ .mask = homed }, true);
+    report_add_realtime(Report_Homed);
+
+    state_set(STATE_IDLE);
+    st_go_idle();
+    grbl.report.feedback_message(Message_None);
 }
 
 /* --- session orchestration -------------------------------------------- */
@@ -218,6 +277,18 @@ static bool pump (long timeout_us)
     serial_wait(timeout_us);
     serial_poll();
     return protocol_execute_realtime();
+}
+
+/* A move that has just ended may still be playing out its decel tail in the
+ * kernel. Wait for it, pumping the protocol, for a bounded time. */
+bool gfhome_wait_kernel_idle (uint32_t timeout_ms)
+{
+    uint32_t give_up = hal.get_elapsed_ticks() + timeout_ms;
+    while(!gf_stream_kernel_idle()) {
+        if((int32_t)(give_up - hal.get_elapsed_ticks()) <= 0 || !pump(20000))
+            return false;
+    }
+    return true;
 }
 
 static status_code_t gfcloud_home (sys_state_t entry_state)
@@ -363,18 +434,24 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     static const char *const home_keys[] = { "gfcloud_home_x", "gfcloud_home_y" };
     for(uint_fast8_t a = X_AXIS; a <= Y_AXIS; a++) {
         float key = cfg_read_float(home_keys[a], 0.0f);
-        home[a] = gfhome_clamp_home_mm(key, -settings.axis[a].max_travel);
+        home[a] = gfhome_clamp_cloud_home_mm(key, -settings.axis[a].max_travel);
         if(home[a] != key)
-            fflog(LOG_WARNING, "gfhome: %s %g is off the bed; using %g", home_keys[a],
+            fflog(LOG_WARNING, "gfhome: %s %g is out of range; using %g", home_keys[a],
                   (double)key, (double)home[a]);
     }
     home[Z_AXIS] = (float)(edge_steps + park) / z_spm;
 
+    /* The envelope is the bed. A camera home may lie behind the origin (a
+     * negative gfcloud_home_x or _y): the head stands there, so the envelope
+     * reaches back to it, or no move from the home could land. */
     uint_fast8_t idx;
     for(idx = 0; idx < N_AXIS; idx++) {
         sys.position[idx] = lroundf(home[idx] * settings.axis[idx].steps_per_mm);
+        /* On the step grid, so the head never starts a rounding error
+         * outside an envelope that begins where it stands. */
+        home[idx] = (float)sys.position[idx] / settings.axis[idx].steps_per_mm;
         sys.home_position[idx] = home[idx];
-        sys.work_envelope.min.values[idx] = 0.0f;
+        sys.work_envelope.min.values[idx] = idx <= Y_AXIS && home[idx] < 0.0f ? home[idx] : 0.0f;
         sys.work_envelope.max.values[idx] = -settings.axis[idx].max_travel;
     }
     /* The Z envelope: the head's free travel around the edge, a
@@ -383,20 +460,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     z_env_max = (float)(edge_steps + above + 1) / z_spm;
     z_referenced = true;
     sys.homed.mask = X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT;
-    gfhome_apply_z_limit();
-    sync_position();
-
-    gf_stream_clear_position();
-    anchor_write(home, X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT);
-
-    if(grbl.on_homing_completed)
-        grbl.on_homing_completed(
-            (axes_signals_t){ .mask = X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT }, true);
-    report_add_realtime(Report_Homed);
-
-    state_set(STATE_IDLE);
-    st_go_idle();
-    grbl.report.feedback_message(Message_None);
+    home_completed(home, X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT, X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT, "gfcloud");
 
     fflog(LOG_NOTICE, "gfhome: homed - X%.2f Y%.2f Z%.2f (the hall edge at Z%.2f, the lens "
           "parked %+d half-steps from it)",
@@ -405,26 +469,121 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     return Status_OK;
 }
 
+/* The manual provider: the operator has put the head in the home corner
+ * by hand (back-left, against the stop blocks the operator installed) and
+ * $H declares it. Nothing moves, so there is no session, no runner,
+ * and no lid gate: the lid is open while the head is being pushed. X and
+ * Y become X0 Y0 and homed, and the bed becomes their envelope, which is
+ * exactly as true as the placement; the sender is told so at every home.
+ * Z is left as it is: the lens carries its own reference from the start. */
+static status_code_t manual_home (sys_state_t entry_state)
+{
+    (void)entry_state;
+
+    /* The counters are cleared below: the kernel has to be done playing. */
+    if(!gfhome_wait_kernel_idle(SUSPEND_WAIT_MS))
+        return sys.abort ? Status_OK : Status_IdleError;
+
+    /* The declared position has to be one the motors hold. */
+    status_code_t status = gfrelease_energize();
+    if(status != Status_OK)
+        return status;
+
+    /* The coordinate the stop blocks stand for (manual_home_x and _y): the
+     * origin unless the operator says otherwise, and never negative. They
+     * belong to this provider alone. The blocks are a wall, so they are
+     * also where the envelope starts: nothing is reachable behind them. */
+    float home[N_AXIS];
+    static const char *const home_keys[] = { "manual_home_x", "manual_home_y" };
+    for(uint_fast8_t a = X_AXIS; a <= Y_AXIS; a++) {
+        float key = cfg_read_float(home_keys[a], 0.0f);
+        home[a] = gfhome_clamp_home_mm(key, -settings.axis[a].max_travel);
+        if(home[a] != key)
+            fflog(LOG_WARNING, "gfhome: %s %g is out of range; using %g", home_keys[a],
+                  (double)key, (double)home[a]);
+        sys.position[a] = lroundf(home[a] * settings.axis[a].steps_per_mm);
+        home[a] = (float)sys.position[a] / settings.axis[a].steps_per_mm;     /* on the step grid */
+        sys.home_position[a] = home[a];
+        sys.work_envelope.min.values[a] = home[a];
+        sys.work_envelope.max.values[a] = -settings.axis[a].max_travel;   /* stored negative */
+    }
+    /* The counters are cleared for all three axes, so the anchor carries
+     * where the lens stands now. */
+    home[Z_AXIS] = (float)sys.position[Z_AXIS] / settings.axis[Z_AXIS].steps_per_mm;
+
+    sys.homed.mask |= X_AXIS_BIT|Y_AXIS_BIT;
+    home_completed(home, X_AXIS_BIT|Y_AXIS_BIT,
+                   X_AXIS_BIT|Y_AXIS_BIT|(z_referenced ? Z_AXIS_BIT : 0), "manual");
+
+    report_message("Manual home: position set where the head was placed. "
+                   "Soft limits may not match the machine.", Message_Warning);
+    fflog(LOG_NOTICE, "gfhome: manual home - X%.2f Y%.2f declared where the head stands, Z%.2f kept",
+          (double)home[X_AXIS], (double)home[Y_AXIS], (double)home[Z_AXIS]);
+
+    return Status_OK;
+}
+
+/* No limit switch backend exists: the core's cycle would drive the gantry
+ * into the frame for the full search distance against signals that never
+ * assert. */
+static status_code_t switches_home (sys_state_t entry_state)
+{
+    (void)entry_state;
+    report_message("homing_mode = switches: no limit switches on this machine yet", Message_Warning);
+    return Status_SettingDisabled;
+}
+
+/* The providers of the homing role: homing_mode names one by id. The kind
+ * is a property of the code, never of configuration. A builtin provider is
+ * a function in this driver. A runner-fd provider hands the pulse device
+ * to a root process that moves the machine for minutes; it suspends and
+ * resumes the stream engine around its session, and it is refused while
+ * the motors are released, because it would energize them. */
+typedef enum {
+    HomingProvider_Builtin,
+    HomingProvider_RunnerFd
+} homing_provider_kind_t;
+
+typedef struct {
+    const char *id;
+    homing_provider_kind_t kind;
+    status_code_t (*run)(sys_state_t entry_state);
+} homing_provider_t;
+
+static const homing_provider_t homing_providers[] = {
+    { "gfcloud",  HomingProvider_RunnerFd, gfcloud_home },
+    { "manual",   HomingProvider_Builtin,  manual_home },
+    { "switches", HomingProvider_Builtin,  switches_home }
+};
+
 static status_code_t home_cmd (sys_state_t state, char *args)
 {
     (void)args;
 
     char mode[24] = "";
     cfg_read("homing_mode", mode, sizeof(mode));
-    if(!strcmp(mode, "switches")) {
-        /* No limit switch backend exists: the core's cycle would drive
-         * the gantry into the frame for the full search distance against
-         * signals that never assert. */
-        report_message("homing_mode = switches: no limit switches on this machine yet", Message_Warning);
-        return Status_SettingDisabled;
+
+    const homing_provider_t *provider = NULL;
+    for(size_t i = 0; i < sizeof(homing_providers) / sizeof(homing_providers[0]); i++) {
+        if(!strcmp(mode, homing_providers[i].id))
+            provider = &homing_providers[i];
     }
-    if(strcmp(mode, "gfcloud"))
-        return Status_Unhandled;   /* none (or unset): core $H semantics, disabled */
+    if(provider == NULL) {
+        if(!gfrelease_active())
+            return Status_Unhandled;   /* none (or unset): core $H semantics, disabled */
+        gfrelease_report();            /* and never the core's cycle over a released gantry */
+        return Status_SystemGClock;
+    }
 
     if(!(state == STATE_IDLE || state == STATE_ALARM))
         return Status_IdleError;
 
-    return gfcloud_home(state);
+    if(provider->kind == HomingProvider_RunnerFd && gfrelease_active()) {
+        gfrelease_report();
+        return Status_SystemGClock;
+    }
+
+    return provider->run(state);
 }
 
 static const sys_command_t homing_command_list[] = {

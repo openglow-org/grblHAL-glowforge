@@ -53,3 +53,7 @@ jobs:
         run: python3 forgefirm/scripts/bench/xy_mode_test.py build/grblHAL_glowforge
       - name: A deep planner buffer starts
         run: python3 forgefirm/scripts/bench/planner_blocks_test.py build/grblHAL_glowforge
+      - name: Controller port keeps the sender's response count
+        run: python3 forgefirm/scripts/bench/ctlport_test.py build/grblHAL_glowforge
+      - name: Manual home moves nothing and a released gantry stays released
+        run: python3 forgefirm/scripts/bench/manual_home_test.py build/grblHAL_glowforge

@@ -9,6 +9,8 @@
 #pragma once
 
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 // Z is the focal point's height above the tray. After a home the lens
 // sits on the hall's rising edge, whose focal height the focus card
@@ -49,14 +51,30 @@ static inline float gfhome_clamp_timeout_s (float s, float dflt)
          : s > GFHOME_TIMEOUT_MAX_S ? GFHOME_TIMEOUT_MAX_S : s;
 }
 
-// The post-homing coordinate of an axis, held to the bed: 0 to `travel`
-// (the axis's travel, positive). A value that is not a number is the
-// origin.
+// The coordinate a home declares. Each homing provider has its own pair of
+// keys and reads no other's.
+//
+// A manual home (manual_home_x, _y) declares what the stop blocks stand
+// for: 0 to `travel` (the axis's travel, positive), never negative, since
+// nothing is reachable behind the blocks.
+//
+// A camera home (gfcloud_home_x, _y) declares where the service leaves the
+// head, and that may lie behind the origin the operator calibrated: it is
+// held to `travel` either side of the origin.
+//
+// A value that is not a number is the origin in both.
 static inline float gfhome_clamp_home_mm (float mm, float travel)
 {
     if(!(mm == mm))
         return 0.0f;
     return mm < 0.0f ? 0.0f : mm > travel ? travel : mm;
+}
+
+static inline float gfhome_clamp_cloud_home_mm (float mm, float travel)
+{
+    if(!(mm == mm))
+        return 0.0f;
+    return mm < -travel ? -travel : mm > travel ? travel : mm;
 }
 
 // The lens is never moved without a reference. The Z soft limit is
@@ -89,3 +107,13 @@ void gfhome_init (void);
 // Drop the /run position anchor: the homed reference is no longer
 // trustworthy (stream fault, position lost). Homing success rewrites it.
 void gfhome_invalidate (void);
+
+// Wait, pumping the protocol, until the kernel has finished playing what a
+// move left queued (its decel tail), or the time runs out. False on a
+// timeout or an abort.
+bool gfhome_wait_kernel_idle (uint32_t timeout_ms);
+
+// Drop the X and Y reference alone: the head is about to be moved by hand
+// (a motor release). The lens is not released, so Z keeps its reference
+// and the anchor keeps carrying it.
+void gfhome_invalidate_xy (void);
