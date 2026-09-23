@@ -44,6 +44,7 @@
 #include "glowforge_homing.h"
 #include "glowforge_release.h"
 #include "glowforge_laser.h"
+#include "glowforge_mcode.h"
 #include "glowforge_status.h"
 #include "glowforge_switches.h"
 #include "eeprom.h"
@@ -448,6 +449,7 @@ bool driver_init (void)
     gfhome_init();
     gfrelease_init();
     gflaser_init();
+    gfmcode_init();             /* after gflaser_init: M102 stays the laser's */
     gfsw_init();
     ctlport_init();             /* after gfstatus_init: the socket lives in the state directory */
 

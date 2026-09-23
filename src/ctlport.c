@@ -10,7 +10,9 @@
   Requests and replies are single lines:
 
     state            {"state":"Idle","sender":true,"port_jog":false,"released":false,
-                      "mpos":[x,y,z],"homed":3}
+                      "mpos":[x,y,z],"homed":3,"mcode":null}
+                     mcode is the M-code a job waits at, while one does:
+                     {"seq":n,"code":160,"words":{"P":1}} (glowforge_mcode.c)
     jog <words>      ok | error:<n> | busy:<why>     <words> is the tail of a $J= line
     cancel           ok
 
@@ -23,6 +25,14 @@
     home             ok | error:<n> | busy:<why>     $H, only while homing_mode = manual:
                                                      it moves nothing. Every other $H is a
                                                      session that belongs to the sender.
+
+  and for the machine daemon itself, the M-codes extension packages answer:
+
+    mcodes <list>    ok | error:invalid              the numbers answered now: "-", or
+                                                     160,161 (M160 to M179, each once)
+    mcode_result <seq> ok|fail [<words>]
+                     ok | error:stale | error:invalid
+                                                     the answer to the M-code state names
 
   The port's only motion is the core's jog, $J=. A jog ships dark whatever
   the modal spindle state is, because the stream masks FIRE while the core
@@ -55,6 +65,7 @@
 #include "ctlport.h"
 #include "serial.h"
 #include "glowforge_io.h"
+#include "glowforge_mcode.h"
 #include "glowforge_release.h"
 
 #include "grbl/hal.h"
@@ -188,19 +199,46 @@ static const char *state_name (void)
 
 static void op_state (void)
 {
-    char buf[200];
+    char buf[360], mcode[160];
     float mpos[3] = {0};
 
     for(int i = 0; i < 3 && i < N_AXIS; i++)
         mpos[i] = (float)sys.position[i] / settings.axis[i].steps_per_mm;
 
+    gfmcode_state_json(mcode, sizeof(mcode));
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"sender\":%s,\"port_jog\":%s,\"released\":%s,"
-             "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u}\n",
+             "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u,\"mcode\":%s}\n",
              state_name(), serial_client_connected() ? "true" : "false",
              port_jog ? "true" : "false", gfrelease_active() ? "true" : "false",
-             mpos[0], mpos[1], mpos[2], (unsigned)sys.homed.mask);
+             mpos[0], mpos[1], mpos[2], (unsigned)sys.homed.mask, mcode);
     reply(buf);
+}
+
+/* mcode_result <seq> ok|fail [<words>] */
+static void op_mcode_result (const char *args)
+{
+    char *end;
+    unsigned long seq = strtoul(args, &end, 10);
+    bool ok;
+
+    if(end == args || *end != ' ' || seq == 0 || seq > 0xffffffffUL) {
+        reply("error:invalid\n");
+        return;
+    }
+    end++;
+    if(!strncmp(end, "ok", 2) && (end[2] == '\0' || end[2] == ' '))
+        ok = true;
+    else if(!strncmp(end, "fail", 4) && (end[4] == '\0' || end[4] == ' '))
+        ok = false;
+    else {
+        reply("error:invalid\n");
+        return;
+    }
+    const char *text = end + (ok ? 2 : 4);
+    if(*text == ' ')
+        text++;
+    reply(gfmcode_answer((unsigned)seq, ok, text) == 0 ? "ok\n" : "error:stale\n");
 }
 
 static void op_jog (const char *words)
@@ -221,6 +259,10 @@ static void op_jog (const char *words)
 
     if(gfrelease_active()) {
         reply("busy:released\n");   /* the core would refuse it too; this says why */
+        return;
+    }
+    if(gfmcode_waiting()) {
+        reply("busy:mcode\n");      /* the job is Idle at its M-code, and it is still the job */
         return;
     }
 
@@ -281,6 +323,10 @@ static void handle_request (char *line)
         op_command("$ME");
     else if(!strcmp(line, "home"))
         op_home();
+    else if(!strncmp(line, "mcodes ", 7))
+        reply(gfmcode_set_table(line + 7) == 0 ? "ok\n" : "error:invalid\n");
+    else if(!strncmp(line, "mcode_result ", 13))
+        op_mcode_result(line + 13);
     else
         reply("error:unknown\n");
 }

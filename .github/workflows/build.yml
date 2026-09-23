@@ -55,6 +55,8 @@ jobs:
         run: python3 forgefirm/scripts/bench/planner_blocks_test.py build/grblHAL_glowforge
       - name: Controller port keeps the sender's response count
         run: python3 forgefirm/scripts/bench/ctlport_test.py build/grblHAL_glowforge
+      - name: An M-code a package answers is a dark barrier, bounded, and held on a refusal
+        run: python3 forgefirm/scripts/bench/mcode_test.py build/grblHAL_glowforge
       - name: Manual home moves nothing and a released gantry stays released
         run: python3 forgefirm/scripts/bench/manual_home_test.py build/grblHAL_glowforge
       - name: Every cooling report carries the supervisor's secret, and nothing inherits it
