@@ -17,6 +17,8 @@
       coordinates to the bed (gfhome_clamp_timeout_s,
       gfhome_clamp_home_mm): a key that is not a number takes the
       default, or the origin
+    - a measured far edge is held to 50 mm up to the travel plus 30 mm
+      (gfhome_clamp_envelope_mm), and an unset one is the travel
 
   Copyright 2026 514 LLC d/b/a OpenGlow
   Written by Scott Wiederhold
@@ -190,6 +192,30 @@ int main (void)
                 failures++;
             } else {
                 printf("ok   camera home %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
+            }
+        }
+    }
+
+    /* A measured far edge: 50 mm up to the travel plus 30 mm; unset (the
+     * key's absence reads as -1) or not a number, the travel. */
+    {
+        const float travel = 495.0f;
+        const struct { float in, want; const char *what; } cases[] = {
+            { 480.0f, 480.0f, "a measured edge inside the travel stands" },
+            { 510.5f, 510.5f, "one past the travel, inside its margin, stands" },
+            { 600.0f, 525.0f, "one past the margin lands on the travel plus 30 mm" },
+            { 10.0f, 50.0f, "one below 50 mm lands on 50 mm" },
+            { -1.0f, 495.0f, "an unset key is the travel" },
+            { 0.0f, 495.0f, "zero is the travel" },
+            { NAN, 495.0f, "a value that is not a number is the travel" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            float got = gfhome_clamp_envelope_mm(cases[i].in, travel);
+            if (fabsf(got - cases[i].want) > 1e-4f) {
+                printf("FAIL envelope %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
+                failures++;
+            } else {
+                printf("ok   envelope %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
             }
         }
     }

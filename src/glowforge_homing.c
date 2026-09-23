@@ -54,6 +54,7 @@
 #include "fflog.h"
 #include "driver.h"
 #include "glowforge_homing.h"
+#include "glowforge_laser.h"
 #include "glowforge_release.h"
 #include "glowforge_io.h"
 #include "stepper_stream.h"
@@ -243,6 +244,60 @@ static void anchor_write (const float *home, uint8_t axes, const char *source)
         memcpy(anchor_home, home, sizeof(anchor_home));
     anchor_axes = axes;
     snprintf(anchor_source, sizeof(anchor_source), "%s", source);
+}
+
+/* ---- the envelope's far edges ---- */
+
+static bool envelope_is_open;
+static float envelope_closed[2];                 /* X's and Y's far edges before the envelope was opened */
+
+/* An axis's far edge: the measured one (envelope_x_mm, _y) for X and Y,
+ * the travel for Z. max_travel is stored negative. */
+static float far_edge (uint_fast8_t a)
+{
+    float travel = -settings.axis[a].max_travel;
+    if(a > Y_AXIS)
+        return travel;
+    static const char *const keys[] = { "envelope_x_mm", "envelope_y_mm" };
+    float key = cfg_read_float(keys[a], -1.0f), edge = gfhome_clamp_envelope_mm(key, travel);
+    if(key > 0.0f && edge != key)
+        fflog(LOG_WARNING, "gfhome: %s %g is out of range; using %g", keys[a], (double)key, (double)edge);
+    return edge;
+}
+
+int gfhome_envelope (bool open)
+{
+    if((sys.homed.mask & (X_AXIS_BIT | Y_AXIS_BIT)) != (X_AXIS_BIT | Y_AXIS_BIT))
+        return -1;
+    if(state_get() != STATE_IDLE || gflaser_armed())
+        return -2;
+    char msg[120];
+    for(uint_fast8_t a = X_AXIS; a <= Y_AXIS; a++) {
+        if(open && !envelope_is_open)
+            envelope_closed[a] = sys.work_envelope.max.values[a];
+        sys.work_envelope.max.values[a] = open ? -settings.axis[a].max_travel + GFHOME_ENVELOPE_EXTRA_MM : far_edge(a);
+    }
+    envelope_is_open = open;
+    snprintf(msg, sizeof(msg), open ? "Envelope open for the bed check: X to %.1f, Y to %.1f; jog carefully"
+                                    : "Envelope: X to %.1f, Y to %.1f",
+             (double)sys.work_envelope.max.values[X_AXIS], (double)sys.work_envelope.max.values[Y_AXIS]);
+    report_message(msg, open ? Message_Warning : Message_Info);
+    fflog(LOG_NOTICE, "gfhome: %s", msg);
+    return 0;
+}
+
+bool gfhome_envelope_is_open (void)
+{
+    return envelope_is_open;
+}
+
+void gfhome_envelope_close (void)
+{
+    if(envelope_is_open) {
+        sys.work_envelope.max.values[X_AXIS] = envelope_closed[X_AXIS];
+        sys.work_envelope.max.values[Y_AXIS] = envelope_closed[Y_AXIS];
+        envelope_is_open = false;
+    }
 }
 
 /* What every provider does once the machine stands at its home and
@@ -452,8 +507,9 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         home[idx] = (float)sys.position[idx] / settings.axis[idx].steps_per_mm;
         sys.home_position[idx] = home[idx];
         sys.work_envelope.min.values[idx] = idx <= Y_AXIS && home[idx] < 0.0f ? home[idx] : 0.0f;
-        sys.work_envelope.max.values[idx] = -settings.axis[idx].max_travel;
+        sys.work_envelope.max.values[idx] = far_edge(idx);
     }
+    envelope_is_open = false;
     /* The Z envelope: the head's free travel around the edge, a
      * half-step of slack at each end; the Z soft limit stands on it. */
     z_env_min = (float)(edge_steps - below - 1) / z_spm;
@@ -505,8 +561,9 @@ static status_code_t manual_home (sys_state_t entry_state)
         home[a] = (float)sys.position[a] / settings.axis[a].steps_per_mm;     /* on the step grid */
         sys.home_position[a] = home[a];
         sys.work_envelope.min.values[a] = home[a];
-        sys.work_envelope.max.values[a] = -settings.axis[a].max_travel;   /* stored negative */
+        sys.work_envelope.max.values[a] = far_edge(a);
     }
+    envelope_is_open = false;
     /* The counters are cleared for all three axes, so the anchor carries
      * where the lens stands now. */
     home[Z_AXIS] = (float)sys.position[Z_AXIS] / settings.axis[Z_AXIS].steps_per_mm;

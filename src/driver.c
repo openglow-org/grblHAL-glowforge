@@ -314,6 +314,7 @@ static void driverReset (void)
     if(sys.reset_pending) {
         gflaser_disarm();
         gf_stream_reset();
+        gfhome_envelope_close();
     }
 
     driver_reset_chain();

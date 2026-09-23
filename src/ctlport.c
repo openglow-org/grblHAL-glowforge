@@ -10,7 +10,7 @@
   Requests and replies are single lines:
 
     state            {"state":"Idle","sender":true,"port_jog":false,"released":false,
-                      "mpos":[x,y,z],"homed":3,"mcode":null}
+                      "mpos":[x,y,z],"homed":3,"envelope_open":false,"mcode":null}
                      mcode is the M-code a job waits at, while one does:
                      {"seq":n,"code":160,"words":{"P":1}} (glowforge_mcode.c)
     jog <words>      ok | error:<n> | busy:<why>     <words> is the tail of a $J= line
@@ -25,6 +25,14 @@
     home             ok | error:<n> | busy:<why>     $H, only while homing_mode = manual:
                                                      it moves nothing. Every other $H is a
                                                      session that belongs to the sender.
+    envelope open|apply
+                     ok | error:homed | busy:state   the bed check's: X's and Y's far edges
+                                                     opened to the travel plus 30 mm, or set
+                                                     from envelope_x_mm and _y again. An open
+                                                     envelope is the port's jogs' alone: the
+                                                     sender's lines wait while it is open, as
+                                                     during a port jog, and the first one
+                                                     closes it before the core reads it
 
   and for the machine daemon itself, the M-codes extension packages answer:
 
@@ -64,6 +72,7 @@
 
 #include "ctlport.h"
 #include "serial.h"
+#include "glowforge_homing.h"
 #include "glowforge_io.h"
 #include "glowforge_mcode.h"
 #include "glowforge_release.h"
@@ -101,6 +110,7 @@ static bool awaiting = false;       /* a line is injected, its status not yet ba
 static bool awaiting_jog = false;   /* and that line is a jog */
 static bool port_jog = false;       /* the jog in progress is the port's */
 static bool cancel_sent = false;
+static bool envelope_hold = false;  /* the sender is held for an open envelope */
 static char deferred[sizeof(req) + 4];  /* a line waiting for the ring to empty, "" when none */
 static bool deferred_jog;
 static double deferred_until;
@@ -128,6 +138,7 @@ static void drop_port_client (void)
         req_len = 0;
         deferred[0] = '\0';
         cancel_port_jog();          /* the client is the dead-man */
+        gfhome_envelope_close();    /* and the bed check's envelope is its own */
     }
 }
 
@@ -199,7 +210,7 @@ static const char *state_name (void)
 
 static void op_state (void)
 {
-    char buf[360], mcode[160];
+    char buf[400], mcode[160];
     float mpos[3] = {0};
 
     for(int i = 0; i < 3 && i < N_AXIS; i++)
@@ -208,10 +219,11 @@ static void op_state (void)
     gfmcode_state_json(mcode, sizeof(mcode));
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"sender\":%s,\"port_jog\":%s,\"released\":%s,"
-             "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u,\"mcode\":%s}\n",
+             "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u,\"envelope_open\":%s,\"mcode\":%s}\n",
              state_name(), serial_client_connected() ? "true" : "false",
              port_jog ? "true" : "false", gfrelease_active() ? "true" : "false",
-             mpos[0], mpos[1], mpos[2], (unsigned)sys.homed.mask, mcode);
+             mpos[0], mpos[1], mpos[2], (unsigned)sys.homed.mask,
+             gfhome_envelope_is_open() ? "true" : "false", mcode);
     reply(buf);
 }
 
@@ -323,7 +335,10 @@ static void handle_request (char *line)
         op_command("$ME");
     else if(!strcmp(line, "home"))
         op_home();
-    else if(!strncmp(line, "mcodes ", 7))
+    else if(!strcmp(line, "envelope open") || !strcmp(line, "envelope apply")) {
+        int rc = gfhome_envelope(line[9] == 'o');
+        reply(rc == 0 ? "ok\n" : rc == -1 ? "error:homed\n" : "busy:state\n");
+    } else if(!strncmp(line, "mcodes ", 7))
         reply(gfmcode_set_table(line + 7) == 0 ? "ok\n" : "error:invalid\n");
     else if(!strncmp(line, "mcode_result ", 13))
         op_mcode_result(line + 13);
@@ -345,6 +360,28 @@ void ctlport_poll (void)
             serial_hold_sender(false);
         } else if(serial_sender_pending())
             cancel_port_jog();
+    }
+
+    /* An open envelope (the bed check's) is the port's jogs' alone, so no
+     * program runs in it. The sender's bytes wait while it is open, and
+     * the first one closes it, once a port jog it cancels has ended, before
+     * the core reads the line. */
+    if(gfhome_envelope_is_open() && !awaiting) {
+        if(!serial_sender_pending()) {
+            serial_hold_sender(true);
+            envelope_hold = true;
+        } else if(port_jog)
+            cancel_port_jog();
+        else {
+            gfhome_envelope_close();
+            hal.stream.write("[MSG:Bed check envelope closed: a sender line]" ASCII_EOL);
+            serial_hold_sender(false);
+            envelope_hold = false;
+        }
+    } else if(envelope_hold && !gfhome_envelope_is_open()) {
+        envelope_hold = false;              /* a home, a reset, or the port client closed it */
+        if(!port_jog)
+            serial_hold_sender(false);
     }
 
     /* One client. A second connection is refused, never displacing. A

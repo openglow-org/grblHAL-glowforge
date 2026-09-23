@@ -77,6 +77,39 @@ static inline float gfhome_clamp_cloud_home_mm (float mm, float travel)
     return mm < -travel ? -travel : mm > travel ? travel : mm;
 }
 
+// The work envelope's far edges in X and Y (envelope_x_mm, _y): what the
+// operator measured with the Setup page's bed check, in place of the axis
+// travel ($130, $131), which is what an unset key stands for. Held to
+// GFHOME_ENVELOPE_MIN_MM up to the travel plus GFHOME_ENVELOPE_EXTRA_MM: a
+// margin the factory took for its tolerances can be given back, and no
+// more than that.
+#define GFHOME_ENVELOPE_MIN_MM   50.0f
+#define GFHOME_ENVELOPE_EXTRA_MM 30.0f
+
+static inline float gfhome_clamp_envelope_mm (float mm, float travel)
+{
+    if(!(mm == mm) || mm <= 0.0f)
+        return travel;
+    float hi = travel + GFHOME_ENVELOPE_EXTRA_MM;
+    return mm < GFHOME_ENVELOPE_MIN_MM ? GFHOME_ENVELOPE_MIN_MM : mm > hi ? hi : mm;
+}
+
+// The bed check's two steps (the port's envelope op). open: X's and Y's far
+// edges at the widest they may be, the travel plus GFHOME_ENVELOPE_EXTRA_MM,
+// so the operator can jog to the machine's own ends; apply: the far edges
+// from the keys again, as a home sets them. Both need X and Y homed, the
+// machine Idle, and no armed window. A home, a soft reset, and a sender's
+// line close an open envelope. 0, -1 not homed, -2 not Idle or a window
+// open.
+int gfhome_envelope (bool open);
+
+bool gfhome_envelope_is_open (void);
+
+// Closes an open envelope: the far edges it had before it was opened. From
+// the driver's reset hook, and from the port when a sender's line arrives
+// (ctlport.c): an open envelope is the port's jogs' alone.
+void gfhome_envelope_close (void);
+
 // The lens is never moved without a reference. The Z soft limit is
 // always on: until Z is referenced it holds Z where it is (a jog is
 // refused, a program move raises the soft-limit alarm before it starts);
