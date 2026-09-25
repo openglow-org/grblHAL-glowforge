@@ -15,6 +15,11 @@
 // https://docs.forgefirm.org/technical/forgefirm/cooling-engine/. Called from driver_init().
 void gfcool_init (void);
 
+// The report secret the supervisor handed this process, "" when there is
+// none. The homing runner reports job state in this client's place while
+// a gfcloud $H holds the machine, and is handed it at its spawn.
+const char *gfcool_report_secret (void);
+
 // hal.coolant backends. Flood (M8/M9) drives the job-state reports;
 // the engine applies the fan profiles.
 void gfcool_coolant_set (coolant_state_t state);

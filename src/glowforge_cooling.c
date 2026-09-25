@@ -12,7 +12,9 @@
     spawn (GF_REPORT_SECRET), which the route asks for: the channel is the
     running controller's alone, and a loopback peer is not proof of that.
     The secret is read once and taken out of the environment, so nothing
-    this process starts inherits it. Level-triggered, re-sent every ~1 s from gfcool_poll and
+    this process starts inherits it but the homing runner, which reports
+    in this client's place while a gfcloud $H holds the machine and is
+    handed it at its spawn (gfcool_report_secret). Level-triggered, re-sent every ~1 s from gfcool_poll and
     immediately on every change, so a lost report self-heals. The
     effective run window is the sender's M8/M9 OR'd with the laser
     armed window: fire must never run without the cut airflow and the
@@ -451,8 +453,9 @@ void gfcool_init (void)
     if(vf && *vf)
         verdict_file = vf;
     /* The report secret: 32 hex digits or nothing (it goes into a header
-     * as it is). Out of the environment once read: the homing runner and
-     * anything else this process starts has no use for it. */
+     * as it is). Out of the environment once read: nothing this process
+     * starts inherits it, and the homing runner, which reports in this
+     * client's place, is handed it at its spawn. */
     const char *rs = getenv("GF_REPORT_SECRET");
     if(rs && strlen(rs) == sizeof(report_secret) - 1 &&
        strspn(rs, "0123456789abcdef") == sizeof(report_secret) - 1)
@@ -471,6 +474,11 @@ void gfcool_init (void)
     if(pthread_create(&tid, &a, reporter_thread, NULL) != 0)
         fflog(LOG_ERR, "gfcool: cannot start the reporter thread");
     pthread_attr_destroy(&a);
+}
+
+const char *gfcool_report_secret (void)
+{
+    return report_secret;
 }
 
 void gfcool_coolant_set (coolant_state_t state)

@@ -53,6 +53,7 @@
  * macro that would otherwise mangle the field of that name in vfs.h */
 #include "fflog.h"
 #include "driver.h"
+#include "glowforge_cooling.h"
 #include "glowforge_homing.h"
 #include "glowforge_laser.h"
 #include "glowforge_release.h"
@@ -406,6 +407,15 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     char park_s[16];
     snprintf(park_s, sizeof(park_s), "%d", park);
     setenv("GFHOME_PARK_HALF_STEPS", park_s, 1);
+    /* The runner reports job state in the cooling client's place while it
+     * holds the machine (the client is quiet in STATE_HOMING), and the
+     * report channel asks for the supervisor's secret: without it every
+     * report is refused, the engine hears silence, and its dead-man stops
+     * the first motion that plays. The runner's client takes it out of
+     * its own environment once read. */
+    const char *secret = gfcool_report_secret();
+    if(*secret)
+        setenv("GF_REPORT_SECRET", secret, 1);
 
     pid_t pid = fork();
     if(pid == 0) {
@@ -415,6 +425,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     }
     unsetenv("GFHOME_TIMEOUT_S");
     unsetenv("GFHOME_PARK_HALF_STEPS");
+    unsetenv("GF_REPORT_SECRET");
     if(pid < 0) {
         fflog(LOG_ERR, "gfhome: cannot spawn the homing runner");
         if(!gf_stream_resume())
