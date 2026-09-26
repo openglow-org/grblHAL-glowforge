@@ -59,7 +59,7 @@ jobs:
         run: python3 forgefirm/scripts/bench/mcode_test.py build/grblHAL_glowforge
       - name: The measured envelope, and the bed check's open envelope is the port's jogs' alone
         run: python3 forgefirm/scripts/bench/envelope_test.py build/grblHAL_glowforge
-      - name: Manual home declares the stop blocks, jogs dark to an offset origin, and a released gantry stays released
+      - name: Manual home declares the gantry stops, jogs dark to an offset origin, and a released gantry stays released
         run: python3 forgefirm/scripts/bench/manual_home_test.py build/grblHAL_glowforge
       - name: Every cooling report carries the supervisor's secret, and only the homing runner is handed it
         run: python3 forgefirm/scripts/bench/cool_report_test.py build/grblHAL_glowforge

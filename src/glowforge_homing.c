@@ -10,10 +10,10 @@
                             (gfhome.py: cloud vision homes X/Y to the
                             factory home corner, Z to the hall sensor).
     homing_mode = manual    the operator has pushed the head against the
-                            stop blocks by hand (with the motors released,
+                            gantry stops by hand (with the motors released,
                             glowforge_release.c), and $H declares that spot:
                             X0 Y0 by default, or minus manual_home_x,
-                            manual_home_y (how far in front of the blocks
+                            manual_home_y (how far in front of the stops
                             the origin lies, never negative), and then
                             jogs the head to the origin. Z is left as it
                             is.
@@ -555,7 +555,7 @@ static void origin_jog_cancel (sys_state_t state)
         jog_cancel_chain(state);
 }
 
-/* A manual home with an offset: the head stands at the stop blocks, in
+/* A manual home with an offset: the head stands at the gantry stops, in
  * front of the origin, and goes straight to X0 Y0 as a jog, the one motion
  * that ships dark whatever the modal spindle state is (the stream masks
  * FIRE while the core jogs). Like every jog it runs with the lid open (the
@@ -606,12 +606,12 @@ static void manual_home_to_origin (void)
     }
 }
 
-/* The manual provider: the operator has put the head against the stop
- * blocks by hand (back-left, the blocks the operator installed) and $H
+/* The manual provider: the operator has put the head against the gantry
+ * stops by hand (back-left, the stops the operator installed) and $H
  * declares it. There is no session, no runner, and no lid gate: the lid is
  * open while the head is being pushed. X and Y are homed, and the bed
  * becomes their envelope, which is exactly as true as the placement; the
- * sender is told so at every home. With no offset the blocks are X0 Y0 and
+ * sender is told so at every home. With no offset the stops are X0 Y0 and
  * nothing moves; with one the head jogs to the origin. Z is left as it
  * is: the lens carries its own reference from the start. */
 static status_code_t manual_home (sys_state_t entry_state)
@@ -627,11 +627,11 @@ static status_code_t manual_home (sys_state_t entry_state)
     if(status != Status_OK)
         return status;
 
-    /* How far in front of the stop blocks the origin lies (manual_home_x
+    /* How far in front of the gantry stops the origin lies (manual_home_x
      * and _y): 0 unless the operator says otherwise, and never negative.
-     * They belong to this provider alone. The head at the blocks is minus
+     * They belong to this provider alone. The head at the stops is minus
      * the offsets, and the envelope starts at the origin, so the strip
-     * between the blocks and the origin is outside it. */
+     * between the stops and the origin is outside it. */
     float home[N_AXIS];
     bool offset = false;
     static const char *const home_keys[] = { "manual_home_x", "manual_home_y" };
