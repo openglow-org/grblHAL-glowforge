@@ -10,7 +10,8 @@
   Requests and replies are single lines:
 
     state            {"state":"Idle","sender":true,"port_jog":false,"released":false,
-                      "mpos":[x,y,z],"homed":3,"envelope_open":false,"mcode":null}
+                      "mpos":[x,y,z],"homed":3,"envelope_open":false,"mcode":null,
+                      "sender_out":false}
                      mcode is the M-code a job waits at, while one does:
                      {"seq":n,"code":160,"words":{"P":1}} (glowforge_mcode.c)
     jog <words>      ok | error:<n> | busy:<why>     <words> is the tail of a $J= line
@@ -41,6 +42,23 @@
 
     mcodes <list>    ok | error:invalid              the numbers answered now: "-", or
                                                      160,161 (M160 to M179, each once)
+
+  and the Grbl socket kept to this host while an extension package uses
+  the machine:
+
+    sender out       ok | busy:state | busy:sender   only on an idle machine: no program,
+                                                     motion, jog, armed window, M-code wait
+                                                     or open envelope, and the sender quiet
+                                                     for 2 s with no line of its running.
+                                                     The sender is dropped, after a message
+                                                     line, and every sender from the network
+                                                     is turned away until "sender in"; one
+                                                     from this host (the daemon's own job
+                                                     runner) connects as always. It holds
+                                                     until "sender in" or a controller
+                                                     restart, whatever happens to the port's
+                                                     client: the daemon keeps it or ends it
+    sender in        ok
     mcode_result <seq> ok|fail [<words>]
                      ok | error:stale | error:invalid
                                                      the answer to the M-code state names
@@ -51,7 +69,9 @@
   line that does not start with $J=, and <words> is held to the characters
   a jog needs.
 
-  The sender always wins. A port jog is refused while the sender is active,
+  The sender always wins, but for "sender out", which the daemon asks for
+  only on an idle machine and only for an extension package the operator
+  let keep the sender out. A port jog is refused while the sender is active,
   and a sender line that arrives while a port jog runs cancels the jog and
   waits, unread, until the core is idle again: the sender sees a short
   delay and its own status, never the error a line gets during a jog. The
@@ -77,10 +97,13 @@
 #include "serial.h"
 #include "glowforge_homing.h"
 #include "glowforge_io.h"
+#include "glowforge_laser.h"
 #include "glowforge_mcode.h"
 #include "glowforge_release.h"
+#include "stepper_stream.h"
 
 #include "grbl/hal.h"
+#include "grbl/planner.h"
 #include "grbl/protocol.h"
 #include "grbl/state_machine.h"
 #include "grbl/system.h"
@@ -100,6 +123,10 @@
 
 /* A port jog waits this long after the sender's last line. */
 #define SENDER_QUIET_S 0.3
+
+/* Keeping the sender out waits this long after the sender's last line:
+ * a sender between two lines of its own program is not done with it. */
+#define SENDER_OUT_QUIET_S 2.0
 
 /* A line that found the sender's empty lines in the ring waits this long
  * for the core to read them, which takes it one pass of its loop. */
@@ -222,11 +249,13 @@ static void op_state (void)
     gfmcode_state_json(mcode, sizeof(mcode));
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"sender\":%s,\"port_jog\":%s,\"released\":%s,"
-             "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u,\"envelope_open\":%s,\"mcode\":%s}\n",
+             "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u,\"envelope_open\":%s,\"mcode\":%s,"
+             "\"sender_out\":%s}\n",
              state_name(), serial_client_connected() ? "true" : "false",
              port_jog ? "true" : "false", gfrelease_active() ? "true" : "false",
              mpos[0], mpos[1], mpos[2], (unsigned)sys.homed.mask,
-             gfhome_envelope_is_open() ? "true" : "false", mcode);
+             gfhome_envelope_is_open() ? "true" : "false", mcode,
+             serial_keeping_out() ? "true" : "false");
     reply(buf);
 }
 
@@ -313,6 +342,30 @@ static void op_command (const char *line)
     inject(line, false);
 }
 
+/* sender out: the machine is idle in every sense a sender can see, and
+ * the sender has nothing under way, or nothing changes. */
+static void op_sender_out (void)
+{
+    if(serial_keeping_out()) {
+        reply("ok\n");
+        return;
+    }
+    if(state_get() != STATE_IDLE || plan_get_current_block() != NULL || port_jog ||
+       gfmcode_waiting() || gflaser_armed() || gflaser_arming() ||
+       gfhome_envelope_is_open() || !gf_stream_kernel_idle()) {
+        reply("busy:state\n");
+        return;
+    }
+    if(serial_sender_midline() || serial_sender_line_open() || serial_sender_pending() ||
+       (serial_sender_last_line() > 0 && now_s() - serial_sender_last_line() < SENDER_OUT_QUIET_S)) {
+        reply("busy:sender\n");
+        return;
+    }
+    serial_keep_out(true);
+    serial_drop_sender();
+    reply("ok\n");
+}
+
 static void op_home (void)
 {
     char mode[24] = "";
@@ -346,7 +399,12 @@ static void handle_request (char *line)
         reply(gfmcode_set_table(line + 7) == 0 ? "ok\n" : "error:invalid\n");
     else if(!strncmp(line, "mcode_result ", 13))
         op_mcode_result(line + 13);
-    else
+    else if(!strcmp(line, "sender out"))
+        op_sender_out();
+    else if(!strcmp(line, "sender in")) {
+        serial_keep_out(false);
+        reply("ok\n");
+    } else
         reply("error:unknown\n");
 }
 

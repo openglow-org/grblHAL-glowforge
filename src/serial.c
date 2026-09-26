@@ -65,6 +65,8 @@ static bool banner_pending = false; /* a sender connected: welcome it from a top
 static bool tx_blocked = false;     /* serialPutC is waiting on the ring: no nested writes */
 static bool rx_discarding = false;  /* dropping the rest of an overrun line */
 static bool rx_overrun = false;     /* an overrun happened, not yet taken */
+static bool client_loopback = false;    /* the sender connected from this host */
+static bool keep_out = false;       /* senders from the network are refused (serial.h) */
 
 /* Line multiplexing (serial.h). An injected line goes into an empty ring
  * only, so it is the next thing the core reads: inj_left is how many of
@@ -80,6 +82,7 @@ static bool inj_first = false;          /* none of its bytes has been read yet *
 static bool inj_status_due = false;     /* its last byte was read: the next status is its own */
 static status_code_t inj_saved_error;   /* the sender's held parser error, put back after it */
 static bool hold_sender = false;
+static bool sender_line_open = false;   /* the core read a sender line whose status is not out yet */
 static serial_inject_done_ptr inj_done = NULL;
 static status_message_ptr status_message_chain = NULL;
 static on_report_handlers_init_ptr report_handlers_init_chain = NULL;
@@ -109,6 +112,7 @@ static void drop_client (void)
     if(client_fd >= 0) {
         close(client_fd);
         client_fd = -1;
+        client_loopback = false;
         client_peer[0] = '\0';
         client_generation++;
         serialRxFlush();
@@ -156,9 +160,12 @@ static int32_t serialGetC (void)
         !(is_eol(rxbuffer.data[bptr]) && !read_midline))
         return -1;
 
+    bool injected = inj_left > 0;
     data = (int32_t)rxbuffer.data[bptr++];          // Get next character, increment tmp pointer
     rxbuffer.tail = bptr & (RX_BUFFER_SIZE - 1);    // and update pointer
     read_midline = !is_eol((uint8_t)data);
+    if(!injected && read_midline)
+        sender_line_open = true;                    // its status clears it
 
     if(inj_left) {
         /* The core runs a line at its end-of-line byte, before it reads
@@ -195,6 +202,7 @@ static void serialRxFlush (void)
     rx_discarding = false;
     sender_midline = false;
     read_midline = false;               // the core flushes its line buffer on the same occasions
+    sender_line_open = false;           // and a line whose run was aborted gets no status
 
     /* An injected line goes with the rest, and its source is told. A line
      * whose run was aborted gets no status from the core, and the core
@@ -394,6 +402,7 @@ static status_code_t inject_status_message (status_code_t status)
         return status;
     }
 
+    sender_line_open = false;
     return status_message_chain(status);
 }
 
@@ -453,6 +462,52 @@ void serial_hold_sender (bool hold)
     hold_sender = hold;
 }
 
+bool serial_sender_midline (void)
+{
+    return sender_midline;
+}
+
+bool serial_sender_line_open (void)
+{
+    return sender_line_open;
+}
+
+/* A peer on this host: the IPv4 loopback net, ::1, or the loopback net
+ * mapped into IPv6, which is how the dual-stack socket sees an IPv4 peer. */
+static bool peer_loopback (const struct sockaddr_storage *sa)
+{
+    if(sa->ss_family == AF_INET)
+        return (ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr) >> 24) == 127;
+    if(sa->ss_family == AF_INET6) {
+        const struct in6_addr *a = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+        return IN6_IS_ADDR_LOOPBACK(a) || (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127);
+    }
+    return false;
+}
+
+/* What a sender that is turned away or dropped reads before the socket
+ * closes: a message line, which senders show in their consoles. */
+#define KEEP_OUT_MSG "[MSG:The machine is in use: senders are kept out for now]\r\n"
+
+void serial_keep_out (bool on)
+{
+    keep_out = on;
+}
+
+bool serial_keeping_out (void)
+{
+    return keep_out;
+}
+
+bool serial_drop_sender (void)
+{
+    if(client_fd < 0 || client_loopback)
+        return false;
+    (void)!write(client_fd, KEEP_OUT_MSG, sizeof(KEEP_OUT_MSG) - 1);
+    drop_client();
+    return true;
+}
+
 bool serial_sender_pending (void)
 {
     /* The sender's bytes are the ones behind an injected line. End-of-line
@@ -495,8 +550,18 @@ static void rx_poll (void)
         struct sockaddr_storage sa;
         socklen_t sl = sizeof(sa);
         int fd = accept4(listen_fd, (struct sockaddr *)&sa, &sl, SOCK_CLOEXEC);
+        /* While senders are kept out, one from the network is turned away
+         * at once, and nothing of the session changes: no displacement,
+         * no generation, no banner. A peer on this host still connects:
+         * the machine daemon's own job runner is one. */
+        if(fd >= 0 && keep_out && !peer_loopback(&sa)) {
+            (void)!write(fd, KEEP_OUT_MSG, sizeof(KEEP_OUT_MSG) - 1);
+            close(fd);
+            fd = -1;
+        }
         if(fd >= 0) {
             drop_client();
+            client_loopback = peer_loopback(&sa);
             client_peer[0] = '\0';
             if(sa.ss_family == AF_INET)
                 inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr,

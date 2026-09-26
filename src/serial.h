@@ -81,3 +81,18 @@ bool serial_sender_pending (void);
 // about to answer: an injection refused now goes through a moment later.
 bool serial_sender_empty_lines_only (void);
 double serial_sender_last_line (void);
+
+// The sender is in the middle of writing a line, and the core has read a
+// sender line whose status has not gone out yet (a dwell, a wait, any
+// line still running).
+bool serial_sender_midline (void);
+bool serial_sender_line_open (void);
+
+// Keeping senders out. While on, a connection from the network is closed
+// as soon as it is accepted, after one message line, and changes nothing
+// of the session; one from this host (the machine daemon's own job
+// runner) connects as always. serial_drop_sender() drops the connected
+// sender the same way, unless it is on this host, and says whether it did.
+void serial_keep_out (bool on);
+bool serial_keeping_out (void);
+bool serial_drop_sender (void);

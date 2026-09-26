@@ -27,12 +27,23 @@
   a settings dump queues in the ring without waiting on the sender, a
   sender that pauses under a second keeps its connection, and one that
   pauses longer is dropped with the ring flushed.
+
+  Keeping senders out: a peer on this host is told from one on the
+  network by its address, the dual-stack socket's mapped IPv4 included;
+  while senders are kept out, one from the network is turned away with a
+  message line and nothing of the session changes (no generation, no
+  banner), one from this host connects, and the connected sender is
+  dropped unless it is on this host. A sender line is open from the
+  core's first byte of it to its status, so a dwell or a wait that runs
+  inside a line reads as the sender at work.
 */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 /* --- stubs the serial source links against -------------------------- */
 
@@ -139,6 +150,66 @@ static const char *received(int fd, int ms)
     buf[len] = '\0';
     return buf;
 }
+
+/* An address of this host that is not the loopback, for a peer the
+   stream must see as one from the network. */
+static bool own_address(struct in_addr *out)
+{
+    struct ifaddrs *list, *i;
+    bool found = false;
+    if(getifaddrs(&list) != 0)
+        return false;
+    for(i = list; i && !found; i = i->ifa_next) {
+        if(!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP))
+            continue;
+        struct in_addr a = ((struct sockaddr_in *)i->ifa_addr)->sin_addr;
+        if((ntohl(a.s_addr) >> 24) != 127) {
+            *out = a;
+            found = true;
+        }
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+static int listen_any(uint16_t *port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = 0, .sin_addr.s_addr = htonl(INADDR_ANY) };
+    socklen_t sl = sizeof(sa);
+    if(fd < 0 || bind(fd, (struct sockaddr *)&sa, sl) != 0 || listen(fd, 4) != 0 ||
+       getsockname(fd, (struct sockaddr *)&sa, &sl) != 0)
+        return -1;
+    *port = ntohs(sa.sin_port);
+    return fd;
+}
+
+static int connect_to(struct in_addr a, uint16_t port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = a };
+    if(fd < 0 || connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0)
+        return -1;
+    return fd;
+}
+
+static bool loopback_text(const char *text)
+{
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    if(strchr(text, ':')) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&ss;
+        v6->sin6_family = AF_INET6;
+        inet_pton(AF_INET6, text, &v6->sin6_addr);
+    } else {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&ss;
+        v4->sin_family = AF_INET;
+        inet_pton(AF_INET, text, &v4->sin_addr);
+    }
+    return peer_loopback(&ss);
+}
+
+static status_code_t fake_status(status_code_t status) { return status; }
 
 /* Bytes serialPutC accepted; a drop ends the count. */
 static int put_bytes(int n)
@@ -300,6 +371,82 @@ int main(void)
     serial_set_listen_fd(-1);
     close(lfd);
 
+    /* --- keeping senders out ------------------------------------------- */
+    printf("Keeping senders out:\n");
+    CHECK(loopback_text("127.0.0.1") && loopback_text("127.5.5.5") && loopback_text("::1") &&
+          loopback_text("::ffff:127.0.0.1"), "this host: the loopback net, ::1, and the mapped loopback");
+    CHECK(!loopback_text("10.0.0.1") && !loopback_text("192.168.1.5") && !loopback_text("::ffff:192.168.1.5") &&
+          !loopback_text("2001:db8::1") && !loopback_text("::"), "the network: every other address");
+
+    uint16_t aport;
+    int lany = listen_any(&aport);
+    CHECK(lany >= 0, "a listening socket on every address");
+    serial_set_listen_fd(lany);
+    serial_keep_out(true);
+    CHECK(serial_keeping_out(), "senders are kept out");
+    int b0 = banners;
+    int local = connect_loopback(aport);
+    serial_poll();
+    CHECK(local >= 0 && client_fd >= 0 && client_loopback && banners == b0 + 1,
+          "a sender on this host connects and is welcomed");
+    CHECK(!serial_drop_sender() && client_fd >= 0, "dropping the sender leaves one on this host");
+    close(local);
+    drop_client();
+
+    struct in_addr own;
+    if(own_address(&own)) {
+        unsigned gen = serial_client_generation();
+        b0 = banners;
+        int net = connect_to(own, aport);
+        serial_poll();
+        CHECK(net >= 0 && client_fd < 0 && serial_client_generation() == gen && banners == b0 &&
+              client_peer[0] == '\0', "a sender from the network is turned away, and nothing of the session changes");
+        CHECK(strstr(received(net, 500), "[MSG:") != NULL, "it reads why");
+        char c;
+        CHECK(read(net, &c, 1) == 0, "and the socket is closed");
+        close(net);
+
+        serial_keep_out(false);
+        net = connect_to(own, aport);
+        serial_poll();
+        CHECK(client_fd >= 0 && !client_loopback && strcmp(received(net, 500), BANNER) == 0,
+              "let back in, a sender from the network connects");
+        serial_keep_out(true);
+        gen = serial_client_generation();
+        CHECK(serial_drop_sender() && client_fd < 0 && serial_client_generation() == gen + 1,
+              "keeping senders out drops the one connected, as a disconnect");
+        CHECK(strstr(received(net, 500), "[MSG:") != NULL, "which reads why");
+        close(net);
+    } else
+        printf("  skipped: this host has no address but the loopback\n");
+    serial_keep_out(false);
+    serial_set_listen_fd(-1);
+    close(lany);
+
+    /* --- a sender line is open until its status ------------------------- */
+    printf("A sender line is open until its status:\n");
+    status_message_chain = fake_status;
+    serialRxFlush();
+    push("G4 P1");
+    CHECK(serial_sender_midline() && !serial_sender_line_open(), "a line being written is mid-line, not yet open");
+    push("\n");
+    CHECK(!serial_sender_midline() && !serial_sender_line_open(), "a whole line the core has not read is neither");
+    int16_t ch;
+    while((ch = serialGetC()) != SERIAL_NO_DATA && ch != '\n')
+        CHECK(serial_sender_line_open(), "each byte the core reads keeps it open");
+    CHECK(ch == '\n' && serial_sender_line_open(), "read whole and running, it is open");
+    inject_status_message(Status_OK);
+    CHECK(!serial_sender_line_open(), "its status closes it");
+    push("\n");
+    while((ch = serialGetC()) != SERIAL_NO_DATA)
+        ;
+    CHECK(!serial_sender_line_open(), "an empty line opens nothing");
+    push("G1 X1\n");
+    (void)serialGetC();
+    CHECK(serial_sender_line_open(), "a line the core began is open");
+    serialRxFlush();
+    CHECK(!serial_sender_line_open(), "a flush closes a line that will get no status");
+
     /* --- the TX ring and its stall bound --------------------------------- */
     printf("The TX ring under a sender that stops reading:\n");
     CHECK(TX_BUFFER_SIZE >= 2048, "the ring holds 2048 bytes");
@@ -360,7 +507,9 @@ int main(void)
                     : "PASS: an overrun drops the overrunning line whole, keeps every earlier "
                       "line, passes real-time characters and is reported once; a connect is "
                       "welcomed from a top-level poll; the ring holds a settings dump and "
-                      "drops a sender only after a second without progress\n",
+                      "drops a sender only after a second without progress; senders from the "
+                      "network are kept out on demand and one on this host is not; a sender "
+                      "line is open until its status\n",
            failures);
     return failures ? 1 : 0;
 }
