@@ -54,9 +54,9 @@ static inline float gfhome_clamp_timeout_s (float s, float dflt)
 // The coordinate a home declares. Each homing provider has its own pair of
 // keys and reads no other's.
 //
-// A manual home (manual_home_x, _y) declares what the stop blocks stand
-// for: 0 to `travel` (the axis's travel, positive), never negative, since
-// nothing is reachable behind the blocks.
+// A manual home (manual_home_x, _y) reads how far in front of the stop
+// blocks the origin lies: 0 to `travel` (the axis's travel, positive),
+// never negative, and the head at the blocks is declared at minus that.
 //
 // A camera home (gfcloud_home_x, _y) declares where the service leaves the
 // head, and that may lie behind the origin the operator calibrated: it is

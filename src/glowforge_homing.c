@@ -9,12 +9,14 @@
                             sequence via the external one-shot runner
                             (gfhome.py: cloud vision homes X/Y to the
                             factory home corner, Z to the hall sensor).
-    homing_mode = manual    $H moves nothing: the operator has pushed the
-                            head to the home corner by hand (with the
-                            motors released, glowforge_release.c), and $H
-                            declares that spot manual_home_x, manual_home_y
-                            (the origin by default, never negative). Z is
-                            left as it is.
+    homing_mode = manual    the operator has pushed the head against the
+                            stop blocks by hand (with the motors released,
+                            glowforge_release.c), and $H declares that spot:
+                            X0 Y0 by default, or minus manual_home_x,
+                            manual_home_y (how far in front of the blocks
+                            the origin lies, never negative), and then
+                            jogs the head to the origin. Z is left as it
+                            is.
     homing_mode = switches  $H is refused: no limit switch backend exists.
     homing_mode = none      $H falls through to the core, which rejects
                             it while homing is disabled ($22=0).
@@ -62,6 +64,7 @@
 #include "serial.h"
 
 #include "grbl/hal.h"
+#include "grbl/motion_control.h"
 #include "grbl/protocol.h"
 #include "grbl/report.h"
 #include "grbl/state_machine.h"
@@ -536,13 +539,81 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     return Status_OK;
 }
 
-/* The manual provider: the operator has put the head in the home corner
- * by hand (back-left, against the stop blocks the operator installed) and
- * $H declares it. Nothing moves, so there is no session, no runner,
- * and no lid gate: the lid is open while the head is being pushed. X and
- * Y become X0 Y0 and homed, and the bed becomes their envelope, which is
- * exactly as true as the placement; the sender is told so at every home.
- * Z is left as it is: the lens carries its own reference from the start. */
+/* The jog to the origin runs inside $H, where the core's own jog cancel
+ * does not reach it: the core cancels a jog when its main loop reads the
+ * cancel out of the input stream, and that loop is waiting for $H. While
+ * the jog runs, a jog cancel (a sender's, or the cooling verdict's) ends
+ * it here instead. */
+static volatile bool origin_jog;
+static on_jog_cancel_ptr jog_cancel_chain;
+
+static void origin_jog_cancel (sys_state_t state)
+{
+    if(origin_jog && state == STATE_JOG)
+        system_set_exec_state_flag(EXEC_MOTION_CANCEL);
+    if(jog_cancel_chain)
+        jog_cancel_chain(state);
+}
+
+/* A manual home with an offset: the head stands at the stop blocks, in
+ * front of the origin, and goes straight to X0 Y0 as a jog, the one motion
+ * that ships dark whatever the modal spindle state is (the stream masks
+ * FIRE while the core jogs). Like every jog it runs with the lid open (the
+ * door is hidden from the core while it jogs), and a jog cancel, a feed
+ * hold, a cooling verdict or a reset ends it. $H answers once the head has
+ * stopped, so a sender's next line never meets the jog. The home stands
+ * whatever becomes of the move: the position is known all the way. */
+static void manual_home_to_origin (void)
+{
+    parser_block_t block;
+    plan_line_data_t pl;
+    char msg[96];
+
+    memset(&block, 0, sizeof(block));
+    for(uint_fast8_t a = 0; a < N_AXIS; a++)
+        block.values.xyz[a] = gc_state.position[a];
+    block.values.xyz[X_AXIS] = block.values.xyz[Y_AXIS] = 0.0f;
+    block.values.f = min(settings.axis[X_AXIS].max_rate, settings.axis[Y_AXIS].max_rate);
+    plan_data_init(&pl);
+
+    /* As the parser does for a $J= line: the parser's position is the
+     * target once the jog is planned, and a cancel syncs it back. */
+    status_code_t status = mc_jog_execute(&pl, &block, gc_state.position);
+    if(status == Status_OK)
+        memcpy(gc_state.position, block.values.xyz, sizeof(gc_state.position));
+    else {
+        snprintf(msg, sizeof(msg), "Manual home: the move to the origin was refused (error %d)", (int)status);
+        report_message(msg, Message_Warning);
+        fflog(LOG_WARNING, "gfhome: manual home - %s", msg);
+        return;
+    }
+
+    origin_jog = true;
+    while(pump(20000) && (plan_get_current_block() != NULL || state_get() == STATE_JOG));
+    origin_jog = false;
+    if(sys.abort || !gfhome_wait_kernel_idle(SUSPEND_WAIT_MS))
+        return;
+
+    float x = (float)sys.position[X_AXIS] / settings.axis[X_AXIS].steps_per_mm;
+    float y = (float)sys.position[Y_AXIS] / settings.axis[Y_AXIS].steps_per_mm;
+    if(sys.position[X_AXIS] == 0 && sys.position[Y_AXIS] == 0)
+        fflog(LOG_NOTICE, "gfhome: manual home - the head is at the origin");
+    else {
+        snprintf(msg, sizeof(msg), "Manual home: the move to the origin stopped at X%.3f Y%.3f",
+                 (double)x, (double)y);
+        report_message(msg, Message_Warning);
+        fflog(LOG_WARNING, "gfhome: %s", msg);
+    }
+}
+
+/* The manual provider: the operator has put the head against the stop
+ * blocks by hand (back-left, the blocks the operator installed) and $H
+ * declares it. There is no session, no runner, and no lid gate: the lid is
+ * open while the head is being pushed. X and Y are homed, and the bed
+ * becomes their envelope, which is exactly as true as the placement; the
+ * sender is told so at every home. With no offset the blocks are X0 Y0 and
+ * nothing moves; with one the head jogs to the origin. Z is left as it
+ * is: the lens carries its own reference from the start. */
 static status_code_t manual_home (sys_state_t entry_state)
 {
     (void)entry_state;
@@ -556,23 +627,26 @@ static status_code_t manual_home (sys_state_t entry_state)
     if(status != Status_OK)
         return status;
 
-    /* The coordinate the stop blocks stand for (manual_home_x and _y): the
-     * origin unless the operator says otherwise, and never negative. They
-     * belong to this provider alone. The blocks are a wall, so they are
-     * also where the envelope starts: nothing is reachable behind them. */
+    /* How far in front of the stop blocks the origin lies (manual_home_x
+     * and _y): 0 unless the operator says otherwise, and never negative.
+     * They belong to this provider alone. The head at the blocks is minus
+     * the offsets, and the envelope starts at the origin, so the strip
+     * between the blocks and the origin is outside it. */
     float home[N_AXIS];
+    bool offset = false;
     static const char *const home_keys[] = { "manual_home_x", "manual_home_y" };
     for(uint_fast8_t a = X_AXIS; a <= Y_AXIS; a++) {
         float key = cfg_read_float(home_keys[a], 0.0f);
-        home[a] = gfhome_clamp_home_mm(key, -settings.axis[a].max_travel);
-        if(home[a] != key)
+        float mm = gfhome_clamp_home_mm(key, -settings.axis[a].max_travel);
+        if(mm != key)
             fflog(LOG_WARNING, "gfhome: %s %g is out of range; using %g", home_keys[a],
-                  (double)key, (double)home[a]);
-        sys.position[a] = lroundf(home[a] * settings.axis[a].steps_per_mm);
+                  (double)key, (double)mm);
+        sys.position[a] = -lroundf(mm * settings.axis[a].steps_per_mm);
         home[a] = (float)sys.position[a] / settings.axis[a].steps_per_mm;     /* on the step grid */
         sys.home_position[a] = home[a];
-        sys.work_envelope.min.values[a] = home[a];
+        sys.work_envelope.min.values[a] = 0.0f;
         sys.work_envelope.max.values[a] = far_edge(a);
+        offset |= sys.position[a] != 0;
     }
     envelope_is_open = false;
     /* The counters are cleared for all three axes, so the anchor carries
@@ -587,6 +661,14 @@ static status_code_t manual_home (sys_state_t entry_state)
                    "Soft limits may not match the machine.", Message_Warning);
     fflog(LOG_NOTICE, "gfhome: manual home - X%.2f Y%.2f declared where the head stands, Z%.2f kept",
           (double)home[X_AXIS], (double)home[Y_AXIS], (double)home[Z_AXIS]);
+
+    if(offset) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Manual home: the head is at X%.3f Y%.3f; moving it to the origin",
+                 (double)home[X_AXIS], (double)home[Y_AXIS]);
+        report_message(msg, Message_Info);
+        manual_home_to_origin();
+    }
 
     return Status_OK;
 }
@@ -667,4 +749,7 @@ void gfhome_init (void)
 {
     gfhome_invalidate();   /* a fresh controller is not homed */
     system_register_commands(&homing_commands);
+
+    jog_cancel_chain = grbl.on_jog_cancel;
+    grbl.on_jog_cancel = origin_jog_cancel;
 }

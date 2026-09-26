@@ -23,8 +23,11 @@
     release          ok | error:<n> | busy:<why>     $MD (glowforge_release.c)
     energize         ok | error:<n> | busy:<why>     $ME
     home             ok | error:<n> | busy:<why>     $H, only while homing_mode = manual:
-                                                     it moves nothing. Every other $H is a
-                                                     session that belongs to the sender.
+                                                     it moves nothing, or only the jog to
+                                                     the origin a manual home offset asks
+                                                     for, and answers once the head has
+                                                     stopped. Every other $H is a session
+                                                     that belongs to the sender.
     envelope open|apply
                      ok | error:homed | busy:state   the bed check's: X's and Y's far edges
                                                      opened to the travel plus 30 mm, or set
@@ -293,7 +296,8 @@ static void op_jog (const char *words)
     inject(line, true);
 }
 
-/* The panel-only operations: a $ command that moves nothing. */
+/* The panel-only operations: a $ command that moves nothing, but for a
+ * manual home's jog to the origin, which ends before the command answers. */
 static void op_command (const char *line)
 {
     sys_state_t state = state_get();
