@@ -69,6 +69,10 @@ bool gfio_xy_released (void);
 int gfio_conf_read (const char *key, char *val, size_t len);
 float gfio_conf_read_float (const char *key, float fallback);
 
+// The path of a file beside the shared config (in its directory): 0, or -1
+// when it does not fit `len`.
+int gfio_conf_sibling (const char *name, char *buf, size_t len);
+
 // The XY microstep mode in force: xy_microsteps in the shared config (8,
 // 16 or 32; unset or anything else reads as x32, logged once). Read at
 // the first call and fixed for the session: the DRV8825 MODE pins are

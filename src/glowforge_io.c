@@ -269,6 +269,15 @@ float gfio_conf_read_float (const char *key, float fallback)
     return end == val ? fallback : f;
 }
 
+int gfio_conf_sibling (const char *name, char *buf, size_t len)
+{
+    const char *conf = conf_path();
+    const char *slash = strrchr(conf, '/');
+    int n = slash ? snprintf(buf, len, "%.*s/%s", (int)(slash - conf), conf, name)
+                  : snprintf(buf, len, "%s", name);
+    return n < 0 || (size_t)n >= len ? -1 : 0;
+}
+
 unsigned gfio_xy_microsteps (void)
 {
     static unsigned mode = 0;

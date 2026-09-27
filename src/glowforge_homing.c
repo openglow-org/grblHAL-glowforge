@@ -60,6 +60,7 @@
 #include "glowforge_laser.h"
 #include "glowforge_release.h"
 #include "glowforge_io.h"
+#include "glowforge_tray.h"
 #include "stepper_stream.h"
 #include "serial.h"
 
@@ -149,7 +150,7 @@ static void lens_window (int *below, int *above)
 void gfhome_reference_z (float z_mm, int below, int above)
 {
     float z_spm = settings.axis[Z_AXIS].steps_per_mm;
-    long steps = gfhome_z_steps(z_mm, z_spm);
+    long steps = gfhome_z_steps(z_mm, z_spm) + gftray_shift_steps();
     lens_window(&below, &above);
     sys.position[Z_AXIS] = steps;
     sys.home_position[Z_AXIS] = (float)steps / z_spm;
@@ -173,7 +174,8 @@ static void anchor_write (const float *home, uint8_t axes, const char *source);
  * lens that could not reach its edge is a motion fault there, so no
  * controller starts at all and this is never read on a machine whose lens
  * did not home. The focal height of the edge is ours to know, not the
- * daemon's: it comes from the same settings a gfcloud home reads. */
+ * daemon's: it comes from the same settings a gfcloud home reads, in the
+ * frame of the tray mode that stands. */
 void gfhome_startup_reference (void)
 {
     const char *dir = getenv("GF_STATE_DIR");
@@ -247,7 +249,35 @@ static void anchor_write (const float *home, uint8_t axes, const char *source)
     if(home != anchor_home)
         memcpy(anchor_home, home, sizeof(anchor_home));
     anchor_axes = axes;
-    snprintf(anchor_source, sizeof(anchor_source), "%s", source);
+    /* A rewrite passes the kept source back in: never a copy onto itself. */
+    if(source != anchor_source)
+        snprintf(anchor_source, sizeof(anchor_source), "%s", source);
+}
+
+/* A Z on the step grid, moved by whole half-steps. */
+static float z_grid_shift (float z, long delta, float z_spm)
+{
+    return (float)(lroundf(z * z_spm) + delta) / z_spm;
+}
+
+void gfhome_tray_shift (long delta)
+{
+    float z_spm = settings.axis[Z_AXIS].steps_per_mm;
+
+    sys.position[Z_AXIS] += (int32_t)delta;
+    sys.home_position[Z_AXIS] = z_grid_shift(sys.home_position[Z_AXIS], delta, z_spm);
+    if(z_referenced) {
+        z_env_min = z_grid_shift(z_env_min, delta, z_spm);
+        z_env_max = z_grid_shift(z_env_max, delta, z_spm);
+    }
+    gfhome_apply_z_limit();     /* an unreferenced lens is pinned where it now reads */
+    /* The anchor's Z is where the lens stood when the counters were
+     * zeroed: an outside reader adds the Z counter to it. */
+    if(anchor_axes) {
+        anchor_home[Z_AXIS] = z_grid_shift(anchor_home[Z_AXIS], delta, z_spm);
+        anchor_write(anchor_home, anchor_axes, anchor_source);
+    }
+    sync_position();
 }
 
 /* ---- the envelope's far edges ---- */
@@ -496,9 +526,12 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
      * the focus card measured (lens_hall_edge_z_mm; the default is the
      * bench reference machine's), then parked it the half-steps handed
      * to it, so Z is the edge's height on the step grid plus the park.
-     * The Z envelope is the head's free travel around the edge.
+     * With the tray out the edge is the tray offset higher
+     * (glowforge_tray.c), and the park, counted from the edge, stays
+     * where it is physically. The Z envelope is the head's free travel
+     * around the edge.
      * NOTE: settings.axis[].max_travel is stored negative. */
-    long edge_steps = gfhome_z_steps(edge_z, z_spm);
+    long edge_steps = gfhome_z_steps(edge_z, z_spm) + gftray_shift_steps();
     float home[N_AXIS];
     static const char *const home_keys[] = { "gfcloud_home_x", "gfcloud_home_y" };
     for(uint_fast8_t a = X_AXIS; a <= Y_AXIS; a++) {
@@ -534,7 +567,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
 
     fflog(LOG_NOTICE, "gfhome: homed - X%.2f Y%.2f Z%.2f (the hall edge at Z%.2f, the lens "
           "parked %+d half-steps from it)",
-          home[X_AXIS], home[Y_AXIS], home[Z_AXIS], gfhome_grid_z(edge_z, z_spm), park);
+          home[X_AXIS], home[Y_AXIS], home[Z_AXIS], (double)((float)edge_steps / z_spm), park);
 
     return Status_OK;
 }

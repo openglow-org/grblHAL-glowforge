@@ -11,7 +11,7 @@
 
     state            {"state":"Idle","sender":true,"port_jog":false,"released":false,
                       "mpos":[x,y,z],"homed":3,"envelope_open":false,"mcode":null,
-                      "sender_out":false}
+                      "sender_out":false,"tray":"in"}
                      mcode is the M-code a job waits at, while one does:
                      {"seq":n,"code":160,"words":{"P":1}} (glowforge_mcode.c)
     jog <words>      ok | error:<n> | busy:<why>     <words> is the tail of a $J= line
@@ -37,6 +37,14 @@
                                                      sender's lines wait while it is open, as
                                                      during a port jog, and the first one
                                                      closes it before the core reads it
+    tray in|out      ok | error:saved | busy:state | busy:mcode | busy:sender
+                                                     the crumb tray's mode: the port runs
+                                                     M103 P0 or P1 (glowforge_tray.c), only
+                                                     on an Idle machine and never while a job
+                                                     waits at a package's M-code. It moves
+                                                     nothing and answers once the Z frame has
+                                                     changed; error:saved when the mode could
+                                                     not be saved, and then did not change
 
   and for the machine daemon itself, the M-codes extension packages answer:
 
@@ -65,9 +73,10 @@
 
   The port's only motion is the core's jog, $J=. A jog ships dark whatever
   the modal spindle state is, because the stream masks FIRE while the core
-  is jogging; no other motion has that property, so the port never forms a
-  line that does not start with $J=, and <words> is held to the characters
-  a jog needs.
+  is jogging; no other motion has that property, so the port's only motion
+  line starts with $J=, and <words> is held to the characters a jog needs.
+  The one g-code line it forms besides is the tray op's M103 P0 or P1,
+  which moves nothing and carries no laser word.
 
   The sender always wins, but for "sender out", which the daemon asks for
   only on an idle machine and only for an extension package the operator
@@ -100,6 +109,7 @@
 #include "glowforge_laser.h"
 #include "glowforge_mcode.h"
 #include "glowforge_release.h"
+#include "glowforge_tray.h"
 #include "stepper_stream.h"
 
 #include "grbl/hal.h"
@@ -144,6 +154,7 @@ static bool envelope_hold = false;  /* the sender is held for an open envelope *
 static char deferred[sizeof(req) + 4];  /* a line waiting for the ring to empty, "" when none */
 static bool deferred_jog;
 static double deferred_until;
+static int tray_want = -1;          /* the injected line is a tray switch to this mode (1 out), else -1 */
 
 static double now_s (void)
 {
@@ -185,9 +196,13 @@ static void reply (const char *line)
 static void line_done (int status)
 {
     char buf[24];
+    int tray = tray_want;
 
     awaiting = false;
-    if(status == Status_OK && !awaiting_jog)
+    tray_want = -1;
+    if(status == Status_OK && tray >= 0)
+        reply(gftray_out() == (tray == 1) ? "ok\n" : "error:saved\n");
+    else if(status == Status_OK && !awaiting_jog)
         reply("ok\n");
     else if(status == Status_OK) {
         if(!port_jog)
@@ -216,8 +231,10 @@ static void inject (const char *line, bool jog)
         snprintf(deferred, sizeof(deferred), "%s", line);
         deferred_jog = jog;
         deferred_until = now_s() + DEFER_S;
-    } else
+    } else {
+        tray_want = -1;
         reply("busy:sender\n");     /* the sender is in the middle of a line */
+    }
 }
 
 static const char *state_name (void)
@@ -240,7 +257,7 @@ static const char *state_name (void)
 
 static void op_state (void)
 {
-    char buf[400], mcode[160];
+    char buf[448], mcode[160];
     float mpos[3] = {0};
 
     for(int i = 0; i < 3 && i < N_AXIS; i++)
@@ -250,12 +267,12 @@ static void op_state (void)
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"sender\":%s,\"port_jog\":%s,\"released\":%s,"
              "\"mpos\":[%.3f,%.3f,%.3f],\"homed\":%u,\"envelope_open\":%s,\"mcode\":%s,"
-             "\"sender_out\":%s}\n",
+             "\"sender_out\":%s,\"tray\":\"%s\"}\n",
              state_name(), serial_client_connected() ? "true" : "false",
              port_jog ? "true" : "false", gfrelease_active() ? "true" : "false",
              mpos[0], mpos[1], mpos[2], (unsigned)sys.homed.mask,
              gfhome_envelope_is_open() ? "true" : "false", mcode,
-             serial_keeping_out() ? "true" : "false");
+             serial_keeping_out() ? "true" : "false", gftray_out() ? "out" : "in");
     reply(buf);
 }
 
@@ -366,6 +383,31 @@ static void op_sender_out (void)
     reply("ok\n");
 }
 
+/* tray in|out: the sender's own M103, run for the panel. */
+static void op_tray (const char *mode)
+{
+    int want = !strcmp(mode, "out") ? 1 : !strcmp(mode, "in") ? 0 : -1;
+
+    if(want < 0) {
+        reply("error:invalid\n");
+        return;
+    }
+    if(gfmcode_waiting()) {
+        reply("busy:mcode\n");      /* the job is Idle at its M-code, and it is still the job */
+        return;
+    }
+    if(state_get() != STATE_IDLE || port_jog) {
+        reply("busy:state\n");
+        return;
+    }
+    if(serial_sender_pending()) {
+        reply("busy:sender\n");
+        return;
+    }
+    tray_want = want;
+    inject(want ? "M103 P1" : "M103 P0", false);
+}
+
 static void op_home (void)
 {
     char mode[24] = "";
@@ -395,7 +437,9 @@ static void handle_request (char *line)
     else if(!strcmp(line, "envelope open") || !strcmp(line, "envelope apply")) {
         int rc = gfhome_envelope(line[9] == 'o');
         reply(rc == 0 ? "ok\n" : rc == -1 ? "error:homed\n" : "busy:state\n");
-    } else if(!strncmp(line, "mcodes ", 7))
+    } else if(!strncmp(line, "tray ", 5))
+        op_tray(line + 5);
+    else if(!strncmp(line, "mcodes ", 7))
         reply(gfmcode_set_table(line + 7) == 0 ? "ok\n" : "error:invalid\n");
     else if(!strncmp(line, "mcode_result ", 13))
         op_mcode_result(line + 13);
@@ -468,6 +512,7 @@ void ctlport_poll (void)
             deferred[0] = '\0';
         } else if(serial_sender_pending() || now_s() > deferred_until) {
             deferred[0] = '\0';
+            tray_want = -1;
             reply("busy:sender\n");
         }
     }

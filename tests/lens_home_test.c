@@ -19,6 +19,11 @@
       default, or the origin
     - a measured far edge is held to 50 mm up to the travel plus 30 mm
       (gfhome_clamp_envelope_mm), and an unset one is the travel
+    - the tray offset is held to 13..60 mm and placed on the same grid
+      (gftray_clamp_offset_mm, gftray_offset_steps, glowforge_tray.h): the
+      default 1.35" is 100 half-steps, and a tray-out edge lands on the
+      tray-in edge's step plus the offset's, so the envelope, the park and
+      the position all move by the same whole steps
 
   Copyright 2026 514 LLC d/b/a OpenGlow
   Written by Scott Wiederhold
@@ -26,6 +31,7 @@
 */
 
 #include "glowforge_homing.h"
+#include "glowforge_tray.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -217,6 +223,50 @@ int main (void)
             } else {
                 printf("ok   envelope %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
             }
+        }
+    }
+
+    /* The tray offset: 13..60 mm, the nearer end out of range, the default
+     * for a value that is not a number, and a whole number of half-steps. */
+    {
+        const struct { float in; long want; const char *what; } cases[] = {
+            { 34.29f, 100, "the default, 1.35 in, is 100 half-steps" },
+            { GFTRAY_OFFSET_DEFAULT_MM, 100, "the named default is the same" },
+            { 13.0f, 38, "the low end stands" },
+            { 60.0f, 175, "the high end stands" },
+            { 12.32f, 38, "the lens travel lands on 13 mm: the ranges never overlap" },
+            { 0.0f, 38, "zero lands on 13 mm" },
+            { 90.0f, 175, "past the high end lands on 60 mm" },
+            { NAN, 100, "a value that is not a number takes the default" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            long got = gftray_offset_steps(cases[i].in, SPM);
+            if (got != cases[i].want) {
+                printf("FAIL tray offset %g: %ld half-steps (want %ld)\n", (double)cases[i].in, got, cases[i].want);
+                failures++;
+            } else {
+                printf("ok   tray offset %g -> %ld half-steps: %s\n", (double)cases[i].in, got, cases[i].what);
+            }
+        }
+        /* Over every edge the settings accept and every offset in range, the
+         * tray-out edge is the tray-in edge's step plus the offset's, on the
+         * grid, and clear of the lens's whole travel. */
+        long checked = 0, drift = 0;
+        for (int e = -200; e <= 200; e++) {
+            for (int o = 1300; o <= 6000; o += 7) {
+                float edge = (float)e / 10.0f, off = (float)o / 100.0f;
+                long in = gfhome_z_steps(edge, SPM), s = gftray_offset_steps(off, SPM);
+                float out_z = (float)(in + s) / SPM;
+                if (lroundf(out_z * SPM) != in + s || s <= lroundf(12.32f * SPM))
+                    drift++;
+                checked++;
+            }
+        }
+        if (drift) {
+            printf("FAIL %ld of %ld tray-out edges leave the grid or overlap the tray-in range\n", drift, checked);
+            failures++;
+        } else {
+            printf("ok   %ld tray-out edges sit on the grid, clear of the tray-in range\n", checked);
         }
     }
 

@@ -73,6 +73,7 @@ set(DRIVER_SOURCES
     src/glowforge_release.c
     src/glowforge_laser.c
     src/glowforge_mcode.c
+    src/glowforge_tray.c
     src/glowforge_status.c
     src/glowforge_switches.c
     src/serial.c
@@ -141,7 +142,8 @@ target_include_directories(bind_addr_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR
 # src/glowforge_homing.h): the edge's focal height lands on the step
 # grid the controller counts, so the reported position agrees with the
 # home position, and the park from the edge stays inside the window
-# every head reaches without touching a stop. Headers only; must not
+# every head reaches without touching a stop; the crumb tray's offset
+# lands on the same grid (src/glowforge_tray.h). Headers only; must not
 # link the core.
 add_executable(lens_home_test tests/lens_home_test.c)
 target_include_directories(lens_home_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})

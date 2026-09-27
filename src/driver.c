@@ -47,6 +47,7 @@
 #include "glowforge_mcode.h"
 #include "glowforge_status.h"
 #include "glowforge_switches.h"
+#include "glowforge_tray.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 #include "fflog.h"
@@ -451,6 +452,7 @@ bool driver_init (void)
     gfrelease_init();
     gflaser_init();
     gfmcode_init();             /* after gflaser_init: M102 stays the laser's */
+    gftray_init();              /* M103, and the mode the marker persisted */
     gfsw_init();
     ctlport_init();             /* after gfstatus_init: the socket lives in the state directory */
 

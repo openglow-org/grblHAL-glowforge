@@ -63,3 +63,5 @@ jobs:
         run: python3 forgefirm/scripts/bench/manual_home_test.py build/grblHAL_glowforge
       - name: Every cooling report carries the supervisor's secret, and only the homing runner is handed it
         run: python3 forgefirm/scripts/bench/cool_report_test.py build/grblHAL_glowforge
+      - name: The crumb tray moves Z and its envelope by the offset, persists, and moves nothing
+        run: python3 forgefirm/scripts/bench/tray_test.py build/grblHAL_glowforge

@@ -12,9 +12,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Z is the focal point's height above the tray. After a home the lens
-// sits on the hall's rising edge, whose focal height the focus card
-// measured (lens_hall_edge_z_mm). The controller counts whole steps, so
+// Z is the focal point's height above the tray, or above the floor of the
+// cut area with the tray out (glowforge_tray.c). After a home the lens
+// sits on the hall's rising edge, whose focal height above the tray the
+// focus card measured (lens_hall_edge_z_mm). The controller counts whole steps, so
 // a height is placed on the step grid first: the stored position, the
 // home position, and the reported Z then agree.
 static inline long gfhome_z_steps (float z_mm, float z_spm)
@@ -115,8 +116,9 @@ void gfhome_envelope_close (void);
 // refused, a program move raises the soft-limit alarm before it starts);
 // a home references the lens on its hall edge and opens the envelope to
 // the head's free travel. gfhome_reference_z applies a reference (the
-// focal height at the edge, and the free half-steps below and above it:
-// pass 0 for either to take the settings, else the fallback);
+// focal height above the tray at the edge, which the tray mode's shift is
+// added to, and the free half-steps below and above it: pass 0 for either
+// to take the settings, else the fallback);
 // gfhome_apply_z_limit re-applies the standing state (after a settings
 // change, at the driver's start, and when the reference is dropped).
 // The X and Y soft limits are the driver's as well: on after a
@@ -124,6 +126,13 @@ void gfhome_envelope_close (void);
 // not trusted. The core's $20 stays off ($22 is off by design).
 void gfhome_reference_z (float z_mm, int below, int above);
 void gfhome_apply_z_limit (void);
+
+// The tray mode changed (glowforge_tray.c): the Z frame moves by `delta`
+// half-steps, and everything that says where Z is moves with it, in one
+// place: the position, the home position, the envelope (a referenced one,
+// or the one pinned where an unreferenced lens stands), and the anchor's Z.
+// Nothing moves. The kernel has to be idle.
+void gfhome_tray_shift (long delta);
 
 // Take the lens reference forgectrl left before this controller started
 // (the lens stands on its hall edge, and the marker says so). Called once
