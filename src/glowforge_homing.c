@@ -170,10 +170,11 @@ static void anchor_write (const float *home, uint8_t axes, const char *source);
 
 /* The lens reference forgectrl took before this controller started. The
  * daemon sweeps the lens onto the hall sensor's rising edge in the
- * motion-verify window and leaves this marker in the state directory; a
- * lens that could not reach its edge is a motion fault there, so no
- * controller starts at all and this is never read on a machine whose lens
- * did not home. The focal height of the edge is ours to know, not the
+ * motion-verify window, and again when a setup step hands the machine
+ * back, and leaves this marker in the state directory; a lens that could
+ * not reach its edge leaves no marker (a motion fault at the probe, so no
+ * controller starts; after a setup step, a controller that holds Z
+ * unreferenced). The focal height of the edge is ours to know, not the
  * daemon's: it comes from the same settings a gfcloud home reads, in the
  * frame of the tray mode that stands. */
 void gfhome_startup_reference (void)
