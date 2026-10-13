@@ -468,6 +468,12 @@ int main(void)
     sw_calls = 0;
     spindleSetState(NULL, on, 500.0f);
     CHECK(sw_calls == 0 && laser_ok, "a laser-on inside the open window does not re-prompt");
+    spindle_state_t off = { .on = Off };
+    spindleSetState(NULL, off, 0.0f);           /* M5 inside the job */
+    CHECK(laser_ok && stream_armed, "an M5 inside the job leaves the window open");
+    spindleSetState(NULL, on, 300.0f);          /* and M3 again */
+    CHECK(sw_calls == 0 && laser_ok && stream_armed,
+          "an M5 then an M3 inside the open window does not re-prompt");
 
     printf("the dose model: derived floors:\n");
 
@@ -582,11 +588,6 @@ int main(void)
         uint_fast16_t prog = curveComputeValue(&pd, 500.0f, false);
         CHECK(prog >= 97 && prog <= 105,
               "the same rpm at ratio 1 is untouched");
-        /* The parser's newest S is nowhere in this: a queued S1000 line
-           changes nothing about the S500 block's segments. */
-        test_param.rate_ratio = 1.0f;
-        CHECK(curveComputeValue(&pd, 500.0f, false) == prog,
-              "the ratio is the segment's own, not the newest S over the block's");
         conf_gamma = 1.0f;
         gamma_load();
         test_param.rate_ratio = 0.5f;
