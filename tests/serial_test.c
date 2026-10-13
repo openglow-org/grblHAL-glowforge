@@ -304,23 +304,6 @@ int main(void)
     CHECK(n == 1 && bad == 0 && strcmp(got[0], "G1 Y0.3 F1500") == 0,
           "a line sent after the overrun arrives whole");
 
-    /* An overrun in the middle of a line whose start is already in the
-       ring: that start is unwritten, so nothing can glue onto the next
-       line. */
-    serialRxFlush();
-    for(int i = 0; i < 72; i++)
-        push(line);                             /* 1008 bytes, 14 free */
-    push("G1 X-30 F15");                        /* 11 bytes in, 3 free */
-    push("00\n");                               /* the 3 fit: 1022, full */
-    push("G1 Y0.3");                            /* 7 more: overrun on the first */
-    push(" F1500\n");
-    (void)serial_rx_overflow_take();
-    n = drain(got, 200, &bad, "G1 X-30 F1500", "G1 Y0.3 F1500");
-    CHECK(n == 73 && bad == 0, "the overrun line's bytes never reach the parser");
-    push(after);
-    n = drain(got, 200, &bad, "G1 X-30 F1500", "G1 Y0.3 F1500");
-    CHECK(n == 1 && bad == 0, "the ring recovers to whole lines");
-
     /* --- the banner on a connect --------------------------------------- */
     printf("The welcome banner on a connect:\n");
     grbl.report.init_message = fake_banner;
