@@ -12,6 +12,9 @@
       while it is open
     - hv_enable (bit 4) is the readback of the HV_ENABLE output and
       never gates: neither state asserts anything
+    - the bit numbers themselves (button 2, doors 3, hv_enable 4,
+      interlock 5), asserted as numbers and decoded from a literal
+      word, so a renumbered header fails here
 
   Also covers the visibility policy (gfsw_visible / gfsw_edges): the
   door signal is hidden from the core while IDLE, JOG or HOMING and
@@ -52,6 +55,21 @@ static uint8_t *mask (bool doors, bool hv_enable, bool interlock)
 int main (void)
 {
     control_signals_t s;
+
+    /* ---- the bit numbers: the device tree's, written as numbers ---- */
+
+    expect("button is bit 2", SW_BIT_BUTTON == 2, true);
+    expect("doors is bit 3", SW_BIT_DOORS == 3, true);
+    expect("hv_enable is bit 4", SW_BIT_HV_ENABLE == 4, true);
+    expect("interlock is bit 5", SW_BIT_INTERLOCK == 5, true);
+
+    /* A word built from the integers, not the macros: bit 3 alone (lid
+       closed, loop closed) gates nothing; bit 5 with it (loop open) is a
+       door event. */
+    static const uint8_t lid_closed[SW_BYTES] = { 1u << 3, 0 };
+    static const uint8_t loop_open[SW_BYTES] = { (1u << 3) | (1u << 5), 0 };
+    expect("the literal word: bit 3 alone gates nothing, bit 5 with it is a door event",
+           !gfsw_map_bits(lid_closed).safety_door_ajar && gfsw_map_bits(loop_open).safety_door_ajar, true);
 
     /* Healthy idle machine: lid closed, HV_ENABLE readback low,
        interlock loop closed (bit inactive). Nothing gates. */
