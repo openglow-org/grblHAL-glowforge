@@ -23,17 +23,21 @@ for t in switch_map_test laser_arm_test latch_test cooling_test switches_test \
 
 On a host without `GFSINK` the driver runs the real core, planner and stream
 code against a **null sink**, which is what makes the laser path testable
-without hardware. The nine tests include the driver source they test and
+without hardware. The eight tests include the driver source they test and
 stub the rest: `laser_arm_test` (the arm flow and the verdict's tiers),
 `latch_test` (the latch writer), `cooling_test` (the verdict client),
 `switches_test` (a lid cancel with the switch device gone), `serial_test`
 (the RX ring, the banner, the TX stall bound).
 
-Five harnesses drive the null-sink build over TCP. They live in the
-`forgefirm` repository, under `scripts/bench/`:
+Eleven harnesses drive the null-sink build over TCP. They live in the
+`forgefirm` repository, under `scripts/bench/`, and run on a build configured
+as CI configures it (`-DGFMCODE_WAIT_S=5.0`: mcode_test's no-answer case
+waits that long, not the image's 30 s):
 
 ```sh
-for h in laser_stream_test laser_lifecycle_test z_envelope_test xy_mode_test planner_blocks_test; do
+cmake -B build -DGFMCODE_WAIT_S=5.0 && cmake --build build
+for h in laser_stream_test laser_lifecycle_test z_envelope_test xy_mode_test planner_blocks_test \
+         ctlport_test mcode_test envelope_test manual_home_test cool_report_test tray_test; do
   python3 $h.py build/grblHAL_glowforge
 done
 ```
@@ -76,7 +80,7 @@ The board binary is a cross-build:
 
 ### CI coupling that sets the push order
 
-This repository's CI fetches the five harnesses from the head of the
+This repository's CI fetches the eleven harnesses from the head of the
 `forgefirm` default branch, unpinned. **Push a harness change to `forgefirm`
 first**, then the driver change that needs it.
 
