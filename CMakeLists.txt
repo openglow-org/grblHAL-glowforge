@@ -86,12 +86,22 @@ set(DRIVER_SOURCES
 
 add_executable(grblHAL_glowforge ${DRIVER_SOURCES})
 
+# The M-code answer wait (30 s, src/glowforge_mcode.h), shortened for a
+# host test build only: CI configures with -DGFMCODE_WAIT_S=5.0 so the
+# harness's no-answer case (forgefirm scripts/bench/mcode_test.py) holds
+# in 5 s, which still outlasts the 3 s its dark case watches the wait.
+# Unset, the header's value stands; the image recipe never sets it.
+set(GFMCODE_WAIT_S "" CACHE STRING "M-code answer wait in seconds, for a host test build only")
+if(NOT GFMCODE_WAIT_S STREQUAL "")
+    target_compile_definitions(grblHAL_glowforge PRIVATE GFMCODE_WAIT_S=${GFMCODE_WAIT_S})
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # The DRIVER's own sources are warning-free and held to that; the
     # core submodule is upstream code and is not held to -Werror here.
     set_source_files_properties(${DRIVER_SOURCES}
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
-        tests/bind_addr_test.c tests/lens_home_test.c tests/xy_scale_test.c
+        tests/lens_home_test.c tests/xy_scale_test.c
         tests/latch_test.c tests/cooling_test.c tests/switches_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
@@ -127,16 +137,11 @@ target_link_libraries(laser_arm_test m)
 # Host unit test for the RX ring under a sender that ignores flow
 # control: the overrunning line is dropped whole, earlier lines are
 # delivered intact, real-time characters keep passing, and the overrun
-# is reported once. Includes the serial source directly, stubs the core.
-add_executable(serial_test tests/serial_test.c)
+# is reported once; and the -b listen address binds an IPv4 literal in
+# its v4-mapped form (src/bind_addr.c). Includes the serial source
+# directly, stubs the core.
+add_executable(serial_test tests/serial_test.c src/bind_addr.c)
 target_include_directories(serial_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
-
-# Host unit test for the -b listen-address parser (src/bind_addr.c): an
-# IPv6 literal binds as written, an IPv4 literal binds in its v4-mapped
-# form, and anything that is not a literal is rejected. Links the parser
-# source alone; must not link the core.
-add_executable(bind_addr_test tests/bind_addr_test.c src/bind_addr.c)
-target_include_directories(bind_addr_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 
 # Host unit test for the Z a home sets (the pure helpers in
 # src/glowforge_homing.h): the edge's focal height lands on the step

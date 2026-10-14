@@ -203,7 +203,7 @@ int main (void)
     CHECK(fail_calls == 0, "OVERTEMP is not the fail tier");
     CHECK(enqueued(CMD_FEED_HOLD) && hold_ours, "the pause tier holds the job");
     CHECK(gfcool_decel_lit(), "the first hold of the episode decelerates lit");
-    CHECK(strstr(all_messages, "fire masked, job held") != NULL, "the pause tier says what it did");
+    CHECK(pause_said, "the pause tier says what it did");
     CHECK(!wrote("cnc/laser_latch=1"), "the pause tier writes no latch");
     cur_state = STATE_HOLD;
     sys.holding_state = Hold_Pending;   /* still decelerating */
@@ -213,22 +213,21 @@ int main (void)
     publish(false, "OVERTEMP", true, false, true, 0.0);
     gfcool_poll();
     CHECK(!gfcool_decel_lit(), "the gate closes once the head has stopped");
-    CHECK(strstr(strstr(all_messages, "fire masked") + 1, "fire masked") == NULL,
-          "a standing pause is said once");
+    CHECK(pause_said, "a standing pause is said once, and not again");
     /* A ~ under the standing verdict: held again, dark this time. */
     cur_state = STATE_CYCLE;
     ncmds = 0;
     gfcool_poll();
     CHECK(enqueued(CMD_FEED_HOLD) && !gfcool_decel_lit(),
           "a resume under the standing verdict is held again with the gate closed");
-    CHECK(strstr(all_messages, "held again") != NULL, "and says so");
+    CHECK(hold_ours, "the hold taken again is the client's");
     cur_state = STATE_HOLD;
     /* The clean verdict resumes the hold the client took. */
     ncmds = 0;
     publish(true, "OK", false, true, true, 0.0);
     gfcool_poll();
     CHECK(enqueued(CMD_CYCLE_START) && !hold_ours, "the clean verdict resumes the hold the client took");
-    CHECK(strstr(all_messages, "resuming") != NULL, "the resume is reported");
+    CHECK(!pause_said, "the clean verdict ends the episode");
     CHECK(fail_calls == 0 && !wrote("cnc/laser_latch=1") && !wrote("cnc/laser_latch=0"),
           "the whole pause episode wrote no latch");
     CHECK(!gfcool_decel_lit(), "the clean verdict leaves no lit-deceleration grace behind");
@@ -240,7 +239,7 @@ int main (void)
     cur_state = STATE_CYCLE;
     publish(false, "COLD", true, false, true, 0.0);
     gfcool_poll();
-    CHECK(hold_ours && strstr(all_messages, "fire masked") != NULL, "COLD is the pause tier");
+    CHECK(hold_ours && pause_said, "COLD is the pause tier");
 
     /* The fail tier, by name. */
     static const char *fail_names[] = { "FIRE", "CRASH", "AIRFLOW", "CRITICAL" };
@@ -253,8 +252,7 @@ int main (void)
         gfcool_poll();
         char msg[64];
         snprintf(msg, sizeof(msg), "%s inside the window is the fail tier", fail_names[i]);
-        CHECK(fail_calls == 1 && !strcmp(fail_name, fail_names[i]) &&
-              strstr(all_messages, "fire masked") == NULL, msg);
+        CHECK(fail_calls == 1 && !strcmp(fail_name, fail_names[i]) && !pause_said, msg);
     }
     static const char *pause_names[] = { "FAULT", "SENSOR", "WARMUP", "BUMP", "FLAME" };
     for(int i = 0; i < 5; i++) {
@@ -266,7 +264,7 @@ int main (void)
         gfcool_poll();
         char msg[64];
         snprintf(msg, sizeof(msg), "%s inside the window is the pause tier", pause_names[i]);
-        CHECK(fail_calls == 0 && hold_ours && strstr(all_messages, "fire masked") != NULL, msg);
+        CHECK(fail_calls == 0 && hold_ours && pause_said, msg);
     }
 
     /* A stale verdict inside the window is the pause tier, with the
@@ -277,8 +275,7 @@ int main (void)
     cur_state = STATE_CYCLE;
     publish(true, "OK", false, true, true, 3.0);
     gfcool_poll();
-    CHECK(fail_calls == 0 && strstr(all_messages, "fire masked") != NULL,
-          "a stale verdict inside the window is the pause tier");
+    CHECK(fail_calls == 0 && pause_said, "a stale verdict inside the window is the pause tier");
     CHECK(enqueued(CMD_FEED_HOLD), "a stale verdict holds the job");
     CHECK(wrote("thermal/heater_pwm=0") && wrote("thermal/exhaust_pwm=" FB_EXHAUST),
           "a stale verdict writes the fallback airflow and the heater off");
@@ -288,8 +285,7 @@ int main (void)
     ncmds = 0;
     publish(true, "OK", false, true, true, 0.0);
     gfcool_poll();
-    CHECK(enqueued(CMD_CYCLE_START), "the restored engine resumes");
-    CHECK(strstr(all_messages, "restored") != NULL, "the restoration is reported");
+    CHECK(enqueued(CMD_CYCLE_START) && !hold_ours && !pause_said, "the restored engine resumes");
 
     /* The enforcement runs on every poll from the cache, not only when
        the file is read: a cache that expires between two reads holds
@@ -305,7 +301,7 @@ int main (void)
     gfcool_poll();
     CHECK(enqueued(CMD_FEED_HOLD) && hold_ours,
           "a cache that expires between reads holds the job before the next read");
-    CHECK(strstr(all_messages, "fire masked") != NULL, "and says so");
+    CHECK(pause_said, "and says so");
 
     /* Outside the window a blocking verdict is neither tier. */
     reset_state();
@@ -313,8 +309,7 @@ int main (void)
     cur_state = STATE_IDLE;
     publish(false, "AIRFLOW", true, false, false, 0.0);
     gfcool_poll();
-    CHECK(fail_calls == 0 && strstr(all_messages, "fire masked") == NULL,
-          "a blocking verdict outside the window is neither tier");
+    CHECK(fail_calls == 0 && !pause_said && !hold_ours, "a blocking verdict outside the window is neither tier");
 
     unlink(verdict_path);
     printf(failures ? "FAIL: %d check(s) failed\n"

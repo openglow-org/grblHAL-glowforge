@@ -18,7 +18,11 @@
 
 // How long a job waits for the answer. It stays under laser_disarm_s's
 // default, so the armed window of a job waiting at one does not close.
+// A host test build shortens it (CMake -DGFMCODE_WAIT_S); the image never
+// does.
+#ifndef GFMCODE_WAIT_S
 #define GFMCODE_WAIT_S 30.0
+#endif
 
 // How long the last move before it may take to finish playing, after the
 // core has handed its steps to the stream, before the M-code is announced.

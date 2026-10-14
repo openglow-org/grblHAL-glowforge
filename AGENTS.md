@@ -18,7 +18,7 @@ The site page is
 ```sh
 cmake -B build && cmake --build build
 for t in switch_map_test laser_arm_test latch_test cooling_test switches_test \
-         serial_test bind_addr_test lens_home_test xy_scale_test; do ./build/$t; done
+         serial_test lens_home_test xy_scale_test; do ./build/$t; done
 ```
 
 On a host without `GFSINK` the driver runs the real core, planner and stream

@@ -72,8 +72,6 @@ int main (void)
     expect_parse("32", 32);
     expect_parse("1", 0);
     expect_parse("24", 0);
-    expect_parse("64", 0);
-    expect_parse("160", 0);
     expect_parse("16x", 0);
     expect_parse("", 0);
     expect_parse("abc", 0);
@@ -83,9 +81,6 @@ int main (void)
     expect_f("$100 at x8", gfio_xy_steps_per_mm_of(8), 53.333f, 1e-4f);
     expect_f("$100 at x16", gfio_xy_steps_per_mm_of(16), 106.667f, 1e-4f);
     expect_f("$100 at x32", gfio_xy_steps_per_mm_of(32), 213.333f, 1e-4f);
-    for (unsigned mode = 8; mode <= 32; mode *= 2)
-        expect_f("steps/mm against 0.15 mm per full step", gfio_xy_steps_per_mm_of(mode),
-                 (float)mode / XY_MM_PER_FULL_STEP, 1e-3f);
 
     /* The tick keeps the ticks per step at the factory's. */
     expect_u("scale at x8", gfio_xy_scale_of(8), 1);

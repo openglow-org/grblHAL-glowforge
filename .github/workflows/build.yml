@@ -14,18 +14,18 @@ jobs:
           submodules: recursive
       # Driver sources are -Werror via CMakeLists (the core submodule is
       # upstream code and is not).
+      # The harnesses below run this build: its M-code answer wait is 5 s,
+      # not the image's 30 s, so mcode_test.py's no-answer case is short.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGFMCODE_WAIT_S=5.0
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Switch-map decode truth table
         run: ./build/switch_map_test
       - name: Operator-arm coolant re-check (G-4) and arm on every laser-on
         run: ./build/laser_arm_test
-      - name: RX ring under a sender that ignores flow control
+      - name: RX ring under a sender that ignores flow control, and the -b listen address
         run: ./build/serial_test
-      - name: Listen-address literal parser (-b)
-        run: ./build/bind_addr_test
       - name: Z after a home sits on the step grid and the park stays inside the window
         run: ./build/lens_home_test
       - name: XY microstep scale derivations
