@@ -1,5 +1,6 @@
 /*
-  latch_test.c - host unit test for the laser latch writer and its owner
+  latch_test.c - host unit test for the laser latch writer and the kernel
+  run requests
 
   grblHAL is free software: you can redistribute it and/or modify it
   under the terms of the GNU General Public License as published by the
@@ -26,7 +27,23 @@
     latch believed unlocked, a closed window, or a closed gate write no
     unlock at a run start;
   - the sideband (GFSINK_LATCH_LOG) carries one line per write.
+
+  The stub also models the kernel's answer to a run request (refused
+  while it plays, in underrun or in fault; refused on an empty ring; a
+  stop acknowledges an underrun), so the test proves what the shipper's
+  run requests promise:
+
+  - the run-start retry's answer: an underrun met at a run start outside
+    the armed window is acknowledged and the run asked for again, and
+    the answer to that second request is the answer, so a retry refused
+    on an empty ring reports nothing queued, never a run in flight;
+  - the deferred run and the underrun under it: a request the busy
+    kernel refused waits while the kernel plays and starts once it reads
+    idle; an underrun under it while the kernel owns bytes of the live
+    stream faults the stream with no run asked for, armed or not; a
+    request left over from an ended stream takes the run start's retry.
 */
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -42,6 +59,7 @@ static char wr_log[64][40];         /* "attr=val" per sysfs write */
 static int  wr_n;
 static int  latch_fail_left;        /* latch writes that fail before one takes */
 static const char *rd_state = "idle";
+static bool ring_empty;             /* the kernel's ring at a run request */
 
 int gfio_wr_attr (const char *attr, const char *val)
 {
@@ -52,6 +70,23 @@ int gfio_wr_attr (const char *attr, const char *val)
         latch_fail_left--;
         return -1;
     }
+    /* The kernel's run request: refused while running, in underrun or
+     * in fault (EPERM), refused on an empty ring (ENODATA), otherwise
+     * started. The stop acknowledges an underrun. */
+    if(!strcmp(attr, "cnc/run")) {
+        if(!strcmp(rd_state, "running") || !strcmp(rd_state, "underrun") ||
+           !strcmp(rd_state, "fault")) {
+            errno = EPERM;
+            return -1;
+        }
+        if(ring_empty) {
+            errno = ENODATA;
+            return -1;
+        }
+        return 0;
+    }
+    if(!strcmp(attr, "cnc/stop") && !strcmp(rd_state, "underrun"))
+        rd_state = "idle";
     return 0;
 }
 
@@ -112,6 +147,15 @@ static int find_write (const char *what)
     return -1;
 }
 
+static int count_write (const char *what)
+{
+    int n = 0;
+    for(int i = 0; i < wr_n && i < 64; i++)
+        if(!strcmp(wr_log[i], what))
+            n++;
+    return n;
+}
+
 static void reset_state (void)
 {
     wr_n = 0;
@@ -122,6 +166,11 @@ static void reset_state (void)
     atomic_store(&fire_gate, false);
     gf.failed = false;
     gf.active = true;                   /* sysfs writes reach the stub */
+    ring_empty = false;
+    gf.run_pending = gf.kernel_running = gf.clear_pending = false;
+    gf.streaming = false;
+    gf.power_sent = false;
+    gf.dith_left = 0;
     latch_locked_by_us = true;
     latch_fail_reported = false;
 }
@@ -210,6 +259,81 @@ int main (void)
     CHECK(find_write("cnc/run=1") < 0, "the refused run never reached the kernel");
     CHECK(atomic_exchange(&fault_flag, false) && gf.failed, "the refused run faults the stream");
 
+    printf("the deferred run and the underrun:\n");
+
+    /* An underrun found at a run start, outside the window, is
+     * acknowledged and the run asked for again; the answer to that
+     * second request is the answer. */
+    reset_state();
+    rd_state = "underrun";
+    CHECK(issue_run() == 1, "a run start that finds an underrun acks it, and the retry starts the run");
+    CHECK(wr_n == 3 && find_write("cnc/stop=1") == 1 && count_write("cnc/run=1") == 2,
+          "the request, the acknowledgment, the retry");
+    CHECK(!gf.failed && !atomic_load(&fault_flag), "a retry that starts the run faults nothing");
+
+    reset_state();
+    rd_state = "underrun";
+    ring_empty = true;
+    CHECK(issue_run() == 2, "a retry refused on an empty ring reports nothing queued, not a run in flight");
+    CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing: the next ship restarts the stream");
+
+    /* The bytes behind a pending request were queued behind what the
+     * kernel was playing: an underrun with a run pending starved this
+     * stream mid-run, and the ring is drained. A fault, with no run
+     * asked for over it, armed or not. */
+    reset_state();
+    gf.run_pending = gf.kernel_running = gf.streaming = true;
+    rd_state = "underrun";
+    ring_empty = true;
+    CHECK(pending_pass(), "an underrun with a run pending does not hold the shipper");
+    CHECK(gf.failed && atomic_exchange(&fault_flag, false), "an underrun with a run pending faults the stream");
+    CHECK(!gf.run_pending, "the pending request is dropped");
+    CHECK(count_write("cnc/run=1") == 0, "no run is asked for over the underrun");
+
+    reset_state();
+    atomic_store(&laser_armed, true);
+    gf.run_pending = gf.kernel_running = gf.streaming = true;
+    rd_state = "underrun";
+    ring_empty = true;
+    CHECK(pending_pass() && gf.failed && atomic_exchange(&fault_flag, false) && !gf.run_pending,
+          "an underrun with a run pending faults the stream inside the window too");
+    CHECK(count_write("cnc/run=1") == 0, "and asks for no run either");
+    atomic_store(&laser_armed, false);
+
+    /* A request left over from a stream that ended, while the kernel
+     * drained its tail: the tail's end-of-data under the next stream's
+     * live flag reads as an underrun before the next bytes land. Nothing
+     * is lost, so it is the run start's case: acknowledged, the anchor
+     * dropped, the retry's empty-ring answer ending the stale request. */
+    reset_state();
+    gf.run_pending = gf.streaming = true;
+    gf.kernel_running = false;
+    rd_state = "underrun";
+    ring_empty = true;
+    CHECK(pending_pass() && !gf.failed && !atomic_load(&fault_flag),
+          "an underrun under a request left over from an ended stream is no fault");
+    CHECK(!gf.run_pending && !gf.kernel_running, "the stale request ends with the retry's answer");
+    CHECK(find_write("cnc/stop=1") == 1 && count_write("cnc/run=1") == 2,
+          "the underrun was acknowledged and the run asked for again");
+    CHECK(!strcmp(rd_state, "idle"), "the kernel is idle for the next ship's run start");
+
+    /* A deferred run that starts: its leading power byte is already in
+     * the ring, so the run state carries on. */
+    reset_state();
+    gf.run_pending = gf.kernel_running = true;
+    gf.power_sent = true;
+    rd_state = "idle";
+    CHECK(pending_pass() && !gf.run_pending && gf.kernel_running && find_write("cnc/run=1") == 0,
+          "a deferred run starts once the kernel reads idle");
+    CHECK(gf.power_sent && !gf.failed, "its leading power byte is in the ring already; no fault");
+
+    /* Still playing: the request waits and nothing is written. */
+    reset_state();
+    gf.run_pending = gf.kernel_running = true;
+    rd_state = "running";
+    CHECK(pending_pass() && gf.run_pending && gf.kernel_running && wr_n == 0,
+          "a kernel still playing keeps the request pending and is asked nothing");
+
     printf("the sideband:\n");
 
     close(fd);
@@ -230,7 +354,9 @@ int main (void)
 
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the latch writer retries, faults a lost lock, never re-opens a "
-                      "latch it did not lock, and relights only its own lock under an open gate\n",
+                      "latch it did not lock, and relights only its own lock under an open gate; "
+                      "a run request takes the retry's answer, and an underrun under a pending "
+                      "run faults the stream\n",
            failures);
     return failures ? 1 : 0;
 }

@@ -25,7 +25,7 @@ On a host without `GFSINK` the driver runs the real core, planner and stream
 code against a **null sink**, which is what makes the laser path testable
 without hardware. The eight tests include the driver source they test and
 stub the rest: `laser_arm_test` (the arm flow and the verdict's tiers),
-`latch_test` (the latch writer), `cooling_test` (the verdict client),
+`latch_test` (the latch writer and the kernel run requests), `cooling_test` (the verdict client),
 `switches_test` (a lid cancel with the switch device gone), `serial_test`
 (the RX ring, the banner, the TX stall bound).
 

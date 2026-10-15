@@ -30,7 +30,7 @@ jobs:
         run: ./build/lens_home_test
       - name: XY microstep scale derivations
         run: ./build/xy_scale_test
-      - name: Laser latch writer (retries, ownership, the run-start relight)
+      - name: Laser latch writer (retries, ownership, the run-start relight) and the kernel run requests (the deferred run, the underrun)
         run: ./build/latch_test
       - name: Cooling client verdict tiers
         run: ./build/cooling_test

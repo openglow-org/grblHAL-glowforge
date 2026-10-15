@@ -1010,19 +1010,25 @@ static int issue_run (void)
         latch_fault("gfstream: laser latch unlock failed at a run start - refusing the run\n");
         return -1;
     }
-    if(gfio_wr_attr("cnc/run", "1") != 0) {
+    bool retried = false;
+    while(gfio_wr_attr("cnc/run", "1") != 0) {
         int err = errno;
         gfio_rd_attr("cnc/state", state, sizeof(state));
-        if(strcmp(state, "underrun") == 0 && !laser_armed) {
+        if(strcmp(state, "underrun") == 0 && !laser_armed && !retried) {
             /* Late detection of a starve: ack, then retry once. The
              * counters no longer prove position, so the homing
-             * anchor must not survive the retry. */
+             * anchor must not survive the retry. The retry's answer
+             * is read like the first request's: a retry that starts
+             * no run (the ring drained, a stop that landed) must
+             * never report a run in flight. */
+            retried = true;
             rt_log("gfstream: kernel underrun; recovering - "
                    "position untrusted, re-home before an armed job\n");
             gfhome_invalidate();
             gfio_wr_attr("cnc/stop", "1");
-            gfio_wr_attr("cnc/run", "1");
-        } else if(strcmp(state, "underrun") == 0) {
+            continue;
+        }
+        if(strcmp(state, "underrun") == 0) {
             /* Laser armed: a restarted run resets the hardware duty,
              * so replaying the queued bytes could fire remaining
              * fire bits at ~full power. Ack the underrun and fail
@@ -1052,6 +1058,7 @@ static int issue_run (void)
             fault_flag = true;
             rc = -1;
         }
+        break;
     }
     if(relight && !laser_armed)
         latch_write_locked(true);   /* disarmed meanwhile - relock */
@@ -1063,12 +1070,14 @@ static int issue_run (void)
 /* Kernel-side follow-ups on the shipper's cadence: a run request the busy
  * kernel refused is re-issued once it is idle, and a mid-motion reset's
  * unplayed residue is dropped once the stop has played out. Both hold
- * shipping until resolved (a clear must not eat a new job's bytes).
- * Returns false when shipping must wait. */
+ * shipping until resolved (a clear must not eat a new job's bytes). An
+ * underrun under the request, while the kernel owns bytes of the live
+ * stream, faults the stream. Returns false when shipping must wait. */
 static bool pending_pass (void)
 {
     pthread_mutex_lock(&gf.lock);
     bool clear = gf.clear_pending, run = gf.run_pending, active = gf.active;
+    bool playing = gf.kernel_running;
     pthread_mutex_unlock(&gf.lock);
 
     if(!active || (!clear && !run))
@@ -1092,6 +1101,35 @@ static bool pending_pass (void)
         gf.power_sent = false;
         dither_reset();
         pthread_mutex_unlock(&gf.lock);
+        return true;
+    }
+
+    /* An underrun while the kernel owns bytes of the live stream is this
+     * stream's, mid-run: the bytes behind the pending request were queued
+     * behind what the kernel was playing, so it starved after consuming
+     * them, and the ring is drained. A retry starts nothing and leaves
+     * the rest of the stream to queue behind an idle kernel and replay
+     * at the next run start. The rule is check_kernel_state's: alarm;
+     * the reset acknowledges the underrun and clears the residue. A
+     * request left over from a stream that ended (the kernel was
+     * draining its tail) takes the run start's path below instead: its
+     * underrun is that tail's end-of-data under the next stream's live
+     * flag, nothing is lost, and the retry acknowledges it. */
+    if(strcmp(state, "underrun") == 0 && playing) {
+        /* Re-checked under the lock: a reset that landed since the
+         * snapshot has dropped the request and owns the recovery. */
+        pthread_mutex_lock(&gf.lock);
+        bool ours = gf.run_pending && gf.kernel_running;
+        bool report = ours && !gf.failed;
+        if(ours) {
+            gf.run_pending = false;
+            gf.failed = true;
+        }
+        pthread_mutex_unlock(&gf.lock);
+        if(report)
+            rt_log("gfstream: kernel underrun under a pending run - alarming\n");
+        if(ours)
+            fault_flag = true;
         return true;
     }
 
