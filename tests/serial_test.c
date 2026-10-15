@@ -37,8 +37,9 @@
   core's first byte of it to its status, so a dwell or a wait that runs
   inside a line reads as the sender at work.
 
-  The -b listen address (src/bind_addr.c): an IPv4 literal binds in its
-  v4-mapped form on the dual-stack socket.
+  The -b listen address (src/bind_addr.c): an IPv6 literal binds as
+  written, an IPv4 literal in its v4-mapped form on the dual-stack socket,
+  and a host name is refused (main.c exits on the refusal).
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -488,12 +489,16 @@ int main(void)
     close(pfd[0]);
 
     /* --- the -b listen address ------------------------------------------- */
-    printf("An IPv4 listen address binds in its v4-mapped form:\n");
+    printf("The -b listen address: an IPv6 literal as written, an IPv4 literal v4-mapped, a host name refused:\n");
     struct in6_addr bound;
     static const uint8_t loop4[4] = { 127, 0, 0, 1 };
+    CHECK(bind_addr_parse("::1", &bound) == 0 && memcmp(&bound, &in6addr_loopback, sizeof(bound)) == 0,
+          "::1 parses to in6addr_loopback, as written");
     CHECK(bind_addr_parse("127.0.0.1", &bound) == 0 && IN6_IS_ADDR_V4MAPPED(&bound) &&
           bound.s6_addr[10] == 0xff && bound.s6_addr[11] == 0xff && memcmp(&bound.s6_addr[12], loop4, 4) == 0,
           "127.0.0.1 parses to ::ffff:127.0.0.1");
+    CHECK(bind_addr_parse("localhost", &bound) == -1,
+          "a host name is refused: the option takes a literal, never a name");
 
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: an overrun drops the overrunning line whole, keeps every earlier "
