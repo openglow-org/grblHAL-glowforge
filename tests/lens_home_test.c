@@ -16,10 +16,11 @@
     - the session's budget is held to 10..3600 s and the post-homing
       coordinates to the bed (gfhome_clamp_timeout_s,
       gfhome_clamp_home_mm), a camera home's to the travel either side of
-      the origin (gfhome_clamp_cloud_home_mm): a key that is not a number
-      takes the default, or the origin
+      the origin (gfhome_clamp_cloud_home_mm): a value in range stands, and
+      a key that is not a number takes the default, or the origin
     - a measured far edge is held to 50 mm up to the travel plus 30 mm
-      (gfhome_clamp_envelope_mm), and an unset one is the travel
+      (gfhome_clamp_envelope_mm), and an unset one, or one that is not a
+      number, is the travel
     - the tray offset is held to 13..60 mm and placed on the same grid
       (gftray_clamp_offset_mm, gftray_offset_steps, glowforge_tray.h): the
       default 1.35" is 100 half-steps, and a tray-out edge lands on the
@@ -43,6 +44,13 @@
 #define UP 12
 
 static int failures = 0;
+
+/* A result is close to its want. A NaN result never is: every comparison
+ * with NaN is false, so a test of distance lets one pass. */
+static bool near_f (float got, float want)
+{
+    return fabsf(got - want) <= 1e-4f;
+}
 
 /* The grid height for `z_mm` must be `steps` over the scale and store
  * back as `steps`. */
@@ -146,7 +154,7 @@ int main (void)
         };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             float got = gfhome_clamp_timeout_s(cases[i].in, dflt);
-            if (fabsf(got - cases[i].want) > 1e-4f) {
+            if (!near_f(got, cases[i].want)) {
                 printf("FAIL timeout %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
                 failures++;
             } else {
@@ -155,18 +163,19 @@ int main (void)
         }
     }
 
-    /* The post-homing coordinates: 0..travel, the origin for a value
-     * that is not a number. */
+    /* The post-homing coordinates: 0..travel, a point on the bed as it
+     * is, the origin for a value that is not a number. */
     {
         const float travel = 495.0f;
         struct { float in, want; const char *what; } cases[] = {
+            { 12.5f, 12.5f, "a point on the bed stands" },
             { -3.0f, 0.0f, "a point off the near edge lands on it" },
             { 600.0f, 495.0f, "a point past the far edge lands on it" },
             { NAN, 0.0f, "a coordinate that is not a number is the origin" },
         };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             float got = gfhome_clamp_home_mm(cases[i].in, travel);
-            if (fabsf(got - cases[i].want) > 1e-4f) {
+            if (!near_f(got, cases[i].want)) {
                 printf("FAIL home %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
                 failures++;
             } else {
@@ -187,7 +196,7 @@ int main (void)
         };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             float got = gfhome_clamp_cloud_home_mm(cases[i].in, travel);
-            if (fabsf(got - cases[i].want) > 1e-4f) {
+            if (!near_f(got, cases[i].want)) {
                 printf("FAIL camera home %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
                 failures++;
             } else {
@@ -205,10 +214,11 @@ int main (void)
             { 600.0f, 525.0f, "one past the margin lands on the travel plus 30 mm" },
             { 10.0f, 50.0f, "one below 50 mm lands on 50 mm" },
             { -1.0f, 495.0f, "an unset key is the travel" },
+            { NAN, 495.0f, "a value that is not a number is the travel" },
         };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             float got = gfhome_clamp_envelope_mm(cases[i].in, travel);
-            if (fabsf(got - cases[i].want) > 1e-4f) {
+            if (!near_f(got, cases[i].want)) {
                 printf("FAIL envelope %g: %g (want %g)\n", (double)cases[i].in, (double)got, (double)cases[i].want);
                 failures++;
             } else {
