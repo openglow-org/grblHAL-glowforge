@@ -41,7 +41,9 @@
     kernel refused waits while the kernel plays and starts once it reads
     idle; an underrun under it while the kernel owns bytes of the live
     stream faults the stream with no run asked for, armed or not; a
-    request left over from an ended stream takes the run start's retry.
+    request left over from an ended stream takes the run start's retry;
+    a deferred run refused on an empty ring ends the kernel run, so the
+    next run leads with a power byte and a fresh dither.
 */
 #include <errno.h>
 #include <stdbool.h>
@@ -316,6 +318,20 @@ int main (void)
     CHECK(find_write("cnc/stop=1") == 1 && count_write("cnc/run=1") == 2,
           "the underrun was acknowledged and the run asked for again");
     CHECK(!strcmp(rd_state, "idle"), "the kernel is idle for the next ship's run start");
+
+    /* A deferred run that finds the ring drained: the bytes played as a
+     * continuation of the tail. That kernel run is over, so the next
+     * run leads with a power byte and a fresh dither, like every run. */
+    reset_state();
+    gf.run_pending = gf.kernel_running = true;
+    gf.power_sent = true;
+    gf.dith_left = 5;
+    rd_state = "idle";
+    ring_empty = true;
+    CHECK(pending_pass() && !gf.run_pending && !gf.kernel_running,
+          "a deferred run refused on an empty ring ends the kernel run: the bytes were played");
+    CHECK(!gf.power_sent && gf.dith_left == 0, "the next run leads with a power byte and a fresh dither");
+    CHECK(!gf.failed && !atomic_load(&fault_flag), "it is no fault");
 
     /* A deferred run that starts: its leading power byte is already in
      * the ring, so the run state carries on. */

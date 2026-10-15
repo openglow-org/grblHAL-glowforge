@@ -1147,6 +1147,8 @@ static bool pending_pass (void)
     } else {
         gf.run_pending = false;
         gf.kernel_running = false;
+        gf.power_sent = false;       /* the next run resets the duty */
+        dither_reset();
     }
     pthread_mutex_unlock(&gf.lock);
     return true;
