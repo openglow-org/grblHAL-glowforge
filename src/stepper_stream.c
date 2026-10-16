@@ -1013,7 +1013,11 @@ static int issue_run (void)
     bool retried = false;
     while(gfio_wr_attr("cnc/run", "1") != 0) {
         int err = errno;
-        gfio_rd_attr("cnc/state", state, sizeof(state));
+        /* Each answer is read with the state after it, the retry's too:
+         * a state that cannot be read is no state, which refuses the run
+         * as a fault, never the state read before the retry. */
+        if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+            state[0] = '\0';
         if(strcmp(state, "underrun") == 0 && !laser_armed && !retried) {
             /* Late detection of a starve: ack, then retry once. The
              * counters no longer prove position, so the homing
@@ -1123,7 +1127,8 @@ static bool pending_pass (void)
      * flag, nothing is lost, and the retry acknowledges it. */
     if(strcmp(state, "underrun") == 0 && playing) {
         /* Re-checked under the lock: a reset that landed since the
-         * snapshot has dropped the request and owns the recovery. */
+         * snapshot has dropped the request and owns the recovery, and a
+         * fault that landed since raised its own alarm: one per stream. */
         pthread_mutex_lock(&gf.lock);
         bool ours = gf.run_pending && gf.kernel_running;
         bool report = ours && !gf.failed;
@@ -1132,10 +1137,10 @@ static bool pending_pass (void)
             gf.failed = true;
         }
         pthread_mutex_unlock(&gf.lock);
-        if(report)
+        if(report) {
             rt_log("gfstream: kernel underrun under a pending run - alarming\n");
-        if(ours)
             fault_flag = true;
+        }
         return true;
     }
 

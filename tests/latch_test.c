@@ -29,18 +29,25 @@
   - the sideband (GFSINK_LATCH_LOG) carries one line per write.
 
   The stub also models the kernel's answer to a run request (refused
-  while it plays, in underrun or in fault; refused on an empty ring; a
-  stop acknowledges an underrun), so the test proves what the shipper's
-  run requests promise:
+  while it plays, in underrun or in fault; refused at idle with another
+  errno, as a head sync that fails is refused with EIO; refused on an
+  empty ring; a stop acknowledges an underrun, or leaves it in place), a
+  state read that fails, and another thread's fault landing during one,
+  so the test proves what the shipper's run requests promise:
 
   - the run-start retry's answer: an underrun met at a run start outside
-    the armed window is acknowledged and the run asked for again, and
-    the answer to that second request is the answer, so a retry refused
-    on an empty ring reports nothing queued, never a run in flight;
+    the armed window is acknowledged and the run asked for again, once,
+    and the answer to that second request is the answer, read with the
+    state after it: a retry refused on an empty ring reports nothing
+    queued, never a run in flight, and an underrun that outlasts its
+    acknowledgment, or a state that cannot be read, is a fault;
+  - a run refused at idle other than on an empty ring faults the stream,
+    and the reset clears the ring;
   - the deferred run and the underrun under it: a request the busy
     kernel refused waits while the kernel plays and starts once it reads
     idle; an underrun under it while the kernel owns bytes of the live
-    stream faults the stream with no run asked for, armed or not; a
+    stream faults the stream with no run asked for, armed or not, and
+    raises no second alarm for a stream another fault failed meanwhile; a
     stream that fails under the request (the armed clamp's stop) drops it
     and asks for no run; a request left over from an ended stream takes
     the run start's retry; a deferred run refused on an empty ring ends
@@ -64,6 +71,10 @@ static int  wr_n;
 static int  latch_fail_left;        /* latch writes that fail before one takes */
 static const char *rd_state = "idle";
 static bool ring_empty;             /* the kernel's ring at a run request */
+static int  idle_refusal;           /* errno of a run refused at idle, 0 = none */
+static int  stops_ignored;          /* stops in underrun that leave it in place */
+static int  state_reads, state_fail_at;     /* the cnc/state read that fails, 0 = none */
+static void (*on_state_read)(void); /* another thread's work, landing during a read */
 
 int gfio_wr_attr (const char *attr, const char *val)
 {
@@ -75,12 +86,18 @@ int gfio_wr_attr (const char *attr, const char *val)
         return -1;
     }
     /* The kernel's run request: refused while running, in underrun or
-     * in fault (EPERM), refused on an empty ring (ENODATA), otherwise
-     * started. The stop acknowledges an underrun. */
+     * in fault (EPERM), refused at idle with idle_refusal when a case
+     * sets it (the kernel refuses a head sync that fails with EIO),
+     * refused on an empty ring (ENODATA), otherwise started. The stop
+     * acknowledges an underrun once stops_ignored stops have not. */
     if(!strcmp(attr, "cnc/run")) {
         if(!strcmp(rd_state, "running") || !strcmp(rd_state, "underrun") ||
            !strcmp(rd_state, "fault")) {
             errno = EPERM;
+            return -1;
+        }
+        if(idle_refusal && !strcmp(rd_state, "idle")) {
+            errno = idle_refusal;
             return -1;
         }
         if(ring_empty) {
@@ -89,15 +106,25 @@ int gfio_wr_attr (const char *attr, const char *val)
         }
         return 0;
     }
-    if(!strcmp(attr, "cnc/stop") && !strcmp(rd_state, "underrun"))
-        rd_state = "idle";
+    if(!strcmp(attr, "cnc/stop") && !strcmp(rd_state, "underrun")) {
+        if(stops_ignored > 0)
+            stops_ignored--;
+        else
+            rd_state = "idle";
+    }
     return 0;
 }
 
 int gfio_rd_attr (const char *attr, char *buf, size_t len)
 {
     if(!strcmp(attr, "cnc/state")) {
+        /* A read that fails leaves the buffer as it was, as the real
+         * reader does when the attribute does not open. */
+        if(++state_reads == state_fail_at)
+            return -1;
         snprintf(buf, len, "%s", rd_state);
+        if(on_state_read)
+            on_state_read();
         return 0;
     }
     if(len)
@@ -160,6 +187,14 @@ static int count_write (const char *what)
     return n;
 }
 
+/* A fault from another thread (the producer's armed clamp, a lock the
+ * protocol thread lost) that lands while the shipper reads the kernel
+ * state. It raised its own alarm, which the hook has taken already. */
+static void fault_lands (void)
+{
+    gf.failed = true;
+}
+
 static void reset_state (void)
 {
     wr_n = 0;
@@ -171,6 +206,10 @@ static void reset_state (void)
     gf.failed = false;
     gf.active = true;                   /* sysfs writes reach the stub */
     ring_empty = false;
+    idle_refusal = 0;
+    stops_ignored = 0;
+    state_reads = state_fail_at = 0;
+    on_state_read = NULL;
     gf.run_pending = gf.kernel_running = gf.clear_pending = false;
     gf.streaming = false;
     gf.power_sent = false;
@@ -281,6 +320,37 @@ int main (void)
     CHECK(issue_run() == 2, "a retry refused on an empty ring reports nothing queued, not a run in flight");
     CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing: the next ship restarts the stream");
 
+    /* The run is asked for again once, never more: an underrun that
+     * outlasts its acknowledgment meets the retry refused, a fault. */
+    reset_state();
+    rd_state = "underrun";
+    stops_ignored = 1;
+    CHECK(issue_run() == -1 && gf.failed && atomic_exchange(&fault_flag, false),
+          "an underrun that outlasts its acknowledgment faults the stream at the retry");
+    CHECK(count_write("cnc/run=1") == 2, "the run is asked for twice, never more");
+
+    /* The retry's answer is read with the state after it: a state that
+     * cannot be read is a fault, never the underrun read before. */
+    reset_state();
+    rd_state = "underrun";
+    ring_empty = true;
+    state_fail_at = 2;
+    CHECK(issue_run() == -1 && gf.failed && atomic_exchange(&fault_flag, false),
+          "a retry whose state cannot be read faults the stream");
+    CHECK(count_write("cnc/stop=1") == 1,
+          "and nothing acts on the underrun read before it: the acknowledgment is the one stop");
+
+    /* A run refused at idle for any reason but an empty ring (the
+     * kernel's EIO for a head sync that fails) leaves the shipped bytes
+     * in the ring with no run to play them: a fault, and the reset then
+     * clears the ring, so the next run start never plays them. */
+    reset_state();
+    idle_refusal = EIO;
+    CHECK(issue_run() == -1 && gf.failed && atomic_exchange(&fault_flag, false),
+          "a run refused at idle other than on an empty ring faults the stream");
+    gf_stream_reset();
+    CHECK(gf.clear_pending, "and the reset clears what the ring holds");
+
     /* The bytes behind a pending request were queued behind what the
      * kernel was playing: an underrun with a run pending starved this
      * stream mid-run, and the ring is drained. A fault, with no run
@@ -303,6 +373,16 @@ int main (void)
           "an underrun with a run pending faults the stream inside the window too");
     CHECK(count_write("cnc/run=1") == 0, "and asks for no run either");
     atomic_store(&laser_armed, false);
+
+    /* A fault that lands while the shipper reads the state raised its
+     * own alarm: the underrun under the request drops it, and the stream
+     * alarms once. */
+    reset_state();
+    gf.run_pending = gf.kernel_running = gf.streaming = true;
+    rd_state = "underrun";
+    on_state_read = fault_lands;
+    CHECK(pending_pass() && gf.failed && !gf.run_pending && !atomic_load(&fault_flag),
+          "an underrun under a request whose stream failed meanwhile raises no second alarm");
 
     /* A stream that fails under a pending request: the armed clamp fault
      * stops the kernel, and the stop's ramp ends idle with what it did
@@ -336,7 +416,6 @@ int main (void)
     CHECK(!gf.run_pending && !gf.kernel_running, "the stale request ends with the retry's answer");
     CHECK(find_write("cnc/stop=1") == 1 && count_write("cnc/run=1") == 2,
           "the underrun was acknowledged and the run asked for again");
-    CHECK(!strcmp(rd_state, "idle"), "the kernel is idle for the next ship's run start");
 
     /* A deferred run that finds the ring drained: the bytes played as a
      * continuation of the tail. That kernel run is over, so the next
