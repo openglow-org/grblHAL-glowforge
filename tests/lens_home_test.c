@@ -45,8 +45,8 @@
 
 static int failures = 0;
 
-/* A result is close to its want. A NaN result never is: every comparison
- * with NaN is false, so a test of distance lets one pass. */
+/* A result is close to its want. A NaN result never is: every ordered
+ * comparison with NaN is false, so a test of distance lets one pass. */
 static bool near_f (float got, float want)
 {
     return fabsf(got - want) <= 1e-4f;
