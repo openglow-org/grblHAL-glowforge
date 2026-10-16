@@ -41,9 +41,11 @@
     kernel refused waits while the kernel plays and starts once it reads
     idle; an underrun under it while the kernel owns bytes of the live
     stream faults the stream with no run asked for, armed or not; a
-    request left over from an ended stream takes the run start's retry;
-    a deferred run refused on an empty ring ends the kernel run, so the
-    next run leads with a power byte and a fresh dither.
+    stream that fails under the request (the armed clamp's stop) drops it
+    and asks for no run; a request left over from an ended stream takes
+    the run start's retry; a deferred run refused on an empty ring ends
+    the kernel run, so the next run leads with a power byte and a fresh
+    dither.
 */
 #include <errno.h>
 #include <stdbool.h>
@@ -302,6 +304,23 @@ int main (void)
     CHECK(count_write("cnc/run=1") == 0, "and asks for no run either");
     atomic_store(&laser_armed, false);
 
+    /* A stream that fails under a pending request: the armed clamp fault
+     * stops the kernel, and the stop's ramp ends idle with what it did
+     * not reach still in the ring. The request goes with the fault, and
+     * the reset clears the residue. */
+    reset_state();
+    atomic_store(&laser_armed, true);
+    gf.run_pending = gf.kernel_running = gf.streaming = true;
+    rd_state = "running";
+    pthread_mutex_lock(&gf.lock);
+    clamp_locked();                     /* late events inside the window */
+    pthread_mutex_unlock(&gf.lock);
+    (void)atomic_exchange(&fault_flag, false);   /* the hook takes the alarm */
+    rd_state = "idle";                  /* the ramp ended with the residue queued */
+    CHECK(pending_pass() && !gf.run_pending, "a failed stream drops its pending request");
+    CHECK(count_write("cnc/run=1") == 0, "and asks the kernel for no run over what the ring still holds");
+    atomic_store(&laser_armed, false);
+
     /* A request left over from a stream that ended, while the kernel
      * drained its tail: the tail's end-of-data under the next stream's
      * live flag reads as an underrun before the next bytes land. Nothing
@@ -371,8 +390,8 @@ int main (void)
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the latch writer retries, faults a lost lock, never re-opens a "
                       "latch it did not lock, and relights only its own lock under an open gate; "
-                      "a run request takes the retry's answer, and an underrun under a pending "
-                      "run faults the stream\n",
+                      "a run request takes the retry's answer, an underrun under a pending "
+                      "run faults the stream, and a failed stream asks for no run\n",
            failures);
     return failures ? 1 : 0;
 }

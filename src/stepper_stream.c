@@ -1072,12 +1072,18 @@ static int issue_run (void)
  * unplayed residue is dropped once the stop has played out. Both hold
  * shipping until resolved (a clear must not eat a new job's bytes). An
  * underrun under the request, while the kernel owns bytes of the live
- * stream, faults the stream. Returns false when shipping must wait. */
+ * stream, faults the stream, and a failed stream's request is dropped.
+ * Returns false when shipping must wait. */
 static bool pending_pass (void)
 {
     pthread_mutex_lock(&gf.lock);
     bool clear = gf.clear_pending, run = gf.run_pending, active = gf.active;
     bool playing = gf.kernel_running;
+    /* A failed stream asks the kernel for no run. The request goes with
+     * the fault: what the ring still holds belongs to the reset, which
+     * stops the kernel and clears it. */
+    if(run && !clear && gf.failed)
+        gf.run_pending = run = false;
     pthread_mutex_unlock(&gf.lock);
 
     if(!active || (!clear && !run))
