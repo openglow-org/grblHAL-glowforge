@@ -18,6 +18,8 @@
     CRITICAL is the fail tier (the laser module is told to end the job),
     and every other fire_ok=false verdict, and a stale one, is the pause
     tier (the job is held, said once, and the latch is never written);
+  - a verdict stamped ahead of the reader's clock is no verdict, as a
+    stale one is: fire stays blocked and the job is held;
   - a clean verdict with resume_ok resumes the hold the client took;
   - outside the window a blocking verdict is neither tier;
   - every change of the armed bit is reported at once, whatever the
@@ -88,7 +90,8 @@ static int failures;
 static char verdict_path[] = "/tmp/cooling_test.XXXXXX";
 
 /* Publish a verdict the way the engine does: the whole document, then a
-   rename into place. age_s backdates ts_mono (a stale publisher). */
+   rename into place. age_s backdates ts_mono (a stale publisher); a
+   negative age_s stamps it ahead of the reader's clock. */
 static void publish (bool fire_ok, const char *name, bool hold, bool resume_ok,
                      bool armed, double age_s)
 {
@@ -286,6 +289,25 @@ int main (void)
     publish(true, "OK", false, true, true, 0.0);
     gfcool_poll();
     CHECK(enqueued(CMD_CYCLE_START) && !hold_ours && !pause_said, "the restored engine resumes");
+
+    /* A verdict stamped ahead of the reader's clock is no verdict, as a
+       stale one is: fire stays blocked and the job is held. The cache
+       has expired before the read, so only an accepted document opens
+       the gate. */
+    static const double ahead_s[] = { 0.25, 5.0 };
+    for(int i = 0; i < 2; i++) {
+        reset_state();
+        armed_val = true;
+        laser_on_window = true;
+        cur_state = STATE_CYCLE;
+        atomic_store(&v_fresh_until_ms, mono_ms() - 1);
+        publish(true, "OK", false, true, true, -ahead_s[i]);
+        gfcool_poll();
+        char msg[96];
+        snprintf(msg, sizeof(msg), "a stamp %g s ahead of the clock is no verdict: fire blocked, the job held",
+                 ahead_s[i]);
+        CHECK(!gfcool_verdict_fire_ok() && enqueued(CMD_FEED_HOLD), msg);
+    }
 
     /* The enforcement runs on every poll from the cache, not only when
        the file is read: a cache that expires between two reads holds
