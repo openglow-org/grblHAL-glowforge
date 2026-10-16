@@ -7,12 +7,13 @@ It is the GRBL-mode controller of
 cloud-dependent factory firmware with an open, locally controlled image, with
 no hardware modification.
 
-The unmodified grblHAL core (a git submodule at `src/grbl`) runs as a Linux
-userspace process. Steps are not fired from a GPIO interrupt handler: the
-driver streams **pulse bytes**, one byte per machine tick, into the kernel
-module's SDMA and EPIT playback engine. That is the same jitter-free hardware
-step generator the factory firmware used, fed live from grblHAL's planner
-instead of from a cloud-generated file.
+The grblHAL core (the project's fork, a git submodule at `src/grbl`; its
+changes are listed in the fork's `FORK-CHANGES.md`) runs as a Linux userspace
+process. Steps are not fired from a GPIO interrupt handler: the driver streams
+**pulse bytes**, one byte per machine tick, into the kernel module's SDMA and
+EPIT playback engine. That is the same jitter-free hardware step generator the
+factory firmware used, fed live from grblHAL's planner instead of from a
+cloud-generated file.
 
 The machine constants (steps per millimeter, maximum rates, accelerations) are
 measured from the factory machine and its own pulse streams;
