@@ -137,11 +137,13 @@ target_link_libraries(laser_arm_test m)
 # Host unit test for the RX ring under a sender that ignores flow
 # control: the overrunning line is dropped whole, earlier lines are
 # delivered intact, real-time characters keep passing, and the overrun
-# is reported once; and the -b listen address binds an IPv4 literal in
-# its v4-mapped form (src/bind_addr.c). Includes the serial source
-# directly, stubs the core.
+# is reported once; the -b listen address binds an IPv4 literal in
+# its v4-mapped form (src/bind_addr.c); and the start notice's list
+# (src/main.c) is the sources' reads, which it reads from DRIVER_SRC at
+# run time. Includes the serial source directly, stubs the core.
 add_executable(serial_test tests/serial_test.c src/bind_addr.c)
 target_include_directories(serial_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_compile_definitions(serial_test PRIVATE DRIVER_SRC="${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Host unit test for the Z a home sets (the pure helpers in
 # src/glowforge_homing.h): the edge's focal height lands on the step

@@ -11,7 +11,8 @@
   address, an IPv6 or IPv4 literal, default :: for all interfaces;
   parsed by bind_addr.c), -e <file> (the settings file). The listener is
   one dual-stack socket, so an IPv4 literal binds in its v4-mapped form.
-  print_usage() names the environment variables.
+  print_usage() names the environment variables. The start notice names
+  every variable of the list in ENV_OVERRIDES that is set.
 
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -104,6 +105,39 @@ static void print_version (void)
       __DATE__, __TIME__);
 }
 
+/* Every environment variable the controller reads, in one place, but the
+ * three the supervisor sets on every spawn (GFSINK, GF_PULSE_FD and
+ * GF_REPORT_SECRET): the start notice names the ones that are set (names
+ * only), and serial_test holds this list to the sources. They are the
+ * stream's bench and harness knobs, the log's, the cooling client's port,
+ * and the paths a host test moves; nothing on a machine sets one. */
+static const char *const ENV_OVERRIDES[] = {
+    "FFLOG_CONF", "FFLOG_LEVEL", "FFLOG_SOCK", "FFLOG_STDERR", "FORGECTRL_PORT",
+    "GFHOME_CONF", "GFSINK_ATTR_LOG", "GFSINK_DEPTH_MS", "GFSINK_DUMP",
+    "GFSINK_LATCH_LOG", "GFSINK_LEAD_MS", "GFSINK_RATE", "GFSINK_STALL_MS",
+    "GFSINK_WRITE_STALL_MS", "GF_STATE_DIR", "GF_SWITCH_DEV", "GF_SWITCH_FILE",
+    "GF_VERDICT_FILE",
+};
+
+/* One line at start naming the overrides that are set, names only, never
+ * a value: once the options are parsed, before any thread starts. Silent
+ * when none is set. */
+static void say_env_overrides (void)
+{
+    char line[512];
+    size_t off = 0;
+    for(size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++) {
+        if(!getenv(ENV_OVERRIDES[i]))
+            continue;
+        int n = snprintf(line + off, sizeof(line) - off, "%s%s", off ? " " : "", ENV_OVERRIDES[i]);
+        if(n < 0 || (size_t)n >= sizeof(line) - off)
+            break;
+        off += (size_t)n;
+    }
+    if(off)
+        fflog(LOG_NOTICE, "environment overrides in force: %s", line);
+}
+
 static void sig_handler (int signum)
 {
     (void)signum;
@@ -182,6 +216,8 @@ int main (int argc, char *argv[])
             return EXIT_FAILURE;
         }
     }
+
+    say_env_overrides();
 
     // Lock text and data so the SCHED_FIFO shipper never takes a major
     // page fault mid-stream. Root only: CAP_IPC_LOCK exempts the memlock

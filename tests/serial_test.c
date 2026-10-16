@@ -42,11 +42,20 @@
   (all sixteen bytes written, whatever the output held), and a host name
   is refused, as is a short dotted form: an IPv4 literal is the dotted
   quad (main.c exits on the refusal).
+
+  The start notice's list (ENV_OVERRIDES in src/main.c), held to the
+  sources: every getenv in the .c and .h files of src/ names its
+  variable, the notice's own loop aside, and the list names each
+  variable the sources read, once, but the three the supervisor sets on
+  every spawn. The test reads the sources from DRIVER_SRC, which
+  CMakeLists.txt sets.
 */
+#include <dirent.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -267,6 +276,57 @@ static int drain(char out[][32], int max, int *bad, const char *a, const char *b
     if(len)                          /* a partial line left in the ring */
         (*bad)++;
     return n;
+}
+
+/* The variables the supervisor sets on every spawn: never an override,
+   so the start notice leaves them out of its list. */
+static const char *const spawn_env[] = { "GFSINK", "GF_PULSE_FD", "GF_REPORT_SECRET" };
+
+#define ENV_NAMES 64
+typedef char env_name_t[40];
+
+static bool env_has(const env_name_t *set, int n, const char *name)
+{
+    for(int i = 0; i < n; i++)
+        if(!strcmp(set[i], name))
+            return true;
+    return false;
+}
+
+static bool env_spawned(const char *name)
+{
+    for(size_t i = 0; i < sizeof(spawn_env) / sizeof(*spawn_env); i++)
+        if(!strcmp(spawn_env[i], name))
+            return true;
+    return false;
+}
+
+/* The variable name quoted at p ("NAME": capitals, digits, underscores),
+   copied to out. Returns the character after its closing quote, or NULL
+   when p holds none. */
+static const char *env_quoted(const char *p, char *out, size_t len)
+{
+    size_t n = 0;
+    if(*p++ != '"')
+        return NULL;
+    for(; (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_'; p++)
+        if(n + 1 < len)
+            out[n++] = *p;
+    out[n] = '\0';
+    return *p == '"' && n ? p + 1 : NULL;
+}
+
+static char *env_slurp(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    char *text = NULL;
+    long size = -1;
+    if(f && fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) >= 0 && fseek(f, 0, SEEK_SET) == 0 &&
+       (text = malloc((size_t)size + 1)) != NULL)
+        text[fread(text, 1, (size_t)size, f)] = '\0';
+    if(f)
+        fclose(f);
+    return text;
 }
 
 int main(void)
@@ -505,6 +565,67 @@ int main(void)
           "a host name is refused: the option takes a literal, never a name");
     CHECK(bind_addr_parse("1.2.3", &bound) == -1,
           "a short dotted form is refused: an IPv4 literal is the dotted quad");
+
+    /* --- the start notice's list ----------------------------------------- */
+    printf("The start notice's list of environment overrides, held to the sources:\n");
+    {
+        static env_name_t reads[ENV_NAMES], listed[ENV_NAMES];
+        int n_reads = 0, n_listed = 0, files = 0, unnamed = 0, differ = 0;
+        DIR *dir = opendir(DRIVER_SRC);
+        struct dirent *e;
+        while(dir && (e = readdir(dir)) != NULL) {
+            size_t l = strlen(e->d_name);
+            if(l < 3 || e->d_name[l - 2] != '.' || (e->d_name[l - 1] != 'c' && e->d_name[l - 1] != 'h'))
+                continue;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s", DRIVER_SRC, e->d_name);
+            char *text = env_slurp(path);
+            files += text != NULL;
+            for(const char *p = text; p && (p = strstr(p, "getenv(")) != NULL; ) {
+                env_name_t name;
+                p += strlen("getenv(");
+                if(env_quoted(p, name, sizeof(name))) {
+                    if(!env_has(reads, n_reads, name) && n_reads < ENV_NAMES)
+                        strcpy(reads[n_reads++], name);
+                } else if(strncmp(p, "ENV_OVERRIDES[i])", strlen("ENV_OVERRIDES[i])")))
+                    unnamed++;                  /* the notice's own loop is the one exception */
+            }
+            free(text);
+        }
+        if(dir)
+            closedir(dir);
+        char *main_c = env_slurp(DRIVER_SRC "/main.c");
+        const char *table = main_c ? strstr(main_c, "ENV_OVERRIDES[] = {") : NULL;
+        const char *end = table ? strstr(table, "};") : NULL;
+        for(const char *p = table; p && end && p < end; p++) {
+            env_name_t name;
+            const char *next = env_quoted(p, name, sizeof(name));
+            if(!next)
+                continue;
+            if(env_has(listed, n_listed, name)) {
+                printf("  the list names %s twice\n", name);
+                differ++;
+            } else if(n_listed < ENV_NAMES)
+                strcpy(listed[n_listed++], name);
+            p = next - 1;
+        }
+        free(main_c);
+        for(int i = 0; i < n_reads; i++)
+            if(!env_spawned(reads[i]) && !env_has(listed, n_listed, reads[i])) {
+                printf("  the sources read %s, which the list does not name\n", reads[i]);
+                differ++;
+            }
+        for(int i = 0; i < n_listed; i++)
+            if(env_spawned(listed[i]) || !env_has(reads, n_reads, listed[i])) {
+                printf("  the list names %s, %s\n", listed[i],
+                       env_spawned(listed[i]) ? "which the supervisor sets" : "which no source reads");
+                differ++;
+            }
+        CHECK(files > 10 && end && n_listed > 0, "the driver sources and main.c's list were read");
+        CHECK(unnamed == 0, "every getenv in the sources names its variable");
+        CHECK(differ == 0,
+              "the list names every variable the sources read, once, but the supervisor's three");
+    }
 
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: an overrun drops the overrunning line whole, keeps every earlier "

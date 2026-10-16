@@ -24,7 +24,7 @@ jobs:
         run: ./build/switch_map_test
       - name: Operator-arm coolant re-check (G-4) and arm on every laser-on
         run: ./build/laser_arm_test
-      - name: RX ring under a sender that ignores flow control, and the -b listen address
+      - name: RX ring under a sender that ignores flow control, the -b listen address, and the start notice's list of environment overrides
         run: ./build/serial_test
       - name: Z after a home sits on the step grid and the park stays inside the window
         run: ./build/lens_home_test
