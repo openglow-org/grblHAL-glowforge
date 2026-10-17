@@ -159,12 +159,28 @@ static void stepperWakeUp (void)
     gf_core_unlock();
 }
 
+/* The core's stepper state, as the HAL hands it to every pulse start. */
+static stepper_t *core_stepper;
+
 static void stepperGoIdle (bool clear_signals)
 {
     (void)clear_signals;   /* pulse bytes have no persistent pin state */
 
+    /* mc_reset sets EXEC_RESET before it kills the steppers during
+     * motion: the stream that ends here is then the reset's, and the
+     * reset stops the kernel with its ramp. The core counts a step in
+     * sys.position one interrupt callback before the pulse start that
+     * outputs it (step_out, while a block executes), and under the reset
+     * that callback never runs, so the step goes to the engine to be
+     * owed back. Read under the core lock: no callback is in flight. */
     gf_core_lock();
-    gf_stream_go_idle();
+    bool reset = bit_istrue(sys.rt_exec_state, EXEC_RESET);
+    uint8_t steps = 0, dirs = 0;
+    if(reset && core_stepper && core_stepper->exec_block) {
+        steps = (uint8_t)core_stepper->step_out.bits;
+        dirs = (uint8_t)core_stepper->dir_out.bits;
+    }
+    gf_stream_go_idle(reset, steps, dirs);
     gf_core_unlock();
 }
 
@@ -177,6 +193,8 @@ static void stepperCyclesPerTick (uint32_t cycles_per_tick)
 
 static void stepperPulseStart (stepper_t *stepper)
 {
+    core_stepper = stepper;
+
     if(stepper->dir_changed.bits)
         stepper->dir_changed.bits = 0;   /* direction rides in every pulse byte */
 
@@ -306,16 +324,55 @@ static void onSettingsChanged (settings_t *settings, settings_changed_flags_t ch
     gfhome_apply_z_limit();
 }
 
+/* The longest wait for the kernel's ramp and the clear after it: the
+ * ramp lasts well under a second at every tick (glowforge_io.h), and the
+ * shipper clears on its 10 ms cadence. */
+#define READBACK_WAIT_MS 1000
+
+/* A reset during motion: the core counted steps that never played (the
+ * step of the pulse start that never came, the backlog that the reset
+ * dropped, and the residue that the kernel's ramp did not reach). The
+ * stream engine reads them back, the residue from the kernel's step
+ * counters, once the ramp has ended, and the position drops them, so it
+ * says where the machine stopped. The core then keeps its reference
+ * through the reset. A position that cannot be read back stays lost: the
+ * core drops its reference at the reset, the homing anchor goes with it,
+ * and the sender is told. On the protocol thread, before the core's
+ * re-init syncs the planner and the parser to the position, so no job
+ * that $X admits is planned from the old one. */
+static void readback_position (void)
+{
+    int32_t unplayed[3];
+
+    int rc = gf_stream_readback(unplayed, READBACK_WAIT_MS);
+    if(rc > 0) {
+        for(uint_fast8_t axis = X_AXIS; axis <= Z_AXIS; axis++)
+            sys.position[axis] -= unplayed[axis];
+        sys.position_lost = false;
+        fflog(LOG_INFO, "soft reset: the kernel ramped the motion down; the position drops "
+              "%d %d %d steps that never played", (int)unplayed[X_AXIS],
+              (int)unplayed[Y_AXIS], (int)unplayed[Z_AXIS]);
+    } else if(rc < 0) {
+        gfhome_invalidate();
+        report_message("Soft reset: the position cannot be read back. Home before the "
+                       "coordinates are trusted.", Message_Warning);
+        fflog(LOG_WARNING, "soft reset: the position cannot be read back from the kernel; "
+              "the reference is dropped");
+    }
+}
+
 static void driverReset (void)
 {
     /* Called for both EXEC_STOP and EXEC_RESET; only a real reset may kill
      * the stream (EXEC_STOP's controlled decel must play out normally).
      * The latch relock comes first: FIRE is severed before the stream
-     * teardown even begins. */
+     * teardown even begins. A reset during motion stops the kernel with
+     * its ramp, and the position is read back when the ramp has ended. */
     if(sys.reset_pending) {
         gflaser_disarm();
         gf_stream_reset();
         gfhome_envelope_close();
+        readback_position();
     }
 
     driver_reset_chain();
@@ -377,9 +434,9 @@ static void glowforge_process_realtime (uint_fast16_t state)
     }
 
     /* The sender overran the RX ring: lines are missing from the job,
-     * so the job stops the way an incoming ^X stops it (controlled
-     * deceleration, latch relocked, alarm), never runs on with a hole in
-     * it, and the sender is told why. */
+     * so the job stops the way an incoming ^X stops it (the latch
+     * relocked, the kernel's ramp, the position read back, alarm), never
+     * runs on with a hole in it, and the sender is told why. */
     if(serial_rx_overflow_take()) {
         fflog(LOG_ERR, "serial: RX overrun - the sender ignored flow control; job aborted");
         report_message("RX overrun: the sender ignored flow control (Bf:); job aborted",
@@ -397,9 +454,9 @@ static void glowforge_process_realtime (uint_fast16_t state)
         if(state == STATE_CYCLE || state == STATE_JOG || state == STATE_HOMING ||
            ((state & STATE_HOLD) && !gf_stream_kernel_idle())) {
             /* A termination request during motion is a stop, not a
-             * "finish the job": the same path as an incoming ^X -
-             * controlled deceleration, latch relocked, alarm - and the
-             * exit follows once the kernel has ramped down. A hold whose
+             * "finish the job": the same path as an incoming ^X (the
+             * latch relocked, the kernel's ramp, alarm), and the exit
+             * follows once the kernel has ramped down. A hold whose
              * deceleration is still playing counts as motion. */
             if(!exit_reset_sent) {
                 exit_reset_sent = true;

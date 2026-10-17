@@ -28,9 +28,14 @@ uint32_t gf_stream_vclk (void);
 uint32_t gf_stream_rate (void);
 
 // hal.stepper entry points (call with the core lock held; the driver's
-// handlers in driver.c take it).
+// handlers in driver.c take it). reset tells go_idle that a soft reset
+// is pending (EXEC_RESET): a live stream that it ends is then the
+// reset's, and gf_stream_reset stops the kernel with its ramp. step_bits
+// and dir_bits are then the step the core has counted for its next pulse
+// start, which never comes (grblHAL bit order; 0 for none): the reset
+// owes it back with the rest.
 void gf_stream_wakeup (void);
-void gf_stream_go_idle (void);
+void gf_stream_go_idle (bool reset, uint8_t step_bits, uint8_t dir_bits);
 void gf_stream_cycles_per_tick (uint32_t cycles);
 void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits); // grblHAL bit order
 
@@ -96,16 +101,32 @@ bool gf_stream_laser_latch (bool lock);
 // True while this process's last latch write was a lock.
 bool gf_stream_latch_locked_by_us (void);
 
-// hal.driver_reset hook body: abort the stream (drop unshipped backlog,
-// kernel controlled stop). Call only when sys.reset_pending.
+// hal.driver_reset hook body. A reset that ends a live stream (a reset
+// during motion) drops the unshipped backlog and stops the kernel with
+// its ramp (cnc/stop); the residue that the ramp does not reach is
+// cleared once the kernel is idle. A reset after a stream fault
+// acknowledges the fault the same way. Call only when sys.reset_pending.
 void gf_stream_reset (void);
+
+// The position read-back that gf_stream_reset owes the core after it
+// stopped a stream the core went idle under. Waits up to wait_ms for the
+// ramp to end and the residue to be cleared, then gives the X, Y and Z
+// steps that the core counted and the kernel never played: the step of
+// the pulse start that never came, the backlog the reset dropped, and the
+// residue, which the kernel's step counters (cnc/position) give. 1 with
+// steps filled in, 0 when nothing is owed, -1 when the position cannot be
+// read back (the counters or their base cannot be read, the clear did not
+// take or did not land in time, or a write failed under the reset). Call
+// on the protocol thread, after gf_stream_reset.
+int gf_stream_readback (int32_t steps[3], uint32_t wait_ms);
 
 // Nonzero when the shipper hit an unrecoverable stream fault (underrun /
 // write failure). Clears the flag; caller raises the alarm.
 bool gf_stream_fault_take (void);
 
 // Zero the kernel position counters (homing established a reference;
-// external status readers add the home offset to the counters).
+// external status readers add the home offset to the counters). The
+// zero is a new base for the read-back.
 void gf_stream_clear_position (void);
 
 // Hand the pulse device to another process (the gfcloud homing runner)
