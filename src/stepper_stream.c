@@ -1040,9 +1040,15 @@ static int issue_run (void)
         if(strcmp(state, "underrun") == 0) {
             /* Laser armed: a restarted run resets the hardware duty,
              * so replaying the queued bytes could fire remaining
-             * fire bits at ~full power. Ack the underrun and fail
-             * safe instead; the alarm path relocks the latch. */
-            rt_log("gfstream: kernel underrun while laser armed - failing safe\n");
+             * fire bits at ~full power. At the retry, the underrun
+             * outlasted its acknowledgment: the stop write did not
+             * take, and the run is asked for again once, never more.
+             * Either way, ack the underrun and fail safe; the alarm
+             * path relocks the latch. The log line names the entry
+             * by retried, never by laser_armed: an arm or a disarm
+             * can land between the check above and the line. */
+            rt_log(retried ? "gfstream: kernel underrun outlasted its acknowledgment - failing safe\n"
+                           : "gfstream: kernel underrun while laser armed - failing safe\n");
             gfio_wr_attr("cnc/stop", "1");
             if(!atomic_exchange(&gf.failed, true))
                 fault_flag = true;
