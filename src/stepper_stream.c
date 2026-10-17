@@ -1076,10 +1076,10 @@ static int issue_run (void)
 /* Kernel-side follow-ups on the shipper's cadence: a run request the busy
  * kernel refused is re-issued once it is idle, and a mid-motion reset's
  * unplayed residue is dropped once the stop has played out. Both hold
- * shipping until resolved (a clear must not eat a new job's bytes). An
- * underrun under the request, while the kernel owns bytes of the live
- * stream, faults the stream, and a failed stream's request is dropped.
- * Returns false when shipping must wait. */
+ * shipping until resolved (a clear must not eat a new job's bytes). A
+ * kernel that stops running under the request, while it owns bytes of
+ * the live stream, faults the stream, and a failed stream's request is
+ * dropped. Returns false when shipping must wait. */
 static bool pending_pass (void)
 {
     pthread_mutex_lock(&gf.lock);
@@ -1116,18 +1116,25 @@ static bool pending_pass (void)
         return true;
     }
 
-    /* An underrun while the kernel owns bytes of the live stream is this
-     * stream's, mid-run: the bytes behind the pending request were queued
-     * behind what the kernel was playing, so it starved after consuming
-     * them, and the ring is drained. A retry starts nothing and leaves
-     * the rest of the stream to queue behind an idle kernel and replay
-     * at the next run start. The rule is check_kernel_state's: alarm;
-     * the reset acknowledges the underrun and clears the residue. A
-     * request left over from a stream that ended (the kernel was
-     * draining its tail) takes the run start's path below instead: its
-     * underrun is that tail's end-of-data under the next stream's live
-     * flag, nothing is lost, and the retry acknowledges it. */
-    if(strcmp(state, "underrun") == 0 && playing) {
+    /* A kernel that has stopped running while it owns bytes of the live
+     * stream has ended this stream's run, mid-run. An underrun starved
+     * it: the bytes behind the pending request were queued behind what
+     * the kernel was playing, it consumed them, and the ring is drained.
+     * An idle or disabled kernel was stopped by another writer (the
+     * cooling engine's safing stop, a halt): the live flag turns a run
+     * out of bytes into an underrun, never into idle, so what the ring
+     * still holds is that stop's residue, motion the core counted that
+     * never played. A fault is the kernel's own. None of them gets a
+     * run: a retry or a deferred start would replay the rest of the
+     * stream from a standstill at the full tick rate, and the run
+     * start's relight could undo a lock this process wrote. The rule is
+     * check_kernel_state's: alarm; the reset acknowledges the underrun
+     * and clears the residue. A request left over from a stream that
+     * ended (the kernel was draining its tail) takes the run start's
+     * path below instead: its underrun is that tail's end-of-data under
+     * the next stream's live flag, nothing is lost, and the retry
+     * acknowledges it. */
+    if(playing) {
         /* Re-checked under the lock: a reset that landed since the
          * snapshot has dropped the request and owns the recovery, and a
          * fault that landed since raised its own alarm: one per stream. */
@@ -1140,15 +1147,18 @@ static bool pending_pass (void)
         }
         pthread_mutex_unlock(&gf.lock);
         if(report) {
-            rt_log("gfstream: kernel underrun under a pending run - alarming\n");
+            char msg[80];
+            snprintf(msg, sizeof(msg), "gfstream: kernel %s under a pending run - alarming\n", state);
+            rt_log(msg);
             fault_flag = true;
         }
         return true;
     }
 
-    /* Idle with our request pending: either the bytes we shipped were
-     * consumed as a continuation (nothing left: run says no data) or they
-     * were stranded and start now. */
+    /* A request left over from a stream that ended: the bytes it
+     * shipped were consumed as a continuation of the tail (nothing
+     * left: run says no data), or they were stranded behind its end and
+     * start now. */
     int rc = issue_run();
     pthread_mutex_lock(&gf.lock);
     if(rc == 1) {
@@ -1394,10 +1404,15 @@ static void ship_pass (void)
 /* Mid-run fault detection at the shipper's cadence: the ring accepting
  * writes says nothing about playback, so a starve or a stepper-driver
  * fault would otherwise leave the sender planning and counting against
- * a motionless gantry until the NEXT run start. cnc/state is cheap to
- * read (free is the attr the UAPI forbids polling); read outside
- * gf.lock. driver.c turns the fault flag into disarm + anchor
- * invalidation + alarm on the protocol thread. */
+ * a motionless gantry until the NEXT run start. A stop another writer
+ * made (the cooling engine's safing stop, a halt) is the same: the live
+ * flag turns a run out of bytes into an underrun, never into idle, so a
+ * kernel that reads anything but running while it owns bytes of the
+ * live stream has ended this stream's run, and what the ring still
+ * holds would replay at the next run start. cnc/state is cheap to read
+ * (free is the attr the UAPI forbids polling); read outside gf.lock.
+ * driver.c turns the fault flag into disarm + anchor invalidation +
+ * alarm on the protocol thread. */
 static void check_kernel_state (void)
 {
     bool running;
@@ -1411,7 +1426,7 @@ static void check_kernel_state (void)
     char state[16] = "";
     if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
         return;
-    if(strcmp(state, "underrun") == 0 || strcmp(state, "fault") == 0) {
+    if(strcmp(state, "running") != 0) {
         /* A fault that landed since the snapshot raised its own alarm. */
         pthread_mutex_lock(&gf.lock);
         bool report = !atomic_exchange(&gf.failed, true);

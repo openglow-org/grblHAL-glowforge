@@ -44,18 +44,19 @@
     acknowledgment, or a state that cannot be read, is a fault;
   - a run refused at idle other than on an empty ring faults the stream,
     and the reset clears the ring;
-  - the deferred run and the underrun under it: a request the busy
-    kernel refused waits while the kernel plays and starts once it reads
-    idle; an underrun under it while the kernel owns bytes of the live
-    stream faults the stream with no run asked for, armed or not, and
-    raises no second alarm for a stream another fault failed meanwhile; a
-    stream that fails under the request (the armed clamp's stop) drops it
-    and asks for no run; a request left over from an ended stream takes
-    the run start's retry; a deferred run refused on an empty ring ends
-    the kernel run, so the next run leads with a power byte and a fresh
-    dither;
-  - the mid-run check: an underrun while the kernel owns bytes of the
-    live stream faults the stream;
+  - the deferred run and what ends it: a request the busy kernel refused
+    waits while the kernel plays; a kernel that stops running under it
+    while it owns bytes of the live stream (an underrun, or a stop
+    another writer made) faults the stream with no run asked for, armed
+    or not, and raises no second alarm for a stream another fault failed
+    meanwhile; a stream that fails under the request (the armed clamp's
+    stop) drops it and asks for no run; a request left over from an
+    ended stream takes the run start's retry and starts what an idle
+    kernel still holds, and refused on an empty ring it ends the kernel
+    run, so the next run leads with a power byte and a fresh dither;
+  - the mid-run check: a kernel that stops running while it owns bytes
+    of the live stream (an underrun, or a stop another writer made)
+    faults the stream;
   - one alarm per stream fault: a fault that another thread lands during
     a state read raised its own alarm, so the run request and the mid-run
     check raise no second one.
@@ -425,6 +426,19 @@ int main (void)
     CHECK(count_write("cnc/run=1") == 0, "and asks the kernel for no run over what the ring still holds");
     atomic_store(&laser_armed, false);
 
+    /* The drop alone holds the rule for a request left over from an
+     * ended stream: the lock at the job's end fails after its retries
+     * while the kernel drains, and its idle asks for no run either. */
+    reset_state();
+    gf.run_pending = true;
+    latch_locked_by_us = false;
+    latch_fail_left = 1 + LATCH_RETRIES + 1;
+    (void)gf_stream_laser_latch(true);  /* a lock that fails: the stream faults */
+    (void)atomic_exchange(&fault_flag, false);   /* the hook takes the alarm */
+    rd_state = "idle";
+    CHECK(pending_pass() && !gf.run_pending && count_write("cnc/run=1") == 0,
+          "a failed stream's request left over from an ended stream asks for no run either");
+
     /* A request left over from a stream that ended, while the kernel
      * drained its tail: the tail's end-of-data under the next stream's
      * live flag reads as an underrun before the next bytes land. Nothing
@@ -441,29 +455,47 @@ int main (void)
     CHECK(find_write("cnc/stop=1") == 1 && count_write("cnc/run=1") == 2,
           "the underrun was acknowledged and the run asked for again");
 
-    /* A deferred run that finds the ring drained: the bytes played as a
-     * continuation of the tail. That kernel run is over, so the next
-     * run leads with a power byte and a fresh dither, like every run. */
+    /* A request left over from an ended stream that finds the ring
+     * drained: its bytes played as a continuation of the tail. Its run
+     * is over, and the branch ends it as every run end does, so the
+     * next run leads with a power byte and a fresh dither. */
     reset_state();
-    gf.run_pending = gf.kernel_running = true;
+    gf.run_pending = true;
     gf.power_sent = true;
     gf.dith_left = 5;
     rd_state = "idle";
     ring_empty = true;
     CHECK(pending_pass() && !gf.run_pending && !gf.kernel_running,
-          "a deferred run refused on an empty ring ends the kernel run: the bytes were played");
+          "a stale request refused on an empty ring ends: the bytes were played");
     CHECK(!gf.power_sent && gf.dith_left == 0, "the next run leads with a power byte and a fresh dither");
     CHECK(!gf.failed && !atomic_load(&fault_flag), "it is no fault");
 
-    /* A deferred run that starts: its leading power byte is already in
-     * the ring, so the run state carries on. */
+    /* A request left over from an ended stream whose bytes an idle
+     * kernel still holds: they start now. */
     reset_state();
-    gf.run_pending = gf.kernel_running = true;
-    gf.power_sent = true;
+    gf.run_pending = true;
     rd_state = "idle";
     CHECK(pending_pass() && !gf.run_pending && gf.kernel_running && find_write("cnc/run=1") == 0,
-          "a deferred run starts once the kernel reads idle");
-    CHECK(gf.power_sent && !gf.failed, "its leading power byte is in the ring already; no fault");
+          "a stale request starts what an idle kernel still holds");
+    CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing");
+
+    /* A kernel stopped under a live stream's pending request: another
+     * writer's stop (the cooling engine's safing stop) ramps to idle
+     * with the rest of the stream in the ring, since the live flag turns
+     * a run out of bytes into an underrun, never into idle. The stream
+     * faults, with no run asked for over the stop's residue and no
+     * relight of the lock this process wrote; the reset clears it. */
+    reset_state();
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf.run_pending = gf.kernel_running = gf.streaming = true;
+    rd_state = "idle";
+    CHECK(pending_pass() && gf.failed && atomic_exchange(&fault_flag, false) && !gf.run_pending,
+          "a kernel stopped under a live stream's pending request faults the stream");
+    CHECK(count_write("cnc/run=1") == 0 && latch_writes() == 0,
+          "and asks for no run and no relight over the stop's residue");
+    atomic_store(&laser_armed, false);
+    atomic_store(&fire_gate, false);
 
     /* Still playing: the request waits and nothing is written. */
     reset_state();
@@ -490,6 +522,15 @@ int main (void)
     CHECK(gf.failed && !atomic_load(&fault_flag),
           "an underrun mid-run for a stream that failed meanwhile raises no second alarm");
 
+    /* With no request pending the same rule holds: a kernel idle while
+     * it owns bytes of the live stream was stopped by another writer. */
+    reset_state();
+    gf.kernel_running = gf.streaming = true;
+    rd_state = "idle";
+    check_kernel_state();
+    CHECK(gf.failed && atomic_exchange(&fault_flag, false),
+          "a kernel stopped under a live stream with no request pending faults the stream");
+
     printf("the sideband:\n");
 
     close(fd);
@@ -511,9 +552,9 @@ int main (void)
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the latch writer retries, faults a lost lock, never re-opens a "
                       "latch it did not lock, and relights only its own lock under an open gate; "
-                      "a run request takes the retry's answer, an underrun under a pending "
-                      "run or mid-run faults the stream, a failed stream asks for no run, "
-                      "and a stream fault alarms once\n",
+                      "a run request takes the retry's answer, a kernel that stops under a "
+                      "live stream faults it, a failed stream asks for no run, and a stream "
+                      "fault alarms once\n",
            failures);
     return failures ? 1 : 0;
 }
