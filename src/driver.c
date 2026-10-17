@@ -342,9 +342,9 @@ static void onSettingsChanged (settings_t *settings, settings_changed_flags_t ch
  * stream engine reads them back, the residue from the kernel's step
  * counters, once the ramp has ended, and the position drops them, so it
  * says where the machine stopped. The core then keeps its reference
- * through the reset. A position that cannot be read back stays lost: the
- * core drops its reference at the reset, the homing anchor goes with it,
- * and the sender is told. On the protocol thread, before the core's
+ * through the reset. A position that cannot be read back stays lost, and
+ * the sender is told: driverReset drops the reference. On the protocol
+ * thread, before the core's
  * re-init syncs the planner and the parser to the position, so no job
  * that $X admits is planned from the old one. */
 static void readback_position (void)
@@ -360,7 +360,6 @@ static void readback_position (void)
               "%d %d %d steps that never played", (int)unplayed[X_AXIS],
               (int)unplayed[Y_AXIS], (int)unplayed[Z_AXIS]);
     } else if(rc < 0) {
-        gfhome_invalidate();
         report_message("Soft reset: the position cannot be read back. Home before the "
                        "coordinates are trusted.", Message_Warning);
         fflog(LOG_WARNING, "soft reset: the position cannot be read back from the kernel; "
@@ -380,6 +379,19 @@ static void driverReset (void)
         gf_stream_reset();
         gfhome_envelope_close();
         readback_position();
+        /* A position still lost (one that cannot be read back, or a reset
+         * during the web-service homing session, where the device is the
+         * session's and nothing is read back) is not trusted: X and Y
+         * lose their reference, the homing anchor goes, and the lens is
+         * pinned where it reads. position_lost then clears, so the core's
+         * re-init keeps the homed mask and the work envelope: left set,
+         * the re-init clears both, the lens hold with them, and an
+         * unreferenced lens would move after $X. The X and Y envelope it
+         * keeps is never checked while X and Y are unhomed. */
+        if(sys.position_lost) {
+            gfhome_invalidate();
+            sys.position_lost = false;
+        }
     }
 
     driver_reset_chain();
