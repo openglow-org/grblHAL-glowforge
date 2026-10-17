@@ -28,6 +28,9 @@ void gfio_set_hw (bool active);
 #define GFIO_EREJECT (-1)
 int gfio_wr_attr (const char *attr, const char *val);
 int gfio_rd_attr (const char *attr, char *buf, size_t len);
+// A binary attribute (cnc/position): up to len bytes as the kernel wrote
+// them, nothing stripped. Returns the byte count, or -1.
+int gfio_rd_bin (const char *attr, void *buf, size_t len);
 
 // Open the pulse device and take the exclusive flock (the kernel dead
 // man's switch). Returns the fd, or -1. The _nb variant fails instead

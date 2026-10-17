@@ -98,6 +98,21 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     return 0;
 }
 
+int gfio_rd_bin (const char *attr, void *buf, size_t len)
+{
+    char path[128];
+    int fd;
+    ssize_t n;
+    snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
+    if((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+        return -1;
+    do
+        n = read(fd, buf, len);
+    while(n < 0 && errno == EINTR);
+    close(fd);
+    return n < 0 ? -1 : (int)n;
+}
+
 /* Standalone: the device is this process's alone and must never reach
  * a child (the homing runner gets it through the broker's inherited fd
  * only, and standalone the suspend closes it first). */

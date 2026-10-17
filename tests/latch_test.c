@@ -33,7 +33,10 @@
   errno, as a head sync that fails is refused with EIO; refused on an
   empty ring; a stop acknowledges an underrun), a stop write that does
   not take (issue_run ignores its return), a state read that fails, and
-  another thread's fault landing during one, so the test proves what the
+  another thread's fault landing during one, and the kernel's byte
+  counts: a pipe stands in for the ring, and the position read answers
+  with what reached the pipe, counted apart from the engine, and with a
+  processed count that the case sets. So the test proves what the
   shipper's run requests and its mid-run check promise:
 
   - the run-start retry's answer: an underrun met at a run start outside
@@ -46,16 +49,23 @@
     read, is a fault;
   - a run refused at idle other than on an empty ring faults the stream,
     and the reset clears the ring;
-  - the deferred run and what ends it: a request the busy kernel refused
-    waits while the kernel plays; a kernel that stops running under it
-    while it owns bytes of the live stream (an underrun, or a stop
-    another writer made) faults the stream with no run asked for, armed
-    or not, and raises no second alarm for a stream another fault failed
-    meanwhile; a stream that fails under the request (the armed clamp's
-    stop) drops it and asks for no run; a request left over from an
-    ended stream takes the run start's retry and starts what an idle
-    kernel still holds, and refused on an empty ring it ends the kernel
-    run, so the next run leads with a power byte and a fresh dither;
+  - the deferred run and what ends it: a request waits while the kernel
+    plays; a kernel that stops running under it while it owns bytes of
+    the live stream (an underrun, or a stop another writer made) faults
+    the stream with no run asked for, armed or not, and raises no second
+    alarm for a stream another fault failed meanwhile; a stream that
+    fails under the request (the armed clamp's stop) drops it and asks
+    for no run; a request whose stream no longer owns the kernel asks
+    for nothing;
+  - the run gate: a stream's run start at a kernel that plays asks for
+    no run, and its request waits and ends with the stream; at any other
+    state but an underrun or a fault, a run starts only over exactly the
+    bytes the stream wrote for it, the dark pad behind a lit end
+    counted: a stop's residue at an idle or a disabled kernel (one whose
+    ramp ended after the stream's end included), or bytes another writer
+    added, fault the stream with no run asked for and no relight, and so
+    does a count or a state that cannot be read; an underrun at a run
+    start goes to the retry;
   - the mid-run check: a kernel that stops running while it owns bytes
     of the live stream (an underrun, or a stop another writer made)
     faults the stream;
@@ -86,6 +96,12 @@ static int  idle_refusal;           /* errno of a run refused at idle, 0 = none 
 static int  stops_ignored;          /* stop writes in underrun that do not take */
 static int  state_reads, state_fail_at;     /* the cnc/state read that fails, 0 = none */
 static void (*on_state_read)(void); /* another thread's work, landing during a read */
+static int  ring_rd = -1;           /* the read end of the pipe that stands in for the ring */
+static uint32_t ring_took;          /* bytes that reached the stand-in */
+static unsigned char ring_tail[2];  /* the last two of them */
+static uint32_t k_processed;        /* bytes the kernel has played */
+static uint32_t k_foreign;          /* bytes another writer added to the ring */
+static bool pos_fail;               /* the position record cannot be read */
 
 int gfio_wr_attr (const char *attr, const char *val)
 {
@@ -143,6 +159,35 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     if(len)
         buf[0] = '\0';
     return -1;
+}
+
+static void ring_drain (void)
+{
+    unsigned char b[512];
+    ssize_t n;
+    while(ring_rd >= 0 && (n = read(ring_rd, b, sizeof(b))) > 0) {
+        ring_took += (uint32_t)n;
+        ring_tail[0] = n > 1 ? b[n - 2] : ring_tail[1];
+        ring_tail[1] = b[n - 1];
+    }
+}
+
+/* The kernel's position record: the processed count the case sets, and
+ * the tally of what the ring took, which is what reached the stand-in
+ * and what another writer added. */
+int gfio_rd_bin (const char *attr, void *buf, size_t len)
+{
+    unsigned char *p = buf;
+    if(strcmp(attr, "cnc/position") || pos_fail || len < 32)
+        return -1;
+    ring_drain();
+    uint32_t took = ring_took + k_foreign;
+    memset(p, 0, 32);
+    for(int i = 0; i < 4; i++) {
+        p[12 + i] = (unsigned char)(k_processed >> (8 * i));
+        p[16 + i] = (unsigned char)(took >> (8 * i));
+    }
+    return 32;
 }
 
 void gfio_set_hw (bool active) { (void)active; }
@@ -225,10 +270,63 @@ static void reset_state (void)
     on_state_read = NULL;
     gf.run_pending = gf.kernel_running = gf.clear_pending = false;
     gf.streaming = false;
+    gf.hold_pending = false;
     gf.power_sent = false;
+    gf.last_lit = false;
+    gf.want_fire = false;
     gf.dith_left = 0;
+    gf.written = gf.run_base = 0;
+    k_processed = k_foreign = 0;
+    pos_fail = false;
     latch_locked_by_us = true;
     latch_fail_reported = false;
+}
+
+/* The ring stand-in: a pipe whose write end is the pulse device, so what
+ * the ring took is what reached it, counted apart from the engine. */
+static void ring_open (void)
+{
+    int p[2];
+    if(pipe(p) != 0 || fcntl(p[0], F_SETFL, O_NONBLOCK) != 0) {
+        printf("FAIL: cannot open the ring stand-in\n");
+        exit(1);
+    }
+    ring_rd = p[0];
+    gf.fd = p[1];
+    ring_took = 0;
+    ring_tail[0] = ring_tail[1] = 0;
+    gf.rate = 1000;
+    gf.depth = 100;
+}
+
+static void ring_close (void)
+{
+    close(ring_rd);
+    close(gf.fd);
+    ring_rd = gf.fd = -1;
+    gf.shipped = gf.produced = 0;
+}
+
+static uint32_t ring_total (void)
+{
+    ring_drain();
+    return ring_took;
+}
+
+/* A stream that starts its run at an idle kernel and ends lit: the
+ * preload, a stretch that the wakeup's re-asserted fire lights, and the
+ * dark pad that the end writes behind it. The kernel then plays all but
+ * `unplayed` of what the ring took. The caller opens the window and the
+ * gate and asks for fire. */
+static void stream_ended (uint32_t unplayed)
+{
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    gf.ship_t0 -= 0.05;                 /* 50 more ticks are due */
+    ship_pass();                        /* lit from the wakeup's base on */
+    gf_stream_go_idle();
+    ship_pass();                        /* the end: a dark pad behind the lit tick */
+    k_processed = ring_total() - unplayed;
 }
 
 int main (void)
@@ -457,58 +555,14 @@ int main (void)
     CHECK(count_write("cnc/run=1") == 0, "and asks the kernel for no run over what the ring still holds");
     atomic_store(&laser_armed, false);
 
-    /* The drop alone holds the rule for a request left over from an
-     * ended stream: the lock at the job's end fails after its retries
-     * while the kernel drains, and its idle asks for no run either. */
-    reset_state();
-    gf.run_pending = true;
-    latch_locked_by_us = false;
-    latch_fail_left = 1 + LATCH_RETRIES + 1;
-    (void)gf_stream_laser_latch(true);  /* a lock that fails: the stream faults */
-    (void)atomic_exchange(&fault_flag, false);   /* the hook takes the alarm */
-    rd_state = "idle";
-    CHECK(pending_pass() && !gf.run_pending && count_write("cnc/run=1") == 0,
-          "a failed stream's request left over from an ended stream asks for no run either");
-
-    /* A request left over from a stream that ended, while the kernel
-     * drained its tail: the tail's end-of-data under the next stream's
-     * live flag reads as an underrun before the next bytes land. Nothing
-     * is lost, so it is the run start's case: acknowledged, the anchor
-     * dropped, the retry's empty-ring answer ending the stale request. */
-    reset_state();
-    gf.run_pending = gf.streaming = true;
-    gf.kernel_running = false;
-    rd_state = "underrun";
-    ring_empty = true;
-    CHECK(pending_pass() && !gf.failed && !atomic_load(&fault_flag),
-          "an underrun under a request left over from an ended stream is no fault");
-    CHECK(!gf.run_pending && !gf.kernel_running, "the stale request ends with the retry's answer");
-    CHECK(find_write("cnc/stop=1") == 1 && count_write("cnc/run=1") == 2,
-          "the underrun was acknowledged and the run asked for again");
-
-    /* A request left over from an ended stream that finds the ring
-     * drained: its bytes played as a continuation of the tail. Its run
-     * is over, and the branch ends it as every run end does, so the
-     * next run leads with a power byte and a fresh dither. */
-    reset_state();
-    gf.run_pending = true;
-    gf.power_sent = true;
-    gf.dith_left = 5;
-    rd_state = "idle";
-    ring_empty = true;
-    CHECK(pending_pass() && !gf.run_pending && !gf.kernel_running,
-          "a stale request refused on an empty ring ends: the bytes were played");
-    CHECK(!gf.power_sent && gf.dith_left == 0, "the next run leads with a power byte and a fresh dither");
-    CHECK(!gf.failed && !atomic_load(&fault_flag), "it is no fault");
-
-    /* A request left over from an ended stream whose bytes an idle
-     * kernel still holds: they start now. */
+    /* A request whose stream no longer owns bytes in the kernel asks for
+     * nothing, whatever the ring holds: the request dies with its
+     * stream, and nothing here starts a run. */
     reset_state();
     gf.run_pending = true;
     rd_state = "idle";
-    CHECK(pending_pass() && !gf.run_pending && gf.kernel_running && find_write("cnc/run=1") == 0,
-          "a stale request starts what an idle kernel still holds");
-    CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing");
+    CHECK(pending_pass() && wr_n == 0 && !gf.run_pending && !gf.failed && !atomic_load(&fault_flag),
+          "a request whose stream no longer owns the kernel is dropped and asks for nothing");
 
     /* A kernel stopped under a live stream's pending request: another
      * writer's stop (the cooling engine's safing stop) ramps to idle
@@ -534,6 +588,110 @@ int main (void)
     rd_state = "running";
     CHECK(pending_pass() && gf.run_pending && gf.kernel_running && wr_n == 0,
           "a kernel still playing keeps the request pending and is asked nothing");
+
+    printf("the run gate:\n");
+
+    /* A run starts over exactly the bytes that the stream wrote for it:
+     * the ring holds nothing older, the dark pad behind a lit end
+     * included, and the kernel has played none of the stream's. */
+    reset_state();
+    ring_open();
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf.want_fire = true;
+    gf.want_power = 100;
+    stream_ended(0);
+    CHECK(count_write("cnc/run=1") == 1 && (ring_tail[0] & 0x10) && ring_tail[1] == 0x00 && !gf.failed,
+          "a run start at an idle kernel with an empty ring starts, and its lit end gets a dark pad");
+    gf_stream_wakeup();
+    ship_pass();
+    CHECK(count_write("cnc/run=1") == 2 && gf.kernel_running && !gf.failed && !atomic_load(&fault_flag),
+          "the next run start over exactly its own bytes starts: the dark pad is counted");
+    ring_close();
+
+    /* A stop another writer made after the previous stream ended leaves
+     * the rest of that stream in the ring. The next run start asks for no
+     * run over it and does not relight a lock that this process wrote:
+     * the stream faults, and the reset clears the ring. */
+    const char *stopped[] = { "idle", "disabled" };
+    for(int i = 0; i < 2; i++) {
+        reset_state();
+        ring_open();
+        atomic_store(&laser_armed, true);
+        atomic_store(&fire_gate, true);
+        gf.want_fire = true;
+        gf.want_power = 100;
+        stream_ended(50);
+        latch_locked_by_us = true;      /* a lock this process wrote inside the window */
+        rd_state = stopped[i];
+        int latches = latch_writes();
+        gf_stream_wakeup();
+        ship_pass();
+        CHECK(gf.failed && atomic_exchange(&fault_flag, false) && count_write("cnc/run=1") == 1 &&
+              latch_writes() == latches,
+              i == 0 ? "a run start over a stop's residue faults the stream, with no run and no relight"
+                     : "and the same at a disabled kernel");
+        ring_close();
+    }
+
+    /* A count or a state that cannot be read, and bytes another writer
+     * added, refuse the run too. */
+    for(int i = 0; i < 3; i++) {
+        reset_state();
+        ring_open();
+        if(i == 0)
+            pos_fail = true;
+        else if(i == 1)
+            state_fail_at = 1;
+        else
+            k_foreign = 7;
+        gf_stream_wakeup();
+        ship_pass();
+        CHECK(gf.failed && atomic_exchange(&fault_flag, false) && count_write("cnc/run=1") == 0,
+              i == 0 ? "a run start whose byte counts cannot be read faults the stream, with no run"
+              : i == 1 ? "a run start whose kernel state cannot be read faults the stream, with no run"
+                       : "a run start over bytes another writer added faults the stream, with no run");
+        ring_close();
+    }
+
+    /* An underrun at a run start is the retry's to answer: the previous
+     * stream's tail ran out under this stream's live flag. */
+    reset_state();
+    ring_open();
+    rd_state = "underrun";
+    gf_stream_wakeup();
+    ship_pass();
+    CHECK(count_write("cnc/run=1") == 2 && find_write("cnc/stop=1") >= 0 && !gf.failed &&
+          !atomic_load(&fault_flag), "an underrun at a run start goes to the retry, which starts the run");
+    ring_close();
+
+    /* A stop another writer made under a live stream, whose ramp ends
+     * after the stream's end. The stream's run start met the kernel still
+     * playing, so it asked for no run, and its request waited. The stream
+     * ends inside the ramp, and its request with it. The ramp ends short,
+     * with the residue in the ring, and nothing starts it; the next run
+     * start finds it. */
+    reset_state();
+    ring_open();
+    rd_state = "running";               /* the kernel plays the previous tail */
+    gf_stream_wakeup();
+    ship_pass();
+    CHECK(count_write("cnc/run=1") == 0 && gf.run_pending && gf.kernel_running && !gf.failed,
+          "a run start at a kernel that plays asks for no run, and its request waits");
+    gf_stream_go_idle();                /* the stop ramps: the kernel still reads running */
+    ship_pass();
+    CHECK(!gf.run_pending && !gf.kernel_running && find_write("cnc/streaming=0") >= 0,
+          "the stream's end ends its request");
+    rd_state = "idle";                  /* the ramp ends short of the stream's end */
+    k_processed = ring_total() - 40;
+    ship_pass();
+    CHECK(count_write("cnc/run=1") == 0 && !gf.failed && !atomic_load(&fault_flag),
+          "the ramp's idle starts no run over the stop's residue");
+    gf_stream_wakeup();
+    ship_pass();
+    CHECK(gf.failed && atomic_exchange(&fault_flag, false) && count_write("cnc/run=1") == 0,
+          "and the next run start finds the residue: the stream faults, with no run");
+    ring_close();
 
     printf("the mid-run check:\n");
 
@@ -612,7 +770,8 @@ int main (void)
     printf(failures ? "FAIL: %d check(s) failed\n"
                     : "PASS: the latch writer retries, faults a lost lock, never re-opens a "
                       "latch it did not lock, and relights only its own lock under an open gate; "
-                      "a run request takes the retry's answer, a kernel that stops under a "
+                      "a run starts only over the stream's own bytes, a run request takes the "
+                      "retry's answer and dies with its stream, a kernel that stops under a "
                       "live stream faults it, a failed stream asks for no run, and a stream "
                       "fault alarms once\n",
            failures);

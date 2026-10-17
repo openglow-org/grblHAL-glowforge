@@ -223,12 +223,15 @@ static struct {
     uint64_t base;            /* stream index of the current wakeup's epoch */
     bool streaming;           /* motion in progress (wake_up .. go_idle) */
     bool kernel_running;      /* we believe a kernel run is active */
-    bool run_pending;         /* bytes shipped, run refused (kernel busy):
-                                 re-issue once the kernel is idle */
+    bool run_pending;         /* bytes shipped while the kernel played: the
+                                 run request waits, and dies with the stream */
     bool clear_pending;       /* a reset stopped the kernel mid-motion: drop
                                  its unplayed residue once it is idle */
     bool hold_pending;        /* drop to hold currents once kernel idles */
     double hold_poll_at;      /* wall time of the next kernel-state poll */
+    uint32_t written;         /* bytes the ring took since its last seek-clear,
+                                 mod 2^32, as the kernel's processed count wraps */
+    uint32_t run_base;        /* written as of the current run's first byte */
     _Atomic bool failed;      /* unrecoverable; stop feeding (read lock-free
                                  by the entry points; written under gf.lock) */
     double ship_t0;           /* wall time when shipping started */
@@ -980,12 +983,12 @@ static void *producer_thread (void *arg)
 /* --- shipper thread ------------------------------------------------------ */
 
 /* Ship due bytes. Returns with gf.lock released. */
-/* Start a kernel run on the bytes shipped so far. Returns 1 when the run
- * is playing (or a stalled one was recovered), 0 when the kernel is busy
- * (still draining a previous stream, or decelerating from a stop) - the
- * caller keeps the request pending and re-issues it once the kernel is
- * idle - 2 when the kernel is idle with nothing queued (everything was
- * already consumed), and -1 on a fault (flagged). Called without gf.lock. */
+/* Start a kernel run on the bytes shipped so far, once run_gate has passed
+ * them. Returns 1 when the run is playing (or a stalled one was
+ * recovered), 0 when the kernel is busy (the caller keeps the request
+ * pending, and it ends with the stream), 2 when the kernel is idle with
+ * nothing queued (everything was already consumed), and -1 on a fault
+ * (flagged). Called without gf.lock. */
 static int issue_run (void)
 {
     char state[16] = "";
@@ -1046,13 +1049,10 @@ static int issue_run (void)
             rc = -1;
         } else if(strcmp(state, "running") == 0) {
             /* Busy: the kernel is still playing the previous stream's
-             * tail or decelerating from a stop. If it is still consuming
-             * the ring, the bytes just written play as a continuation;
-             * if it has already hit its end of data (or is stopping),
-             * they wait in the ring for a run that nobody would issue -
-             * and would replay at the start of the NEXT run instead.
-             * Never assume: keep the request pending and re-issue it the
-             * moment the kernel reads idle. */
+             * tail or decelerating from a stop. The request waits as the
+             * gate's does: the bytes play as a continuation, or the
+             * kernel stops running under the live stream, which faults
+             * it. */
             rc = 0;
         } else if(strcmp(state, "idle") == 0 && err == ENODATA) {
             rc = 2;                     /* nothing queued: already consumed */
@@ -1073,22 +1073,99 @@ static int issue_run (void)
     return rc;
 }
 
-/* Kernel-side follow-ups on the shipper's cadence: a run request the busy
- * kernel refused is re-issued once it is idle, and a mid-motion reset's
- * unplayed residue is dropped once the stop has played out. Both hold
- * shipping until resolved (a clear must not eat a new job's bytes). A
- * kernel that stops running under the request, while it owns bytes of
- * the live stream, faults the stream, and a failed stream's request is
- * dropped. Returns false when shipping must wait. */
+/* The kernel's byte counts, from cnc/position (bytes 12 to 19,
+ * little-endian): the bytes it has processed, a 32-bit counter that wraps
+ * as this process's own count does, and the bytes the ring took, a tally
+ * that saturates at 4 GiB. False when the record cannot be read. */
+static bool kernel_counts (uint32_t *processed, uint32_t *took)
+{
+    unsigned char pos[32];
+
+    if(gfio_rd_bin("cnc/position", pos, sizeof(pos)) < 20)
+        return false;
+    *processed = (uint32_t)pos[12] | (uint32_t)pos[13] << 8 |
+                 (uint32_t)pos[14] << 16 | (uint32_t)pos[15] << 24;
+    *took = (uint32_t)pos[16] | (uint32_t)pos[17] << 8 |
+            (uint32_t)pos[18] << 16 | (uint32_t)pos[19] << 24;
+    return true;
+}
+
+/* The gate before a stream's run request: a run starts only over the
+ * bytes that the stream wrote for it.
+ *
+ * A kernel that reads running gets no request. The bytes went in behind
+ * what it plays, and under the live flag it plays them as a continuation
+ * or it stops running, which faults the stream (pending_pass,
+ * check_kernel_state). A request made anyway can meet the kernel idle
+ * after another writer's stop, and start that stop's residue.
+ *
+ * An underrun or a fault is issue_run's to answer: an underrun drained
+ * the ring, and a fault refuses the run.
+ *
+ * Any other state can start a run, so the ring must hold exactly this
+ * run's bytes, none of them played. Between its seek-clears the ring
+ * takes only this process's bytes. So the kernel must have processed
+ * every byte that the ring took before the run's first byte and none
+ * after, and its tally must match this process's count until the tally
+ * saturates. Anything else is the residue of a stop another writer made
+ * (the cooling engine's safing stop, a halt) after the previous stream
+ * ended, motion the core counted that never played, or bytes that are
+ * not this process's. A run would replay either from a standstill at the
+ * full tick rate.
+ *
+ * Returns 1 to ask for the run, 0 when the kernel plays (the request
+ * waits), and -1 on a fault (flagged): the residue, or a state or a count
+ * that cannot be read. Called without gf.lock. */
+static int run_gate (uint32_t base, uint32_t written)
+{
+    char state[16] = "";
+    uint32_t processed = 0, took = 0;
+    char msg[192];
+
+    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+        snprintf(msg, sizeof(msg), "gfstream: the kernel state cannot be read at a run start - "
+                 "alarming, no run\n");
+    else if(strcmp(state, "running") == 0)
+        return 0;
+    else if(strcmp(state, "underrun") == 0 || strcmp(state, "fault") == 0)
+        return 1;
+    else if(!kernel_counts(&processed, &took))
+        snprintf(msg, sizeof(msg), "gfstream: the kernel byte counts cannot be read at a run "
+                 "start - alarming, no run\n");
+    else if(processed != base || (took != written && took != UINT32_MAX))
+        snprintf(msg, sizeof(msg), "gfstream: the ring holds bytes this run did not write "
+                 "(processed %u, run start %u, took %u, written %u) - alarming, no run\n",
+                 (unsigned)processed, (unsigned)base, (unsigned)took, (unsigned)written);
+    else
+        return 1;
+
+    pthread_mutex_lock(&gf.lock);
+    bool report = !atomic_exchange(&gf.failed, true);
+    pthread_mutex_unlock(&gf.lock);
+    if(report) {
+        rt_log(msg);
+        fault_flag = true;
+    }
+    return -1;
+}
+
+/* Kernel-side follow-ups on the shipper's cadence: a mid-motion reset's
+ * unplayed residue is dropped once the stop has played out, which holds
+ * shipping until it is done (a clear must not eat a new job's bytes), and
+ * a run request that met a playing kernel waits on it. The request never
+ * starts a run: its stream's bytes went in behind what the kernel played,
+ * so they play as a continuation, or the kernel stops running under them,
+ * which faults the stream. The request dies with the stream that made
+ * it: at the stream's end, with its fault, or with the reset. Returns
+ * false when shipping must wait. */
 static bool pending_pass (void)
 {
     pthread_mutex_lock(&gf.lock);
     bool clear = gf.clear_pending, run = gf.run_pending, active = gf.active;
-    bool playing = gf.kernel_running;
-    /* A failed stream asks the kernel for no run. The request goes with
-     * the fault: what the ring still holds belongs to the reset, which
-     * stops the kernel and clears it. */
-    if(run && !clear && gf.failed)
+    /* A failed stream's request goes with the fault: what the ring still
+     * holds belongs to the reset, which stops the kernel and clears it. A
+     * request whose stream no longer owns bytes in the kernel goes too. */
+    if(run && !clear && (gf.failed || !gf.kernel_running))
         gf.run_pending = run = false;
     pthread_mutex_unlock(&gf.lock);
 
@@ -1104,9 +1181,12 @@ static bool pending_pass (void)
     if(clear) {
         /* Idle after the stop: whatever the ramp did not reach is stale
          * motion (and stale fire bits) that must never replay. */
-        if(lseek(gf.fd, 1, SEEK_SET) < 0)
+        bool cleared = lseek(gf.fd, 1, SEEK_SET) >= 0;
+        if(!cleared)
             rt_log("gfstream: could not clear the kernel residue after the reset\n");
         pthread_mutex_lock(&gf.lock);
+        if(cleared)
+            gf.written = 0;              /* the clear zeroed the ring's counts */
         gf.clear_pending = false;
         gf.run_pending = false;
         gf.kernel_running = false;
@@ -1129,51 +1209,24 @@ static bool pending_pass (void)
      * stream from a standstill at the full tick rate, and the run
      * start's relight could undo a lock this process wrote. The rule is
      * check_kernel_state's: alarm; the reset acknowledges the underrun
-     * and clears the residue. A request left over from a stream that
-     * ended (the kernel was draining its tail) takes the run start's
-     * path below instead: its underrun is that tail's end-of-data under
-     * the next stream's live flag, nothing is lost, and the retry
-     * acknowledges it. */
-    if(playing) {
-        /* Re-checked under the lock: a reset that landed since the
-         * snapshot has dropped the request and owns the recovery, and a
-         * fault that landed since raised its own alarm: one per stream. */
-        pthread_mutex_lock(&gf.lock);
-        bool ours = gf.run_pending && gf.kernel_running;
-        bool report = ours && !gf.failed;
-        if(ours) {
-            gf.run_pending = false;
-            gf.failed = true;
-        }
-        pthread_mutex_unlock(&gf.lock);
-        if(report) {
-            char msg[80];
-            snprintf(msg, sizeof(msg), "gfstream: kernel %s under a pending run - alarming\n", state);
-            rt_log(msg);
-            fault_flag = true;
-        }
-        return true;
-    }
-
-    /* A request left over from a stream that ended: the bytes it
-     * shipped were consumed as a continuation of the tail (nothing
-     * left: run says no data), or they were stranded behind its end and
-     * start now. */
-    int rc = issue_run();
+     * and clears the residue. Re-checked under the lock: a reset that
+     * landed since the snapshot has dropped the request and owns the
+     * recovery, and a fault that landed since raised its own alarm: one
+     * per stream. */
     pthread_mutex_lock(&gf.lock);
-    if(rc == 1) {
-        rt_log("gfstream: deferred run started (kernel was busy at the request)\n");
+    bool ours = gf.run_pending && gf.kernel_running;
+    bool report = ours && !gf.failed;
+    if(ours) {
         gf.run_pending = false;
-        gf.kernel_running = true;
-    } else if(rc == 0) {
-        /* raced back into running: keep waiting */
-    } else {
-        gf.run_pending = false;
-        gf.kernel_running = false;
-        gf.power_sent = false;       /* the next run resets the duty */
-        dither_reset();
+        gf.failed = true;
     }
     pthread_mutex_unlock(&gf.lock);
+    if(report) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "gfstream: kernel %s under a pending run - alarming\n", state);
+        rt_log(msg);
+        fault_flag = true;
+    }
     return true;
 }
 
@@ -1181,7 +1234,8 @@ static void ship_pass (void)
 {
     static unsigned char chunk[SHIP_CHUNK];
 
-    /* A deferred run or a residue clear first; a clear holds shipping. */
+    /* A waiting run request or a residue clear first; a clear holds
+     * shipping. */
     if(!pending_pass())
         return;
 
@@ -1197,6 +1251,8 @@ static void ship_pass (void)
             if(gf.dump_fd >= 0 && write(gf.dump_fd, &dark, 1) < 0) { /* debug copy only */ }
             if(gf.active && pulse_write(gf.fd, &dark, 1) < 0)
                 rt_log("gfstream: the dark pad after the fault did not land; the end-of-data backstop covers it\n");
+            else if(gf.active)
+                gf.written++;
             gf.last_lit = false;
             gf.cur_fire = false;
         }
@@ -1243,7 +1299,8 @@ static void ship_pass (void)
                     snprintf(msg, sizeof(msg), "gfstream: the dark pad did not land (%s); the "
                              "end-of-data backstop covers it\n", strerror(errno));
                     rt_log(msg);
-                }
+                } else if(gf.active)
+                    gf.written++;
                 gf.shipped++;
                 gf.produced = gf.shipped;
                 gf.cur_fire = false;
@@ -1252,6 +1309,11 @@ static void ship_pass (void)
             if(gf.active)
                 gfio_wr_attr("cnc/streaming", "0");
             gf.kernel_running = false;   /* kernel drains the queue and idles */
+            /* The run request dies with its stream. The kernel plays the
+             * stream's bytes as a continuation of what it was playing, or
+             * a stop another writer made ends its run, whose residue the
+             * next run start's gate finds. */
+            gf.run_pending = false;
             gf.power_sent = false;       /* the next run resets the duty */
             dither_reset();
             gf.hold_pending = true;
@@ -1352,6 +1414,8 @@ static void ship_pass (void)
          * residue, run or no run yet. */
         bool first = !gf.kernel_running;
         gf.kernel_running = true;
+        if(first)
+            gf.run_base = gf.written;    /* what the ring took before this run */
         int fd = gf.fd, dump_fd = gf.dump_fd;
         bool active = gf.active;
         double run_s = wall_s() - gf.ship_t0;
@@ -1371,6 +1435,8 @@ static void ship_pass (void)
             fault_flag = true;
             break;
         }
+        if(active)
+            gf.written += n;             /* the ring took the chunk */
         if(gf.failed || gf.suspended || gf.clear_pending)
             break;                      /* a fault or a reset landed under the write */
         if(first)
@@ -1378,14 +1444,18 @@ static void ship_pass (void)
         streaming = gf.streaming;
     }
 
+    uint32_t base = gf.run_base, written = gf.written;
     pthread_mutex_unlock(&gf.lock);
 
     if(start_run && gf.active && !gf.failed) {
-        int rc = issue_run();
+        int rc = run_gate(base, written);
+        if(rc > 0)
+            rc = issue_run();
         if(rc == 0) {
-            /* Busy kernel: keep the request pending (pending_pass re-issues
-             * it once the kernel is idle). kernel_running stays set: the
-             * shipped bytes are the kernel's now, one way or the other. */
+            /* The kernel plays: the stream's bytes went in behind what it
+             * plays, and the request waits on it (pending_pass) until the
+             * stream ends. kernel_running stays set: the shipped bytes are
+             * the kernel's now, one way or the other. */
             pthread_mutex_lock(&gf.lock);
             gf.run_pending = true;
             pthread_mutex_unlock(&gf.lock);
@@ -1416,8 +1486,9 @@ static void ship_pass (void)
  * flag turns a run out of bytes into an underrun, never into idle, so a
  * kernel that reads anything but running while it owns bytes of the
  * live stream has ended this stream's run, and what the ring still
- * holds would replay at the next run start. cnc/state is cheap to read
- * (free is the attr the UAPI forbids polling); read outside gf.lock.
+ * holds is motion the core counted that never played. cnc/state is
+ * cheap to read (free is the attr the UAPI forbids polling); read
+ * outside gf.lock.
  * driver.c turns the fault flag into disarm + anchor invalidation +
  * alarm on the protocol thread. */
 static void check_kernel_state (void)
@@ -1711,6 +1782,9 @@ bool gf_stream_resume (void)
     pthread_mutex_lock(&gf.lock);
     gf.fd = fd;
     gf.produced = gf.shipped = 0;
+    /* The clear above zeroed the ring's counts. A clear that did not take
+     * shows at the next run start's gate. */
+    gf.written = 0;
     gf.streaming = false;
     gf.kernel_running = false;
     gf.hold_pending = false;
