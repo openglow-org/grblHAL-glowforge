@@ -237,8 +237,9 @@ static struct {
     uint32_t written;         /* bytes the ring took since its last seek-clear,
                                  mod 2^32, as the kernel's processed count wraps */
     uint32_t run_base;        /* written as of the current run's first byte */
-    bool killed;              /* a reset ended the live stream: the core went
-                                 idle under the reset (gf_stream_go_idle) */
+    bool killed;              /* a reset during motion: the core went idle
+                                 under the reset (gf_stream_go_idle) with the
+                                 stream live or just ended by its own idle */
     unsigned char kill_step;  /* the step the core counted at that idle and
                                  never output, as a pulse byte */
     /* The position read-back. steps counts the X, Y and Z steps of every
@@ -891,16 +892,26 @@ void gf_stream_go_idle (bool reset, uint8_t step_bits, uint8_t dir_bits)
     armed = false;
 
     pthread_mutex_lock(&gf.lock);
-    if(gf.streaming) {
-        /* Under a reset the core declares the motion lost and goes idle
-         * with no deceleration of its own: the reset that follows stops
-         * the kernel with its ramp (gf_stream_reset). The step the core
-         * counted for the pulse start it never makes is never played:
-         * the reset owes it back with the backlog. */
-        if(reset) {
-            gf.killed = true;
+    /* Under a reset the core declares the motion lost and goes idle with
+     * no deceleration of its own: the reset that follows stops the kernel
+     * with its ramp and reads the position back (gf_stream_reset). That
+     * holds as well when the core's own end-of-buffer idle has ended the
+     * stream just before: mc_reset can run before the protocol thread
+     * takes the cycle complete, so the core still counts a reset during
+     * motion, and the kernel can still be playing the stream's tail. A
+     * live stream owes the step the core counted for the pulse start it
+     * never makes: the reset owes it back with the backlog. A stream that
+     * has already ended owes none, since the callback that ended it
+     * output its step, and a mark made while it was live keeps its step.
+     * A device handed to another process is not the engine's to stop. */
+    if(reset && (gf.streaming || !gf.suspended)) {
+        if(gf.streaming)
             gf.kill_step = pulse_byte(step_bits, dir_bits);
-        }
+        else if(!gf.killed)
+            gf.kill_step = 0;
+        gf.killed = true;
+    }
+    if(gf.streaming) {
         /* The cycle's laser-off must be recorded HERE: the core issues
          * its spindle-off update after st_go_idle (and only for dynamic
          * blocks), when this stream no longer accepts transitions - so
@@ -1699,9 +1710,10 @@ void gf_stream_reset (void)
     /* Soft reset. Two cases:
      * - the reset ends a live stream. The core went idle under the reset
      *   (gf_stream_go_idle with the reset set, as mc_reset does for every
-     *   reset during motion), or the stream is still live. The core
-     *   produces no deceleration of its own, so the unshipped backlog
-     *   drops and the KERNEL decelerates (cnc/stop ramps down at
+     *   reset during motion, also right after the core's own idle ended
+     *   the stream), or the stream is still live. The core produces no
+     *   deceleration of its own, so the unshipped backlog drops and the
+     *   KERNEL decelerates (cnc/stop ramps down at
      *   ramp_rate): nothing slams mechanically. The shipped bytes that the
      *   ramp does not reach stay in the kernel ring and would replay at the
      *   start of the NEXT run, stale motion in an old direction: they are
@@ -1718,10 +1730,12 @@ void gf_stream_reset (void)
      *   stream still live with no idle under the reset gets the stop only
      *   while its run is the kernel's, and no read-back: its producer can
      *   still be armed.
-     * - the stream ended before the reset, and the kernel only drains its
-     *   completed queue: leave it. That queue is the tail of motion the
-     *   core has counted, and the shipper's end-of-stream logic finishes
-     *   as it always does.
+     * - the stream ended before the reset and no idle under the reset
+     *   marked it (the core goes idle under a reset only in a motion
+     *   state, and a device handed to another process takes no mark), and
+     *   the kernel only drains its completed queue: leave it. That queue
+     *   is the tail of motion the core has counted, and the shipper's
+     *   end-of-stream logic finishes as it always does.
      * A stream fault (an underrun, a kernel fault, a refused run, a write
      * error, a ring overflow) ended the run and alarmed the core. The reset
      * is the operator's acknowledgment of the alarm: stop and re-arm the
@@ -1865,8 +1879,15 @@ static void rebase_at_takeover (bool emptied)
 
 bool gf_stream_suspend (void)
 {
-    if(!gf.active)
+    if(!gf.active) {
+        /* The null sink has no device to hand over, and records the
+         * handover all the same: a reset during the session finds the
+         * device another process's, as it does on the machine. */
+        pthread_mutex_lock(&gf.lock);
+        gf.suspended = true;
+        pthread_mutex_unlock(&gf.lock);
         return true;
+    }
 
     bool idle, drop_hold = false, closed = false;
 
@@ -1952,8 +1973,12 @@ static bool apply_tick (void)
 
 bool gf_stream_resume (void)
 {
-    if(!gf.active)
+    if(!gf.active) {
+        pthread_mutex_lock(&gf.lock);
+        gf.suspended = false;
+        pthread_mutex_unlock(&gf.lock);
         return true;
+    }
 
     int fd;
     if(gfio_pulse_inherited()) {

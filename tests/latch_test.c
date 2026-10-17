@@ -78,7 +78,11 @@
     under the reset, the shipper can pass, then the reset): the kernel
     gets its stop and the residue its clear, whether or not the stream's
     run is still the kernel's, the backlog drops, and a stream behind a
-    lit byte still ends dark; once the ramp has ended, the core is owed
+    lit byte still ends dark; a reset that lands after the core's own
+    idle ended the stream, before the cycle complete, gets the same stop,
+    clear and read-back, and a reset while the device is handed over
+    gets neither, and a second idle under the reset keeps the step the
+    first one marked; once the ramp has ended, the core is owed
     the steps that never played (the step it counted for a pulse start
     the reset stopped, the backlog, and the residue from the kernel's
     step counters), and a count that cannot be read, or a counter zero
@@ -864,6 +868,38 @@ int main (void)
           "a stream that ended between the core's idle and the reset still gets the stop and the clear");
     ring_close();
 
+    /* The core's own end-of-buffer idle ends the stream, and a reset
+     * lands before the protocol thread takes the cycle complete: mc_reset
+     * still counts it as a reset during motion and goes idle under it,
+     * while the kernel plays the stream's tail. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    rd_state = "running";
+    gf_stream_go_idle(false, 0, 0);     /* the core's own idle: the buffer ran dry */
+    ship_pass();                        /* the stream's end */
+    gf_stream_go_idle(true, 0, 0);      /* mc_reset's st_go_idle, under the reset */
+    before = wr_n;
+    gf_stream_reset();
+    CHECK(count_write_from("cnc/stop=1", before) == 1 && gf.clear_pending &&
+          gf.readback == RB_WAIT,
+          "a reset that lands after the core's own idle ended the stream gets the stop, the clear "
+          "and the read-back");
+    ring_close();
+
+    /* A reset during the web-service homing session: the device is the
+     * session's, so the core's idle under the reset marks nothing. */
+    reset_state();
+    gf.suspended = true;
+    gf_stream_go_idle(true, 0, 0);
+    before = wr_n;
+    gf_stream_reset();
+    CHECK(count_write_from("cnc/stop=1", before) == 0 && !gf.clear_pending &&
+          gf.readback == RB_NONE,
+          "a reset while the device is handed over writes no stop and owes no read-back");
+    gf.suspended = false;
+
     /* The read-back. The stream shipped 10 steps of +X, 5 of -Y and 3 of
      * +Z, and the backlog held 4 steps of -X. The core counted all of
      * them, and one more step of +Z for the pulse start that the reset
@@ -983,6 +1019,23 @@ int main (void)
     rb = gf_stream_readback(owed, 0);
     CHECK(rb == 1 && owed[0] == 2 && owed[1] == 0 && owed[2] == 0,
           "and the core is owed the backlog alone");
+    gf.shipped = gf.produced = 0;
+
+    /* Two idles under one reset: the first, with the stream live, marks
+     * the step the core never sent, and the second, with the stream
+     * ended, keeps it. */
+    reset_state();
+    gf.active = false;
+    gf.fd = -1;
+    gf.rate = 1000;
+    gf.depth = 100;
+    gf_stream_wakeup();
+    gf_stream_go_idle(true, 0x01, 0x00);
+    gf_stream_go_idle(true, 0, 0);
+    gf_stream_reset();
+    rb = pending_pass() ? gf_stream_readback(owed, 0) : 0;
+    CHECK(rb == 1 && owed[0] == 1 && owed[1] == 0 && owed[2] == 0,
+          "a second idle under the reset keeps the step the first one marked");
     gf.shipped = gf.produced = 0;
 
     printf("the sideband:\n");
