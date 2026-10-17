@@ -1390,13 +1390,20 @@ static void ship_pass (void)
             gf.run_pending = true;
             pthread_mutex_unlock(&gf.lock);
         } else if(rc == 2) {
-            /* Idle with nothing queued right after a write: the ring was
-             * cleared under us; the stream restarts on the next ship. */
+            /* Idle with nothing queued right after a write: the bytes
+             * just shipped are no longer in the kernel. It played them
+             * as a continuation of the previous tail and ran out (the
+             * underrun the retry acknowledged is then this stream's), or
+             * the ring was cleared under us. The motion the core counted
+             * no longer matches the machine: a fault, as an underrun
+             * under a live stream is. The reset clears what is left. */
             pthread_mutex_lock(&gf.lock);
-            gf.kernel_running = false;
-            gf.power_sent = false;
-            dither_reset();
+            bool report = !atomic_exchange(&gf.failed, true);
             pthread_mutex_unlock(&gf.lock);
+            if(report) {
+                rt_log("gfstream: the run start found the stream's bytes gone - alarming\n");
+                fault_flag = true;
+            }
         }
     }
 }

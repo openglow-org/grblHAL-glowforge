@@ -40,8 +40,10 @@
     the armed window is acknowledged and the run asked for again, once,
     and the answer to that second request is the answer, read with the
     state after it: a retry refused on an empty ring reports nothing
-    queued, never a run in flight, and an underrun that outlasts its
-    acknowledgment, or a state that cannot be read, is a fault;
+    queued, never a run in flight, and at a stream's own run start,
+    right after its first write, that answer faults the stream; an
+    underrun that outlasts its acknowledgment, or a state that cannot be
+    read, is a fault;
   - a run refused at idle other than on an empty ring faults the stream,
     and the reset clears the ring;
   - the deferred run and what ends it: a request the busy kernel refused
@@ -329,7 +331,34 @@ int main (void)
     rd_state = "underrun";
     ring_empty = true;
     CHECK(issue_run() == 2, "a retry refused on an empty ring reports nothing queued, not a run in flight");
-    CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing: the next ship restarts the stream");
+    CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing itself: its caller reads the answer");
+
+    /* That answer at a stream's own run start, right after its first
+     * write: the bytes just shipped are no longer in the kernel (played
+     * as a continuation and run out, or cleared under the stream), so
+     * the motion the core counted no longer matches the machine. A
+     * fault; the stream ships and asks for nothing more until the
+     * reset. */
+    reset_state();
+    int sink = open("/dev/null", O_WRONLY);
+    gf.fd = sink;
+    gf.rate = 1000;
+    gf.depth = 100;
+    gf_stream_wakeup();                 /* the live flag and one depth of pad slots */
+    rd_state = "underrun";
+    ring_empty = true;
+    ship_pass();
+    CHECK(gf.shipped >= gf.depth && gf.failed && atomic_exchange(&fault_flag, false),
+          "a stream's run start whose retry finds the ring empty faults the stream");
+    uint64_t at = gf.shipped;
+    gf.produced = at + gf.depth + 30;   /* the producer goes on */
+    ring_empty = false;
+    ship_pass();
+    CHECK(gf.shipped == at && count_write("cnc/run=1") == 2,
+          "and the stream ships and asks for nothing more until the reset");
+    close(sink);
+    gf.fd = -1;
+    gf.shipped = gf.produced = 0;
 
     /* The run is asked for again once, never more: an underrun that
      * outlasts its acknowledgment (the stop write does not take) meets
