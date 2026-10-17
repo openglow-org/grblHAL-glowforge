@@ -1,7 +1,7 @@
 /*
   serial_test.c - host unit test for the Grbl stream: the RX ring under a
   sender that ignores flow control, the welcome banner on a connect, the
-  TX ring's stall bound, and the -b listen address
+  TX ring's stall bound, the -b listen address, and the start notice
 
   grblHAL is free software: you can redistribute it and/or modify it
   under the terms of the GNU General Public License as published by the
@@ -43,14 +43,19 @@
   is refused, as is a short dotted form: an IPv4 literal is the dotted
   quad (main.c exits on the refusal).
 
-  The start notice's list (ENV_OVERRIDES in src/main.c), held to the
-  sources: every getenv in the .c and .h files of src/ names its
-  variable, the notice's own loop aside, and the list names each
-  variable the sources read, once, but the three the supervisor sets on
-  every spawn. The test reads the sources from DRIVER_SRC, which
+  The start notice (src/main.c): the test runs the controller's entry
+  point with its callees stubbed. The controller logs one notice that
+  names the overrides that are set, in the list's order, names only, and
+  no notice when none is set. The notice's list (ENV_OVERRIDES) is held
+  to the sources: every getenv in the .c and .h files of src/ names its
+  variable, with or without white space before its parenthesis
+  (secure_getenv too), the notice's own loop aside, and the list names
+  each variable the sources read, once, but the three the supervisor
+  sets on every spawn. The test reads the sources from DRIVER_SRC, which
   CMakeLists.txt sets.
 */
 #include <dirent.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -329,6 +334,37 @@ static char *env_slurp(const char *path)
     return text;
 }
 
+/* --- the controller's entry point, for its start notice --------------
+   main.c runs with its callees stubbed: the settings file, the platform
+   and the core do nothing, and fflog keeps the notice lines it is given,
+   so the test reads what the controller logs as it starts. */
+#define NOTICE "environment overrides in force:"
+static char notice[512];
+static int notices;
+
+void fflog_init(const char *ident) { (void)ident; }
+void fflog(int prio, const char *fmt, ...)
+{
+    char line[512];
+    va_list ap;
+    (void)prio;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if(!strncmp(line, NOTICE, strlen(NOTICE))) {
+        notices++;
+        snprintf(notice, sizeof(notice), "%s", line);
+    }
+}
+bool set_eeprom_name(const char *name) { (void)name; return true; }
+void eeprom_close(void) {}
+void platform_init(void) {}
+int grbl_enter(void) { return 0; }
+
+#define main controller_main
+#include "../src/main.c"
+#undef main
+
 int main(void)
 {
     static char got[200][32];
@@ -581,9 +617,14 @@ int main(void)
             snprintf(path, sizeof(path), "%s/%s", DRIVER_SRC, e->d_name);
             char *text = env_slurp(path);
             files += text != NULL;
-            for(const char *p = text; p && (p = strstr(p, "getenv(")) != NULL; ) {
+            for(const char *p = text; p && (p = strstr(p, "getenv")) != NULL; ) {
                 env_name_t name;
-                p += strlen("getenv(");
+                p += strlen("getenv");
+                p += strspn(p, " \t\r\n");
+                if(*p != '(')
+                    continue;                   /* the word in a comment, not a call */
+                p++;
+                p += strspn(p, " \t\r\n");
                 if(env_quoted(p, name, sizeof(name))) {
                     if(!env_has(reads, n_reads, name) && n_reads < ENV_NAMES)
                         strcpy(reads[n_reads++], name);
@@ -625,6 +666,28 @@ int main(void)
         CHECK(unnamed == 0, "every getenv in the sources names its variable");
         CHECK(differ == 0,
               "the list names every variable the sources read, once, but the supervisor's three");
+    }
+
+    /* --- the start notice ------------------------------------------------ */
+    printf("The start notice names the overrides in force, names only:\n");
+    {
+        char prog[] = "grblHAL_glowforge";
+        char *args[] = { prog, NULL };
+        for(size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++)
+            unsetenv(ENV_OVERRIDES[i]);
+        setenv("FFLOG_CONF", "/nonexistent/forgefirm.conf", 1);    /* the list's first */
+        setenv("GFSINK_LEAD_MS", "5", 1);
+        setenv("GF_VERDICT_FILE", "/nonexistent/verdict.json", 1); /* and its last */
+        notices = 0;
+        controller_main(1, args);
+        CHECK(notices == 1 &&
+              !strcmp(notice, NOTICE " FFLOG_CONF GFSINK_LEAD_MS GF_VERDICT_FILE"),
+              "the controller logs one notice naming the overrides that are set, and no value");
+        for(size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++)
+            unsetenv(ENV_OVERRIDES[i]);
+        notices = 0;
+        controller_main(1, args);
+        CHECK(notices == 0, "with none set, it logs no notice");
     }
 
     printf(failures ? "FAIL: %d check(s) failed\n"
