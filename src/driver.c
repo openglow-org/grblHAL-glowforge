@@ -170,13 +170,20 @@ static void stepperGoIdle (bool clear_signals)
      * motion: the stream that ends here is then the reset's, and the
      * reset stops the kernel with its ramp. The core counts a step in
      * sys.position one interrupt callback before the pulse start that
-     * outputs it (step_out, while a block executes), and under the reset
-     * that callback never runs, so the step goes to the engine to be
-     * owed back. Read under the core lock: no callback is in flight. */
+     * outputs it (step_out, while a block executes). The step is owed
+     * only when this idle lands between callbacks, as mc_reset's does:
+     * under the reset the callback that would output it never runs, so
+     * it goes to the engine to be owed back. Between callbacks a block
+     * that executes always has its segment, so exec_segment marks that
+     * case. The callback's own end-of-buffer idle runs inside the
+     * callback, after its pulse start has output step_out and after it
+     * cleared exec_segment: that step played, and nothing is owed. Read
+     * under the core lock, which the producer holds across every
+     * callback. */
     gf_core_lock();
     bool reset = bit_istrue(sys.rt_exec_state, EXEC_RESET);
     uint8_t steps = 0, dirs = 0;
-    if(reset && core_stepper && core_stepper->exec_block) {
+    if(reset && core_stepper && core_stepper->exec_block && core_stepper->exec_segment) {
         steps = (uint8_t)core_stepper->step_out.bits;
         dirs = (uint8_t)core_stepper->dir_out.bits;
     }
