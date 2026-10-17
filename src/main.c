@@ -12,7 +12,9 @@
   parsed by bind_addr.c), -e <file> (the settings file). The listener is
   one dual-stack socket, so an IPv4 literal binds in its v4-mapped form.
   print_usage() names the environment variables. The start notice names
-  every variable of the list in ENV_OVERRIDES that is set.
+  every variable of the list in ENV_OVERRIDES that is set, and every test
+  hook of TEST_HOOKS that is set in a null-sink run, where the controller
+  honors it.
 
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -31,6 +33,7 @@
 #include "bind_addr.h"
 #include "driver.h"
 #include "eeprom.h"
+#include "glowforge_io.h"
 #include "platform.h"
 #include "serial.h"
 
@@ -72,6 +75,7 @@ static void print_usage (const char *badarg)
       "    GFSINK_RATE      : machine tick Hz override (default: the XY microstep mode's, 28160 at\n"
       "                       x8, 56320 at x16, 112640 at x32; xy_microsteps in the config file).\n"
       "    GFSINK_DEPTH_MS  : stream queue depth = feed-hold latency (default 200).\n"
+      "    GFSINK_LEAD_MS   : producer lead over the ship cursor (2-10, default 10).\n"
       "    GFSINK_DUMP      : mirror the shipped pulse stream to this file (debug).\n"
       "    GFSINK_ATTR_LOG  : null-sink only: log the sysfs writes the hardware would get.\n"
       "    GFHOME_CONF      : homing config file (default /data/forgefirm/forgefirm.conf).\n"
@@ -80,9 +84,9 @@ static void print_usage (const char *badarg)
       "    FFLOG_STDERR     : 1 = echo log lines to stderr (automatic on a terminal).\n"
       "    GF_PULSE_FD      : an inherited pulse-device fd (set by the forgectrl broker).\n"
       "    FORGECTRL_PORT   : the cooling engine's HTTP port (default 80).\n"
-      "  Test hooks (host builds): GFSINK_LEAD_MS, GF_SWITCH_FILE, GF_VERDICT_FILE,\n"
-      "  GF_STATE_DIR, and the config keys laser_power_model, laser_floor_analog,\n"
-      "  gfcloud_home_cmd (honored only without GFSINK).\n"
+      "  Test hooks, honored only without GFSINK (a null-sink run): GF_SWITCH_FILE,\n"
+      "  GF_VERDICT_FILE, GF_STATE_DIR (default /run/forgefirm), and the config keys\n"
+      "  laser_power_model, laser_floor_analog, gfcloud_home_cmd.\n"
       "\n"
       "  ^F shuts down cleanly once motion is done; SIGINT/SIGTERM stop motion\n"
       "  (controlled deceleration, laser latch relocked) and then exit.\n"
@@ -107,33 +111,50 @@ static void print_version (void)
 
 /* Every environment variable the controller reads, in one place, but the
  * three the supervisor sets on every spawn (GFSINK, GF_PULSE_FD and
- * GF_REPORT_SECRET): the start notice names the ones that are set (names
- * only), and serial_test holds this list to the sources. They are the
- * stream's bench and harness knobs, the log's, the cooling client's port,
- * and the paths a host test moves; nothing on a machine sets one. */
+ * GF_REPORT_SECRET) and the test hooks below: the start notice names the
+ * ones that are set (names only), and serial_test holds this list to the
+ * sources. They are the stream's bench and harness knobs, the log's, the
+ * cooling client's port, and the paths a host test moves; nothing on a
+ * machine sets one. */
 static const char *const ENV_OVERRIDES[] = {
     "FFLOG_CONF", "FFLOG_LEVEL", "FFLOG_SOCK", "FFLOG_STDERR", "FORGECTRL_PORT",
     "GFHOME_CONF", "GFSINK_ATTR_LOG", "GFSINK_DEPTH_MS", "GFSINK_DUMP",
     "GFSINK_LATCH_LOG", "GFSINK_LEAD_MS", "GFSINK_RATE", "GFSINK_STALL_MS",
-    "GFSINK_WRITE_STALL_MS", "GF_STATE_DIR", "GF_SWITCH_DEV", "GF_SWITCH_FILE",
-    "GF_VERDICT_FILE",
+    "GFSINK_WRITE_STALL_MS", "GF_SWITCH_DEV",
 };
 
-/* One line at start naming the overrides that are set, names only, never
- * a value: once the options are parsed, before any thread starts. Silent
- * when none is set. */
+/* The test hooks, which the sources read only through gfio_test_hook. The
+ * controller honors them only in a null-sink run, so the start notice
+ * names the ones that are set there, and none with GFSINK set.
+ * serial_test holds this list to the sources too. */
+static const char *const TEST_HOOKS[] = {
+    "GF_STATE_DIR", "GF_SWITCH_FILE", "GF_VERDICT_FILE",
+};
+
+/* Adds a name to the notice line: false when the line has no room. */
+static bool notice_add (char *line, size_t len, size_t *off, const char *name)
+{
+    int n = snprintf(line + *off, len - *off, "%s%s", *off ? " " : "", name);
+    if(n < 0 || (size_t)n >= len - *off)
+        return false;
+    *off += (size_t)n;
+    return true;
+}
+
+/* One line at start naming the overrides in force, names only, never a
+ * value: once the options are parsed, before any thread starts. Silent
+ * when none is in force. */
 static void say_env_overrides (void)
 {
     char line[512];
     size_t off = 0;
-    for(size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++) {
-        if(!getenv(ENV_OVERRIDES[i]))
-            continue;
-        int n = snprintf(line + off, sizeof(line) - off, "%s%s", off ? " " : "", ENV_OVERRIDES[i]);
-        if(n < 0 || (size_t)n >= sizeof(line) - off)
-            break;
-        off += (size_t)n;
-    }
+    bool room = true;
+    for(size_t i = 0; room && i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++)
+        if(getenv(ENV_OVERRIDES[i]))
+            room = notice_add(line, sizeof(line), &off, ENV_OVERRIDES[i]);
+    for(size_t i = 0; room && i < sizeof(TEST_HOOKS) / sizeof(*TEST_HOOKS); i++)
+        if(gfio_test_hook(TEST_HOOKS[i]))
+            room = notice_add(line, sizeof(line), &off, TEST_HOOKS[i]);
     if(off)
         fflog(LOG_NOTICE, "environment overrides in force: %s", line);
 }

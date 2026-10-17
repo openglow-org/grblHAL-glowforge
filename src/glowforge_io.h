@@ -15,6 +15,19 @@
 
 #include "grbl/settings.h"
 
+// The test hooks: GF_SWITCH_FILE moves the switch source, GF_VERDICT_FILE
+// the cooling verdict file and GF_STATE_DIR the state directory (default
+// /run/forgefirm), for a host harness or a host test. The controller honors
+// a test hook only in a null-sink run, that is with GFSINK unset or empty:
+// there this returns the variable's value. With GFSINK set it returns NULL,
+// so each reader takes its default. The sources read a test hook only
+// through this gate.
+static inline const char *gfio_test_hook (const char *hook)
+{
+    const char *sink = getenv("GFSINK");
+    return sink == NULL || *sink == '\0' ? getenv(hook) : NULL;
+}
+
 // Attribute paths are relative to /sys/glowforge/ (e.g. "cnc/state",
 // "pic/x_step_current"). All return 0 on success, -1 on failure.
 void gfio_set_hw (bool active);

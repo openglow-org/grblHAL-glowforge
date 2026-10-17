@@ -84,11 +84,12 @@
   machine's switches, and is not used: on hardware the laser arm then
   refuses, because there is no button to read.
 
-  Test hook: with GF_SWITCH_FILE set (and no device, i.e. a null-sink host
-  build), the EV_SW word is read from that file instead - an integer,
-  decimal or 0x-hex, holding the bitmask exactly as EVIOCGSW would return
-  it. The host harnesses use it to open the lid, break the interlock loop
-  and press the button against the real gating code.
+  Test hook: in a null-sink run (GFSINK unset or empty) with no switch
+  device, the EV_SW word is read from the file that GF_SWITCH_FILE names:
+  an integer, decimal or 0x-hex, that holds the bitmask exactly as
+  EVIOCGSW returns it. The host harnesses use it to open the lid, break
+  the interlock loop and press the button against the real gating code.
+  With GFSINK set the file is never a switch source.
 */
 
 #include "fflog.h"
@@ -281,7 +282,7 @@ void gfsw_init (void)
     } else
         fflog(LOG_INFO, "gfswitch: cannot open %s - no switch source", dev);
     if(sw_fd < 0) {
-        const char *p = getenv("GF_SWITCH_FILE");
+        const char *p = gfio_test_hook("GF_SWITCH_FILE");
         if(p != NULL && *p != '\0')
             fake_path = p;
     }

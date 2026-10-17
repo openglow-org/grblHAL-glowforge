@@ -73,7 +73,7 @@ static const char *marker_path (void)
 {
     static char path[160];
     if(path[0] == '\0') {
-        const char *dir = getenv("GF_STATE_DIR");
+        const char *dir = gfio_test_hook("GF_STATE_DIR");
         snprintf(path, sizeof(path), "%s/" MARKER_NAME, dir && *dir ? dir : STATE_DIR_DEFAULT);
     }
     return path;

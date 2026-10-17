@@ -16,7 +16,9 @@
   the switch source, drives it through the file-backed test source, and
   proves that a cancel waiting for the kernel to drain sends its reset
   on a poll whose switch read fails, using the stream engine's reading
-  of the kernel (idle without a device).
+  of the kernel (idle without a device). The file is a switch source
+  only in a null-sink run: with GFSINK set and no switch device, there
+  is no switch source, and the laser arm has no button to read.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -95,6 +97,16 @@ int main (void)
     write_word(path, 1u << SW_BIT_DOORS);           /* lid closed, loop closed, button up */
     setenv("GF_SWITCH_FILE", path, 1);
     hal.control.interrupt_callback = control_cb;
+
+    printf("the switch file that GF_SWITCH_FILE names, honored only in a null-sink run:\n");
+
+    /* On a machine the supervisor sets GFSINK: with no switch device the
+       file is no switch source. */
+    setenv("GFSINK", "/dev/glowforge", 1);
+    gfsw_init();
+    CHECK(!gfsw_available(), "with GFSINK set, the switch file is no switch source");
+    unsetenv("GFSINK");
+    grbl.on_state_change = NULL;                    /* the next init chains afresh */
 
     gfsw_init();
     CHECK(gfsw_available(), "the file-backed switch source is available");

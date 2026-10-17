@@ -10,7 +10,8 @@
 #pragma once
 
 // Register the settings-changed hook and resolve the publish directory
-// (GF_STATE_DIR, default /run/forgefirm). Called from driver_init().
+// (/run/forgefirm, or GF_STATE_DIR in a null-sink run). Called from
+// driver_init().
 void gfstatus_init (void);
 
 // Periodic work on the protocol thread (realtime hook): publish

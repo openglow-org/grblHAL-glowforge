@@ -563,7 +563,7 @@ unsigned ctlport_pollfds (struct pollfd *fds)
 void ctlport_init (void)
 {
     struct sockaddr_un sa = { .sun_family = AF_UNIX };
-    const char *dir = getenv("GF_STATE_DIR");
+    const char *dir = gfio_test_hook("GF_STATE_DIR");
 
     if(snprintf(sa.sun_path, sizeof(sa.sun_path), "%s/" SOCK_NAME,
                 dir && *dir ? dir : STATE_DIR_DEFAULT) >= (int)sizeof(sa.sun_path))

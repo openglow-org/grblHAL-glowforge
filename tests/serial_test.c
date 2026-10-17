@@ -45,13 +45,17 @@
 
   The start notice (src/main.c): the test runs the controller's entry
   point with its callees stubbed. The controller logs one notice that
-  names the overrides that are set, in the list's order, names only, and
-  no notice when none is set. The notice's list (ENV_OVERRIDES) is held
-  to the sources: every getenv in the .c and .h files of src/ names its
+  names the overrides in force, in the lists' order, names only, and no
+  notice when none is in force. A test hook is in force only in a
+  null-sink run: with GFSINK set the notice names none. The notice's
+  lists are held to the sources. Every getenv and every call of the
+  gate, gfio_test_hook, in the .c and .h files of src/ names its
   variable, with or without white space before its parenthesis
-  (secure_getenv too), the notice's own loop aside, and the list names
-  each variable the sources read, once, but the three the supervisor
-  sets on every spawn. The test reads the sources from DRIVER_SRC, which
+  (secure_getenv too), the notice's own loops and the gate's own code
+  aside. ENV_OVERRIDES names each variable that a getenv reads, once,
+  but the three the supervisor sets on every spawn. TEST_HOOKS names
+  each variable that the sources read through the gate, once, and no
+  getenv reads one. The test reads the sources from DRIVER_SRC, which
   CMakeLists.txt sets.
 */
 #include <dirent.h>
@@ -334,6 +338,58 @@ static char *env_slurp(const char *path)
     return text;
 }
 
+/* Every call of `word` in text: a quoted name joins set, an argument that
+   an entry of `own` begins is the notice's own loop or the gate's own
+   code, and any other argument is a read that no list can name. Returns
+   the count of those. */
+static int env_calls(const char *text, const char *word, const char *const *own,
+                     env_name_t *set, int *n)
+{
+    int unnamed = 0;
+    for(const char *p = text; p && (p = strstr(p, word)) != NULL; ) {
+        env_name_t name;
+        p += strlen(word);
+        p += strspn(p, " \t\r\n");
+        if(*p != '(')
+            continue;                   /* the word in a comment, not a call */
+        p++;
+        p += strspn(p, " \t\r\n");
+        if(env_quoted(p, name, sizeof(name))) {
+            if(!env_has(set, *n, name) && *n < ENV_NAMES)
+                strcpy(set[(*n)++], name);
+            continue;
+        }
+        bool exempt = false;
+        for(const char *const *o = own; *o; o++)
+            exempt = exempt || !strncmp(p, *o, strlen(*o));
+        unnamed += !exempt;
+    }
+    return unnamed;
+}
+
+/* The names of the table in main.c that `decl` opens, into set; a name
+   listed twice is said, under `label`, and counted in *differ. Returns
+   false when main.c holds no such table or it names nothing. */
+static bool env_table(const char *main_c, const char *decl, const char *label,
+                      env_name_t *set, int *n, int *differ)
+{
+    const char *table = main_c ? strstr(main_c, decl) : NULL;
+    const char *end = table ? strstr(table, "};") : NULL;
+    for(const char *p = table; p && end && p < end; p++) {
+        env_name_t name;
+        const char *next = env_quoted(p, name, sizeof(name));
+        if(!next)
+            continue;
+        if(env_has(set, *n, name)) {
+            printf("  %s names %s twice\n", label, name);
+            (*differ)++;
+        } else if(*n < ENV_NAMES)
+            strcpy(set[(*n)++], name);
+        p = next - 1;
+    }
+    return end != NULL && *n > 0;
+}
+
 /* --- the controller's entry point, for its start notice --------------
    main.c runs with its callees stubbed: the settings file, the platform
    and the core do nothing, and fflog keeps the notice lines it is given,
@@ -602,11 +658,18 @@ int main(void)
     CHECK(bind_addr_parse("1.2.3", &bound) == -1,
           "a short dotted form is refused: an IPv4 literal is the dotted quad");
 
-    /* --- the start notice's list ----------------------------------------- */
-    printf("The start notice's list of environment overrides, held to the sources:\n");
+    /* --- the start notice's lists ---------------------------------------- */
+    printf("The start notice's lists of environment overrides and test hooks, held to the sources:\n");
+    static env_name_t hooks[ENV_NAMES];         /* TEST_HOOKS, read from main.c */
+    int n_hooks = 0;
     {
-        static env_name_t reads[ENV_NAMES], listed[ENV_NAMES];
-        int n_reads = 0, n_listed = 0, files = 0, unnamed = 0, differ = 0;
+        static env_name_t reads[ENV_NAMES], gated[ENV_NAMES], listed[ENV_NAMES];
+        /* The exempt arguments: the notice's two loops, and the gate's
+           own read and its definition in glowforge_io.h. */
+        static const char *const getenv_own[] = { "ENV_OVERRIDES[i])", "hook)", NULL };
+        static const char *const gate_own[] = { "TEST_HOOKS[i])", "const char *hook)", NULL };
+        int n_reads = 0, n_gated = 0, n_listed = 0, files = 0, unnamed = 0, gate_unnamed = 0;
+        int differ = 0, hook_differ = 0;
         DIR *dir = opendir(DRIVER_SRC);
         struct dirent *e;
         while(dir && (e = readdir(dir)) != NULL) {
@@ -617,39 +680,15 @@ int main(void)
             snprintf(path, sizeof(path), "%s/%s", DRIVER_SRC, e->d_name);
             char *text = env_slurp(path);
             files += text != NULL;
-            for(const char *p = text; p && (p = strstr(p, "getenv")) != NULL; ) {
-                env_name_t name;
-                p += strlen("getenv");
-                p += strspn(p, " \t\r\n");
-                if(*p != '(')
-                    continue;                   /* the word in a comment, not a call */
-                p++;
-                p += strspn(p, " \t\r\n");
-                if(env_quoted(p, name, sizeof(name))) {
-                    if(!env_has(reads, n_reads, name) && n_reads < ENV_NAMES)
-                        strcpy(reads[n_reads++], name);
-                } else if(strncmp(p, "ENV_OVERRIDES[i])", strlen("ENV_OVERRIDES[i])")))
-                    unnamed++;                  /* the notice's own loop is the one exception */
-            }
+            unnamed += env_calls(text, "getenv", getenv_own, reads, &n_reads);
+            gate_unnamed += env_calls(text, "gfio_test_hook", gate_own, gated, &n_gated);
             free(text);
         }
         if(dir)
             closedir(dir);
         char *main_c = env_slurp(DRIVER_SRC "/main.c");
-        const char *table = main_c ? strstr(main_c, "ENV_OVERRIDES[] = {") : NULL;
-        const char *end = table ? strstr(table, "};") : NULL;
-        for(const char *p = table; p && end && p < end; p++) {
-            env_name_t name;
-            const char *next = env_quoted(p, name, sizeof(name));
-            if(!next)
-                continue;
-            if(env_has(listed, n_listed, name)) {
-                printf("  the list names %s twice\n", name);
-                differ++;
-            } else if(n_listed < ENV_NAMES)
-                strcpy(listed[n_listed++], name);
-            p = next - 1;
-        }
+        bool listed_read = env_table(main_c, "ENV_OVERRIDES[] = {", "the list", listed, &n_listed, &differ);
+        bool hooks_read = env_table(main_c, "TEST_HOOKS[] = {", "TEST_HOOKS", hooks, &n_hooks, &hook_differ);
         free(main_c);
         for(int i = 0; i < n_reads; i++)
             if(!env_spawned(reads[i]) && !env_has(listed, n_listed, reads[i])) {
@@ -662,10 +701,25 @@ int main(void)
                        env_spawned(listed[i]) ? "which the supervisor sets" : "which no source reads");
                 differ++;
             }
-        CHECK(files > 10 && end && n_listed > 0, "the driver sources and main.c's list were read");
+        for(int i = 0; i < n_gated; i++)
+            if(!env_has(hooks, n_hooks, gated[i])) {
+                printf("  the sources read %s through the gate, which TEST_HOOKS does not name\n", gated[i]);
+                hook_differ++;
+            }
+        for(int i = 0; i < n_hooks; i++)
+            if(!env_has(gated, n_gated, hooks[i]) || env_has(reads, n_reads, hooks[i])) {
+                printf("  TEST_HOOKS names %s, %s\n", hooks[i],
+                       env_has(reads, n_reads, hooks[i]) ? "which a getenv reads past the gate"
+                                                        : "which no source reads through the gate");
+                hook_differ++;
+            }
+        CHECK(files > 10 && listed_read, "the driver sources and main.c's list were read");
         CHECK(unnamed == 0, "every getenv in the sources names its variable");
         CHECK(differ == 0,
               "the list names every variable the sources read, once, but the supervisor's three");
+        CHECK(hooks_read && gate_unnamed == 0 && hook_differ == 0,
+              "TEST_HOOKS names each variable that the sources read through the gate, once, and no "
+              "getenv reads one");
     }
 
     /* --- the start notice ------------------------------------------------ */
@@ -675,16 +729,30 @@ int main(void)
         char *args[] = { prog, NULL };
         for(size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++)
             unsetenv(ENV_OVERRIDES[i]);
+        for(int i = 0; i < n_hooks; i++)
+            unsetenv(hooks[i]);
+        unsetenv("GFSINK");                                        /* a null-sink run */
         setenv("FFLOG_CONF", "/nonexistent/forgefirm.conf", 1);    /* the list's first */
         setenv("GFSINK_LEAD_MS", "5", 1);
-        setenv("GF_VERDICT_FILE", "/nonexistent/verdict.json", 1); /* and its last */
+        setenv("GF_VERDICT_FILE", "/nonexistent/verdict.json", 1); /* the test hooks' last */
         notices = 0;
         controller_main(1, args);
         CHECK(notices == 1 &&
               !strcmp(notice, NOTICE " FFLOG_CONF GFSINK_LEAD_MS GF_VERDICT_FILE"),
               "the controller logs one notice naming the overrides that are set, and no value");
+        /* With GFSINK set, as on a machine, the controller honors no test
+           hook: GF_STATE_DIR and GF_VERDICT_FILE are set, and not in force. */
+        setenv("GFSINK", "/dev/glowforge", 1);
+        setenv("GF_STATE_DIR", "/nonexistent/state", 1);
+        notices = 0;
+        controller_main(1, args);
+        CHECK(notices == 1 && !strcmp(notice, NOTICE " FFLOG_CONF GFSINK_LEAD_MS"),
+              "with GFSINK set, the notice names no test hook: the controller honors none");
+        unsetenv("GFSINK");
         for(size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++)
             unsetenv(ENV_OVERRIDES[i]);
+        for(int i = 0; i < n_hooks; i++)
+            unsetenv(hooks[i]);
         notices = 0;
         controller_main(1, args);
         CHECK(notices == 0, "with none set, it logs no notice");

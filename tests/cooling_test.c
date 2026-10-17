@@ -26,7 +26,9 @@
     sender's M8/M9 state;
   - the per-tick gate's input is the verdict's own fire_ok, without the
     engine's acknowledgment of the window, which gfcool_fire_ok() still
-    waits on.
+    waits on;
+  - GF_VERDICT_FILE moves the verdict file only in a null-sink run: with
+    GFSINK set the client reads the engine's file.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -164,7 +166,17 @@ int main (void)
     close(fd);
     setenv("GF_VERDICT_FILE", verdict_path, 1);
     setenv("FORGECTRL_PORT", "1", 1);   /* the reporter's POSTs fail fast */
+
+    printf("the verdict file that GF_VERDICT_FILE names, honored only in a null-sink run:\n");
+
+    /* On a machine the supervisor sets GFSINK, and the client reads the
+       engine's file whatever GF_VERDICT_FILE names. Each init starts a
+       reporter; both send to a port that refuses at once. */
+    setenv("GFSINK", "/dev/glowforge", 1);
     gfcool_init();
+    CHECK(!strcmp(verdict_file, VERDICT_FILE), "with GFSINK set, the client reads the engine's verdict file");
+    unsetenv("GFSINK");
+    gfcool_init();                      /* a null-sink run: the cases below publish to verdict_path */
 
     printf("the armed bit is reported on every change:\n");
 

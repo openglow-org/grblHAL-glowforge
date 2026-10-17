@@ -98,9 +98,9 @@
 #include <fcntl.h>
 
 #define VERDICT_FILE   "/run/forgefirm/cooling.state"
-/* The verdict path is overridable for the host-side stream harness
- * (GF_VERDICT_FILE), which publishes its own verdicts; a wrong value
- * only ever blocks fire (missing file = stale = blocked). */
+/* The engine's verdict file. In a null-sink run a host harness or a host
+ * test moves it (GF_VERDICT_FILE, a test hook) and publishes its own
+ * verdicts. With GFSINK set the client reads the engine's file only. */
 static const char *verdict_file = VERDICT_FILE;
 /* Reader staleness window per the contract: a verdict older than this
  * is no verdict. The engine publishes at 1 Hz. */
@@ -449,7 +449,7 @@ void gfcool_init (void)
     const char *v = getenv("FORGECTRL_PORT");
     if(v && atoi(v) > 0 && atoi(v) < 65536)
         http_port = atoi(v);
-    const char *vf = getenv("GF_VERDICT_FILE");
+    const char *vf = gfio_test_hook("GF_VERDICT_FILE");
     if(vf && *vf)
         verdict_file = vf;
     /* The report secret: 32 hex digits or nothing (it goes into a header

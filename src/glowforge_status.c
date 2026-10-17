@@ -30,8 +30,8 @@
   realtime hook), and a write is a render into a small buffer, a
   compare, and an atomic rename only when something changed.
 
-  GF_STATE_DIR overrides the directory (default /run/forgefirm) so the
-  host harnesses can point it at a workdir.
+  The directory is /run/forgefirm. In a null-sink run GF_STATE_DIR, a
+  test hook, moves it, so the host harnesses can point it at a workdir.
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -45,6 +45,7 @@
 
 #include "driver.h"
 #include "glowforge_status.h"
+#include "glowforge_io.h"
 #include "glowforge_laser.h"
 #include "serial.h"
 
@@ -254,7 +255,7 @@ void gfstatus_poll (void)
 
 void gfstatus_init (void)
 {
-    const char *dir = getenv("GF_STATE_DIR");
+    const char *dir = gfio_test_hook("GF_STATE_DIR");
     snprintf(state_dir, sizeof(state_dir), "%s",
              dir && *dir ? dir : STATE_DIR_DEFAULT);
     /* The daemon owns the directory on the machine; create it when

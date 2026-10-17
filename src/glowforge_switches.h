@@ -30,9 +30,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Opens the switch device (or the GF_SWITCH_FILE test source) and reads the
-   initial state. Safe to call with no hardware present (null-sink mode),
-   where every signal reads clear. */
+/* Opens the switch device (or, in a null-sink run, the GF_SWITCH_FILE test
+   source) and reads the initial state. Safe to call with no hardware
+   present (null-sink mode), where every signal reads clear. */
 void gfsw_init (void);
 
 /* True when a switch source exists: the input device, or the file-backed

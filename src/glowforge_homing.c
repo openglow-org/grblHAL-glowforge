@@ -179,7 +179,7 @@ static void anchor_write (const float *home, uint8_t axes, const char *source);
  * frame of the tray mode that stands. */
 void gfhome_startup_reference (void)
 {
-    const char *dir = getenv("GF_STATE_DIR");
+    const char *dir = gfio_test_hook("GF_STATE_DIR");
     char path[160], buf[64];
     snprintf(path, sizeof(path), "%s/lens.home",
              dir && *dir ? dir : "/run/forgefirm");
