@@ -59,7 +59,9 @@
     faults the stream;
   - one alarm per stream fault: a fault that another thread lands during
     a state read raised its own alarm, so the run request and the mid-run
-    check raise no second one.
+    check raise no second one;
+  - the dropped backlog: a reset, mid-motion or after a stream fault,
+    leaves no step byte of the backlog it drops in the ring.
 */
 #include <errno.h>
 #include <stdbool.h>
@@ -530,6 +532,35 @@ int main (void)
     check_kernel_state();
     CHECK(gf.failed && atomic_exchange(&fault_flag, false),
           "a kernel stopped under a live stream with no request pending faults the stream");
+
+    printf("the dropped backlog:\n");
+
+    /* A reset drops the unshipped backlog, and the step bytes the
+     * producer mapped ahead of the ship cursor go with it: their slots
+     * hold nothing for a later stream that reaches those indices. */
+    reset_state();
+    gf.rate = 1000;
+    gf.depth = 100;
+    gf_stream_wakeup();                 /* a fresh stream: one depth of pad slots */
+    gf.vticks = 20 * VTICKS_PER_BYTE;
+    gf_stream_pulse(0x01, 0x00);        /* one X step ahead of the cursor */
+    uint64_t slot = gf.produced - 1;
+    bool mapped = gf.ring[slot & RING_MASK] != 0;
+    gf_stream_reset();                  /* mid-motion */
+    CHECK(mapped && gf.ring[slot & RING_MASK] == 0 && gf.produced == gf.shipped,
+          "a reset mid-motion drops the backlog's step bytes with it");
+
+    reset_state();
+    gf_stream_wakeup();
+    gf.vticks = 20 * VTICKS_PER_BYTE;
+    gf_stream_pulse(0x02, 0x02);        /* one Y step ahead of the cursor */
+    slot = gf.produced - 1;
+    mapped = gf.ring[slot & RING_MASK] != 0;
+    gf.failed = true;                   /* a stream fault */
+    gf_stream_go_idle();                /* and the core goes idle on its alarm */
+    gf_stream_reset();                  /* the operator acknowledges it */
+    CHECK(mapped && gf.ring[slot & RING_MASK] == 0 && gf.produced == gf.shipped,
+          "a failed stream's reset drops the backlog's step bytes with it");
 
     printf("the sideband:\n");
 

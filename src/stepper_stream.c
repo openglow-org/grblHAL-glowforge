@@ -1461,6 +1461,19 @@ static void *shipper_thread (void *arg)
 
 /* --- reset / fault / lifecycle ------------------------------------------- */
 
+/* Drop the unshipped backlog. The producer writes each step byte into a
+ * ring slot ahead of the ship cursor, and only the ship zeroes a slot,
+ * so a dropped slot would keep its byte for whichever later stream
+ * reaches that index: a step in an old direction that no event of that
+ * stream asked for. The drop zeroes the slots it drops. Call under
+ * gf.lock. */
+static void drop_backlog_locked (void)
+{
+    for(uint64_t i = gf.shipped; i < gf.produced; i++)
+        gf.ring[i & RING_MASK] = 0;
+    gf.produced = gf.shipped;
+}
+
 void gf_stream_reset (void)
 {
     /* Soft reset. Two cases:
@@ -1490,7 +1503,7 @@ void gf_stream_reset (void)
 
     pthread_mutex_lock(&gf.lock);
     if(gf.streaming) {
-        gf.produced = gf.shipped;
+        drop_backlog_locked();
         gf.streaming = false;
         gf.lev_head = gf.lev_tail;   /* unshipped laser transitions die with the backlog */
         gf.cur_fire = false;
@@ -1514,7 +1527,7 @@ void gf_stream_reset (void)
         gf.run_pending = false;
         gf.clear_pending = true;
         gf.hold_pending = false;
-        gf.produced = gf.shipped;
+        drop_backlog_locked();
         gf.streaming = false;
         gf.lev_head = gf.lev_tail;
         gf.cur_fire = false;
