@@ -87,7 +87,9 @@
     the reset stopped, the backlog, and the residue from the kernel's
     step counters), and a count that cannot be read, or a counter zero
     that lands under the clear's read, loses the position; the null sink
-    clears with no seek and owes the backlog alone.
+    clears with no seek and owes the backlog alone; a failed stream's
+    reset during motion owes no read-back, and its residue clear still
+    runs.
 */
 #include <errno.h>
 #include <stdbool.h>
@@ -1037,6 +1039,25 @@ int main (void)
     CHECK(rb == 1 && owed[0] == 1 && owed[1] == 0 && owed[2] == 0,
           "a second idle under the reset keeps the step the first one marked");
     gf.shipped = gf.produced = 0;
+
+    /* A stream fault that the hook has not taken, then a reset during
+     * motion: the fault can have dropped steps the core counted, which
+     * the read-back cannot see, so the reset owes none, and the ring is
+     * still cleared once the kernel is idle. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();
+    rd_state = "running";
+    gf.failed = true;
+    gf_stream_go_idle(true, 0, 0);      /* mc_reset's idle, under the reset */
+    gf_stream_reset();
+    rd_state = "idle";
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    CHECK(pending_pass() && !gf.clear_pending && gf_stream_readback(owed, 0) == 0,
+          "a failed stream's reset owes no read-back, and the residue clear still runs");
+    ring_close();
 
     printf("the sideband:\n");
 
