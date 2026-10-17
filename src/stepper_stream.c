@@ -1015,7 +1015,9 @@ static int issue_run (void)
         int err = errno;
         /* Each answer is read with the state after it, the retry's too:
          * a state that cannot be read is no state, which refuses the run
-         * as a fault, never the state read before the retry. */
+         * as a fault, never the state read before the retry. A fault
+         * here raises the alarm only for a stream that had not failed:
+         * a fault another thread landed meanwhile raised its own. */
         if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
             state[0] = '\0';
         if(strcmp(state, "underrun") == 0 && !laser_armed && !retried) {
@@ -1039,8 +1041,8 @@ static int issue_run (void)
              * safe instead; the alarm path relocks the latch. */
             rt_log("gfstream: kernel underrun while laser armed - failing safe\n");
             gfio_wr_attr("cnc/stop", "1");
-            gf.failed = true;
-            fault_flag = true;
+            if(!atomic_exchange(&gf.failed, true))
+                fault_flag = true;
             rc = -1;
         } else if(strcmp(state, "running") == 0) {
             /* Busy: the kernel is still playing the previous stream's
@@ -1058,8 +1060,8 @@ static int issue_run (void)
             char msg[64];
             snprintf(msg, sizeof(msg), "gfstream: run refused (state=%s)\n", state);
             rt_log(msg);
-            gf.failed = true;
-            fault_flag = true;
+            if(!atomic_exchange(&gf.failed, true))
+                fault_flag = true;
             rc = -1;
         }
         break;
@@ -1410,13 +1412,16 @@ static void check_kernel_state (void)
     if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
         return;
     if(strcmp(state, "underrun") == 0 || strcmp(state, "fault") == 0) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "gfstream: kernel %s mid-run - alarming\n", state);
-        rt_log(msg);
+        /* A fault that landed since the snapshot raised its own alarm. */
         pthread_mutex_lock(&gf.lock);
-        gf.failed = true;
+        bool report = !atomic_exchange(&gf.failed, true);
         pthread_mutex_unlock(&gf.lock);
-        fault_flag = true;
+        if(report) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "gfstream: kernel %s mid-run - alarming\n", state);
+            rt_log(msg);
+            fault_flag = true;
+        }
     }
 }
 

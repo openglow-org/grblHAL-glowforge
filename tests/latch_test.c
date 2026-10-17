@@ -31,9 +31,10 @@
   The stub also models the kernel's answer to a run request (refused
   while it plays, in underrun or in fault; refused at idle with another
   errno, as a head sync that fails is refused with EIO; refused on an
-  empty ring; a stop acknowledges an underrun, or leaves it in place), a
-  state read that fails, and another thread's fault landing during one,
-  so the test proves what the shipper's run requests promise:
+  empty ring; a stop acknowledges an underrun), a stop write that does
+  not take (issue_run ignores its return), a state read that fails, and
+  another thread's fault landing during one, so the test proves what the
+  shipper's run requests and its mid-run check promise:
 
   - the run-start retry's answer: an underrun met at a run start outside
     the armed window is acknowledged and the run asked for again, once,
@@ -52,7 +53,12 @@
     and asks for no run; a request left over from an ended stream takes
     the run start's retry; a deferred run refused on an empty ring ends
     the kernel run, so the next run leads with a power byte and a fresh
-    dither.
+    dither;
+  - the mid-run check: an underrun while the kernel owns bytes of the
+    live stream faults the stream;
+  - one alarm per stream fault: a fault that another thread lands during
+    a state read raised its own alarm, so the run request and the mid-run
+    check raise no second one.
 */
 #include <errno.h>
 #include <stdbool.h>
@@ -72,7 +78,7 @@ static int  latch_fail_left;        /* latch writes that fail before one takes *
 static const char *rd_state = "idle";
 static bool ring_empty;             /* the kernel's ring at a run request */
 static int  idle_refusal;           /* errno of a run refused at idle, 0 = none */
-static int  stops_ignored;          /* stops in underrun that leave it in place */
+static int  stops_ignored;          /* stop writes in underrun that do not take */
 static int  state_reads, state_fail_at;     /* the cnc/state read that fails, 0 = none */
 static void (*on_state_read)(void); /* another thread's work, landing during a read */
 
@@ -88,8 +94,9 @@ int gfio_wr_attr (const char *attr, const char *val)
     /* The kernel's run request: refused while running, in underrun or
      * in fault (EPERM), refused at idle with idle_refusal when a case
      * sets it (the kernel refuses a head sync that fails with EIO),
-     * refused on an empty ring (ENODATA), otherwise started. The stop
-     * acknowledges an underrun once stops_ignored stops have not. */
+     * refused on an empty ring (ENODATA), otherwise started. A stop
+     * acknowledges an underrun; the first stops_ignored stop writes in
+     * underrun do not take, and leave it in place. */
     if(!strcmp(attr, "cnc/run")) {
         if(!strcmp(rd_state, "running") || !strcmp(rd_state, "underrun") ||
            !strcmp(rd_state, "fault")) {
@@ -107,10 +114,11 @@ int gfio_wr_attr (const char *attr, const char *val)
         return 0;
     }
     if(!strcmp(attr, "cnc/stop") && !strcmp(rd_state, "underrun")) {
-        if(stops_ignored > 0)
+        if(stops_ignored > 0) {
             stops_ignored--;
-        else
-            rd_state = "idle";
+            return -1;
+        }
+        rd_state = "idle";
     }
     return 0;
 }
@@ -321,7 +329,8 @@ int main (void)
     CHECK(!gf.failed && !atomic_load(&fault_flag), "and faults nothing: the next ship restarts the stream");
 
     /* The run is asked for again once, never more: an underrun that
-     * outlasts its acknowledgment meets the retry refused, a fault. */
+     * outlasts its acknowledgment (the stop write does not take) meets
+     * the retry refused, a fault. */
     reset_state();
     rd_state = "underrun";
     stops_ignored = 1;
@@ -383,6 +392,21 @@ int main (void)
     on_state_read = fault_lands;
     CHECK(pending_pass() && gf.failed && !gf.run_pending && !atomic_load(&fault_flag),
           "an underrun under a request whose stream failed meanwhile raises no second alarm");
+
+    /* The same at a run request's refusal, and at its armed underrun. */
+    reset_state();
+    rd_state = "fault";
+    on_state_read = fault_lands;
+    CHECK(issue_run() == -1 && gf.failed && !atomic_load(&fault_flag),
+          "a run refused for a stream that failed meanwhile raises no second alarm");
+
+    reset_state();
+    atomic_store(&laser_armed, true);
+    rd_state = "underrun";
+    on_state_read = fault_lands;
+    CHECK(issue_run() == -1 && gf.failed && !atomic_load(&fault_flag),
+          "an armed underrun at a run start for a stream that failed meanwhile raises no second alarm");
+    atomic_store(&laser_armed, false);
 
     /* A stream that fails under a pending request: the armed clamp fault
      * stops the kernel, and the stop's ramp ends idle with what it did
@@ -448,6 +472,24 @@ int main (void)
     CHECK(pending_pass() && gf.run_pending && gf.kernel_running && wr_n == 0,
           "a kernel still playing keeps the request pending and is asked nothing");
 
+    printf("the mid-run check:\n");
+
+    /* An underrun while the kernel owns bytes of the live stream is the
+     * stream's, mid-run: a fault, and one alarm. */
+    reset_state();
+    gf.kernel_running = gf.streaming = true;
+    rd_state = "underrun";
+    check_kernel_state();
+    CHECK(gf.failed && atomic_exchange(&fault_flag, false), "an underrun mid-run faults the stream");
+
+    reset_state();
+    gf.kernel_running = gf.streaming = true;
+    rd_state = "underrun";
+    on_state_read = fault_lands;
+    check_kernel_state();
+    CHECK(gf.failed && !atomic_load(&fault_flag),
+          "an underrun mid-run for a stream that failed meanwhile raises no second alarm");
+
     printf("the sideband:\n");
 
     close(fd);
@@ -470,7 +512,8 @@ int main (void)
                     : "PASS: the latch writer retries, faults a lost lock, never re-opens a "
                       "latch it did not lock, and relights only its own lock under an open gate; "
                       "a run request takes the retry's answer, an underrun under a pending "
-                      "run faults the stream, and a failed stream asks for no run\n",
+                      "run or mid-run faults the stream, a failed stream asks for no run, "
+                      "and a stream fault alarms once\n",
            failures);
     return failures ? 1 : 0;
 }
