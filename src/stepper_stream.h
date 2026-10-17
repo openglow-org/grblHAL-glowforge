@@ -30,10 +30,12 @@ uint32_t gf_stream_rate (void);
 // hal.stepper entry points (call with the core lock held; the driver's
 // handlers in driver.c take it). reset tells go_idle that a soft reset
 // is pending (EXEC_RESET): a live stream that it ends is then the
-// reset's, and gf_stream_reset stops the kernel with its ramp. step_bits
-// and dir_bits are then the step the core has counted for its next pulse
-// start, which never comes (grblHAL bit order; 0 for none): the reset
-// owes it back with the rest.
+// reset's, and so is a stream that the core's own idle already ended
+// while the engine still holds the device; gf_stream_reset stops the
+// kernel with its ramp. With the device handed over nothing is marked.
+// step_bits and dir_bits are then the step the core has counted for its
+// next pulse start, which never comes (grblHAL bit order; 0 for none):
+// the reset owes it back with the rest.
 void gf_stream_wakeup (void);
 void gf_stream_go_idle (bool reset, uint8_t step_bits, uint8_t dir_bits);
 void gf_stream_cycles_per_tick (uint32_t cycles);
@@ -134,7 +136,8 @@ void gf_stream_clear_position (void);
 // kernel (closing the flock'd fd mid-program is an emergency stop) -
 // callers retry until it returns true. Resume reopens the device and
 // re-applies the analog config, step_freq and stream state; false =
-// device lost (raise an alarm). Both are no-ops in null-sink mode.
+// device lost (raise an alarm). On the null sink both only record the
+// handover (gf.suspended), so a reset during the session takes no mark.
 bool gf_stream_suspend (void);
 bool gf_stream_resume (void);
 
