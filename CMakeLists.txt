@@ -175,8 +175,9 @@ target_link_libraries(latch_test m pthread)
 
 # Host unit test for the cooling client's verdict tiers
 # (src/glowforge_cooling.c): the fail tier ends the job, the pause tier
-# locks the latch under the window and resumes on the clean verdict,
-# and every armed change is reported at once. Includes the client
+# holds the job with no latch write and resumes on the clean verdict,
+# a stamp ahead of the reader's clock is no verdict, and every armed
+# change is reported at once. Includes the client
 # source, publishes verdict files; must not link the core.
 add_executable(cooling_test tests/cooling_test.c)
 target_include_directories(cooling_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
