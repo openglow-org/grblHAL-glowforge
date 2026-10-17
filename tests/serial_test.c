@@ -52,7 +52,7 @@
   gate, gfio_test_hook, in the .c and .h files of src/ names its
   variable, with or without white space before its parenthesis
   (secure_getenv too), the notice's own loops and the gate's own code
-  aside. ENV_OVERRIDES names each variable that a getenv reads, once,
+  aside, each once. ENV_OVERRIDES names each variable that a getenv reads, once,
   but the three the supervisor sets on every spawn. TEST_HOOKS names
   each variable that the sources read through the gate, once, and no
   getenv reads one. The test reads the sources from DRIVER_SRC, which
@@ -340,10 +340,10 @@ static char *env_slurp(const char *path)
 
 /* Every call of `word` in text: a quoted name joins set, an argument that
    an entry of `own` begins is the notice's own loop or the gate's own
-   code, and any other argument is a read that no list can name. Returns
-   the count of those. */
+   code, counted in the entry's hits, and any other argument is a read
+   that no list can name. Returns the count of those. */
 static int env_calls(const char *text, const char *word, const char *const *own,
-                     env_name_t *set, int *n)
+                     int *hits, env_name_t *set, int *n)
 {
     int unnamed = 0;
     for(const char *p = text; p && (p = strstr(p, word)) != NULL; ) {
@@ -360,8 +360,11 @@ static int env_calls(const char *text, const char *word, const char *const *own,
             continue;
         }
         bool exempt = false;
-        for(const char *const *o = own; *o; o++)
-            exempt = exempt || !strncmp(p, *o, strlen(*o));
+        for(int i = 0; own[i]; i++)
+            if(!strncmp(p, own[i], strlen(own[i]))) {
+                exempt = true;
+                hits[i]++;
+            }
         unnamed += !exempt;
     }
     return unnamed;
@@ -664,10 +667,12 @@ int main(void)
     int n_hooks = 0;
     {
         static env_name_t reads[ENV_NAMES], gated[ENV_NAMES], listed[ENV_NAMES];
-        /* The exempt arguments: the notice's two loops, and the gate's
-           own read and its definition in glowforge_io.h. */
+        /* The exempt arguments, each once in the sources: the notice's
+           two loops, and the gate's own read and its definition in
+           glowforge_io.h. A second match is a read past the gate. */
         static const char *const getenv_own[] = { "ENV_OVERRIDES[i])", "hook)", NULL };
         static const char *const gate_own[] = { "TEST_HOOKS[i])", "const char *hook)", NULL };
+        int getenv_hits[2] = { 0, 0 }, gate_hits[2] = { 0, 0 };
         int n_reads = 0, n_gated = 0, n_listed = 0, files = 0, unnamed = 0, gate_unnamed = 0;
         int differ = 0, hook_differ = 0;
         DIR *dir = opendir(DRIVER_SRC);
@@ -680,12 +685,16 @@ int main(void)
             snprintf(path, sizeof(path), "%s/%s", DRIVER_SRC, e->d_name);
             char *text = env_slurp(path);
             files += text != NULL;
-            unnamed += env_calls(text, "getenv", getenv_own, reads, &n_reads);
-            gate_unnamed += env_calls(text, "gfio_test_hook", gate_own, gated, &n_gated);
+            unnamed += env_calls(text, "getenv", getenv_own, getenv_hits, reads, &n_reads);
+            gate_unnamed += env_calls(text, "gfio_test_hook", gate_own, gate_hits, gated, &n_gated);
             free(text);
         }
         if(dir)
             closedir(dir);
+        for(int i = 0; i < 2; i++) {
+            unnamed += getenv_hits[i] != 1;
+            gate_unnamed += gate_hits[i] != 1;
+        }
         char *main_c = env_slurp(DRIVER_SRC "/main.c");
         bool listed_read = env_table(main_c, "ENV_OVERRIDES[] = {", "the list", listed, &n_listed, &differ);
         bool hooks_read = env_table(main_c, "TEST_HOOKS[] = {", "TEST_HOOKS", hooks, &n_hooks, &hook_differ);
