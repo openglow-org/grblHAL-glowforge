@@ -17,7 +17,10 @@
   And the pins the settings dispatch re-asserts (gfio_apply_machine_pins):
   $100/$101 from the mode, $110/$111 under the ceiling, $102 the lens
   screw's constant (a typed 0 or 999 is overwritten), $32 laser mode (a
-  typed 0 is overwritten).
+  typed 0 is overwritten), and $44-$46, the homing cycle masks (a typed
+  $44=1, or all three typed 0, is overwritten with the driver's cycles,
+  whose union holds Z: the core keeps an axis homed only while a cycle
+  names it, and the lens hold rests on the Z homed bit).
 
   Copyright 2026 514 LLC d/b/a OpenGlow
   Written by Scott Wiederhold
@@ -134,6 +137,26 @@ int main (void)
     expect_u("$32 is re-asserted again", (unsigned)s.mode, (unsigned)Mode_Laser);
     expect_f("$100 follows the mode", s.axis[X_AXIS].steps_per_mm, 213.333f, 1e-4f);
     expect_u("nothing held at the mode's own tick", held, 0);
+
+    /* The homing cycle masks: a $44 write leaves the Z hold. The core
+     * recomputes the homing mask from $44-$46 after every write of one
+     * and keeps an axis homed only while the union names it, so a typed
+     * $44=1 (X alone), or all three typed 0, would drop the Z homed bit
+     * that the lens hold rests on. The dispatch puts the driver's cycles
+     * back before the core recomputes. */
+    s.homing.cycle[0].mask = X_AXIS_BIT;
+    s.homing.cycle[1].mask = 0;
+    s.homing.cycle[2].mask = 0;
+    gfio_apply_machine_pins(&s, 8, 28160);
+    expect_u("$44 typed to 1 is re-asserted", s.homing.cycle[0].mask, DEFAULT_HOMING_CYCLE_0);
+    expect_u("$45 typed to 0 is re-asserted", s.homing.cycle[1].mask, DEFAULT_HOMING_CYCLE_1);
+    expect_u("$46 is re-asserted", s.homing.cycle[2].mask, DEFAULT_HOMING_CYCLE_2);
+    expect_u("Z is in the union of the pinned cycles",
+             (s.homing.cycle[0].mask | s.homing.cycle[1].mask | s.homing.cycle[2].mask) & Z_AXIS_BIT,
+             Z_AXIS_BIT);
+    s.homing.cycle[0].mask = 0;
+    gfio_apply_machine_pins(&s, 32, 112640);
+    expect_u("$44 typed to 0 is re-asserted", s.homing.cycle[0].mask, DEFAULT_HOMING_CYCLE_0);
 
     if (failures) {
         printf("%d FAILURE(S)\n", failures);

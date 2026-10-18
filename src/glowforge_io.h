@@ -160,9 +160,17 @@ static inline float gfio_xy_rate_ceiling (unsigned tick_hz, float steps_per_mm)
 // and a typed one is overwritten on the spot): $100/$101 from the XY
 // microstep mode, $110/$111 held under the feed the tick carries, $102
 // the lens screw's constant (a typed 0 would turn the Z envelope into
-// NaN and silently drop the Z soft limit), and $32 laser mode (the
-// laser's M3/M4 semantics are the machine's, not a sender's choice).
-// Returns the axes whose max rate was held down, for the caller to log.
+// NaN and silently drop the Z soft limit), $32 laser mode (the laser's
+// M3/M4 semantics are the machine's, not a sender's choice), and
+// $44-$46, the homing cycle masks, at the core's defaults (Z, then X
+// and Y). The driver's $H never runs the core's cycles, but the core
+// recomputes its homing mask from them after every write of one and
+// keeps an axis homed only while the union names it: a typed $44 that
+// left Z out would drop the Z homed bit that the lens hold rests on
+// (gfhome_apply_z_limit), and the unreferenced lens would move. The
+// dispatch runs before that recomputation, so the pinned masks are what
+// it reads. Returns the axes whose max rate was held down, for the
+// caller to log.
 static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, unsigned tick_hz)
 {
     float spm = gfio_xy_steps_per_mm_of(mode);
@@ -179,5 +187,9 @@ static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, uns
     }
     s->axis[Z_AXIS].steps_per_mm = DEFAULT_Z_STEPS_PER_MM;
     s->mode = Mode_Laser;
+    _Static_assert(N_AXIS == 3, "the pin covers $44-$46: one homing cycle per axis");
+    s->homing.cycle[0].mask = DEFAULT_HOMING_CYCLE_0;
+    s->homing.cycle[1].mask = DEFAULT_HOMING_CYCLE_1;
+    s->homing.cycle[2].mask = DEFAULT_HOMING_CYCLE_2;
     return held;
 }

@@ -299,12 +299,15 @@ static void irqEnable (void)
 static on_settings_changed_ptr settings_changed_chain;
 
 /* The machine's pinned settings are never typed: $100/$101 come from
- * the microstep mode, $102 from the lens screw, $32 is laser mode, and
+ * the microstep mode, $102 from the lens screw, $32 is laser mode,
  * $110/$111 are held under what the stream can carry (one step per
  * machine tick per axis, which matters when the bench lowers the tick
- * under GFSINK_RATE). Re-asserted before the chain runs, so everything
- * the chain derives (the spindle's laser capability included) sees the
- * values in force, in RAM only like $35. */
+ * under GFSINK_RATE), and $44-$46 are the core's default homing cycles,
+ * whose union names Z (glowforge_io.h: the core keeps an axis homed
+ * only while a cycle names it, and the lens hold rests on the Z homed
+ * bit). Re-asserted before the chain runs, so everything the chain
+ * derives (the spindle's laser capability included) sees the values in
+ * force, in RAM only like $35. */
 static void apply_machine_pins (settings_t *settings)
 {
     unsigned mode = gfio_xy_microsteps();
@@ -327,7 +330,11 @@ static void onSettingsChanged (settings_t *settings, settings_changed_flags_t ch
 
     /* The Z soft limit is the driver's, whatever $20 says: the core's
      * own recomputation on a settings change would drop it. The chain
-     * runs first, so this is the last write of the dispatch. */
+     * runs first, so this is the last write of the dispatch, but not
+     * the last of a $44-$46 write: the core then recomputes its homing
+     * mask from the cycles and keeps only the axes they name homed, so
+     * the Z homed bit this sets survives because the cycles are pinned
+     * with Z in their union (apply_machine_pins, above). */
     gfhome_apply_z_limit();
 }
 
