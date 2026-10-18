@@ -15,9 +15,10 @@
 
 #include "grbl/settings.h"
 
-// The test hooks: GF_SWITCH_FILE moves the switch source, GF_VERDICT_FILE
-// the cooling verdict file and GF_STATE_DIR the state directory (default
-// /run/forgefirm), for a host harness or a host test. The controller honors
+// The test hooks: GF_SWITCH_DEV moves the switch device, GF_SWITCH_FILE
+// the file-backed switch source, GF_VERDICT_FILE the cooling verdict file
+// and GF_STATE_DIR the state directory (default /run/forgefirm), for a
+// host harness or a host test. The controller honors
 // a test hook only in a null-sink run, that is with GFSINK unset or empty:
 // there this returns the variable's value. With GFSINK set it returns NULL,
 // so each reader takes its default. The sources read a test hook only

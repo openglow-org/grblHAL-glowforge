@@ -84,9 +84,9 @@ static void print_usage (const char *badarg)
       "    FFLOG_STDERR     : 1 = echo log lines to stderr (automatic on a terminal).\n"
       "    GF_PULSE_FD      : an inherited pulse-device fd (set by the forgectrl broker).\n"
       "    FORGECTRL_PORT   : the cooling engine's HTTP port (default 80).\n"
-      "  Test hooks, honored only without GFSINK (a null-sink run): GF_SWITCH_FILE,\n"
-      "  GF_VERDICT_FILE, GF_STATE_DIR (default /run/forgefirm), and the config keys\n"
-      "  laser_power_model, laser_floor_analog, gfcloud_home_cmd.\n"
+      "  Test hooks, honored only without GFSINK (a null-sink run): GF_SWITCH_DEV,\n"
+      "  GF_SWITCH_FILE, GF_VERDICT_FILE, GF_STATE_DIR (default /run/forgefirm), and\n"
+      "  the config keys laser_power_model, laser_floor_analog, gfcloud_home_cmd.\n"
       "\n"
       "  ^F shuts down cleanly once motion is done; SIGINT/SIGTERM stop motion\n"
       "  (controlled deceleration, laser latch relocked) and then exit.\n"
@@ -120,7 +120,7 @@ static const char *const ENV_OVERRIDES[] = {
     "FFLOG_CONF", "FFLOG_LEVEL", "FFLOG_SOCK", "FFLOG_STDERR", "FORGECTRL_PORT",
     "GFHOME_CONF", "GFSINK_ATTR_LOG", "GFSINK_DEPTH_MS", "GFSINK_DUMP",
     "GFSINK_LATCH_LOG", "GFSINK_LEAD_MS", "GFSINK_RATE", "GFSINK_STALL_MS",
-    "GFSINK_WRITE_STALL_MS", "GF_SWITCH_DEV",
+    "GFSINK_WRITE_STALL_MS",
 };
 
 /* The test hooks, which the sources read only through gfio_test_hook. The
@@ -128,7 +128,7 @@ static const char *const ENV_OVERRIDES[] = {
  * names the ones that are set there, and none with GFSINK set.
  * serial_test holds this list to the sources too. */
 static const char *const TEST_HOOKS[] = {
-    "GF_STATE_DIR", "GF_SWITCH_FILE", "GF_VERDICT_FILE",
+    "GF_STATE_DIR", "GF_SWITCH_DEV", "GF_SWITCH_FILE", "GF_VERDICT_FILE",
 };
 
 /* Adds a name to the notice line: false when the line has no room. */

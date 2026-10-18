@@ -78,18 +78,20 @@
   state on a healthy machine is not characterized, and a false assertion would
   wedge every job. The hardware chain enforces it regardless.
 
-  The device is the gpio-keys node the device tree names "switches";
-  GF_SWITCH_DEV overrides its path (the same name forgectrl uses). A
+  The device is the gpio-keys node the device tree names "switches". A
   device at that path that does not report that name is not the
   machine's switches, and is not used: on hardware the laser arm then
   refuses, because there is no button to read.
 
-  Test hook: in a null-sink run (GFSINK unset or empty) with no switch
-  device, the EV_SW word is read from the file that GF_SWITCH_FILE names:
-  an integer, decimal or 0x-hex, that holds the bitmask exactly as
-  EVIOCGSW returns it. The host harnesses use it to open the lid, break
-  the interlock loop and press the button against the real gating code.
-  With GFSINK set the file is never a switch source.
+  Test hooks, honored only in a null-sink run (GFSINK unset or empty),
+  read through the one gate, gfio_test_hook: GF_SWITCH_DEV moves the
+  device path (the same name forgectrl uses for its own seam), and with
+  no switch device the EV_SW word is read from the file that
+  GF_SWITCH_FILE names: an integer, decimal or 0x-hex, that holds the
+  bitmask exactly as EVIOCGSW returns it. The host harnesses use it to
+  open the lid, break the interlock loop and press the button against
+  the real gating code. With GFSINK set, as on a machine, the device is
+  the device tree's and the file is never a switch source.
 */
 
 #include "fflog.h"
@@ -264,7 +266,7 @@ void gfsw_init (void)
     /* Nothing on this hardware is an e-stop input. */
     hal.signals_cap.e_stop = Off;
 
-    const char *dev = getenv("GF_SWITCH_DEV");
+    const char *dev = gfio_test_hook("GF_SWITCH_DEV");
     if(dev == NULL || *dev == '\0')
         dev = SWITCH_DEV;
     if((sw_fd = open(dev, O_RDONLY | O_CLOEXEC)) >= 0) {
