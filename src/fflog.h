@@ -59,4 +59,15 @@ void fflog(int prio, const char *fmt, ...)
 /* Messages dropped because the socket was full or unavailable. */
 unsigned long fflog_dropped(void);
 
+/* A further program name from the same process, so rsyslog files its
+ * lines under a logger of their own. Its level is read the way the
+ * process's own is, from log_<name>_disk / _remote. Returns a channel
+ * for fflog_ch, or -1 when the table (two channels) is full. Call after
+ * fflog_init, before any thread emits on the channel. */
+int  fflog_channel(const char *name);
+/* Emit on a channel; an unknown channel emits nothing. Drops are
+ * counted with the process's own (fflog_dropped). */
+void fflog_ch(int ch, int prio, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
 #endif /* FFLOG_H */

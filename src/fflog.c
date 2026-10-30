@@ -30,9 +30,17 @@
 #define FFLOG_FACILITY  LOG_DAEMON
 #define FFLOG_MSG_MAX   2048
 #define RECONNECT_MIN_S 1.0
+#define FFLOG_CHANNELS  2
 
 static char ident[32] = "fflog";
 static int level = LOG_INFO;
+/* Further program names from this process (fflog_channel), each with its
+ * own level; a slot is written once, before any thread emits on it. */
+static struct {
+    char ident[32];
+    int level;
+} chans[FFLOG_CHANNELS];
+static int nchans = 0;
 static int echo_stderr = 0;
 static int sock = -1;
 static double last_connect_try = -1e9;
@@ -157,6 +165,18 @@ void fflog_init(const char *id)
     pthread_mutex_unlock(&mu);
 }
 
+int fflog_channel(const char *name)
+{
+    if (!name || !*name || nchans >= FFLOG_CHANNELS)
+        return -1;
+    int ch = nchans++;
+    snprintf(chans[ch].ident, sizeof(chans[ch].ident), "%s", name);
+    const char *conf = getenv("FFLOG_CONF");
+    chans[ch].level = level_from_conf(conf && *conf ? conf : FFLOG_CONF_DEF,
+                                      chans[ch].ident);
+    return ch;
+}
+
 int fflog_level(void)
 {
     return level;
@@ -202,7 +222,7 @@ static int send_raw(const char *pkt, size_t len)
     return -1;
 }
 
-static size_t header(char *buf, size_t cap, int prio)
+static size_t header(char *buf, size_t cap, int prio, const char *id)
 {
     time_t now = time(NULL);
     struct tm tm;
@@ -211,25 +231,22 @@ static size_t header(char *buf, size_t cap, int prio)
     /* RFC 3164 timestamp: "Mmm dd hh:mm:ss" (day space-padded). */
     strftime(ts, sizeof(ts), "%b %e %H:%M:%S", &tm);
     int n = snprintf(buf, cap, "<%d>%s %s[%d]: ",
-                     FFLOG_FACILITY | prio, ts, ident, (int)getpid());
+                     FFLOG_FACILITY | prio, ts, id, (int)getpid());
     return n < 0 ? 0 : (size_t)n < cap ? (size_t)n : cap - 1;
 }
 
-void fflog(int prio, const char *fmt, ...)
+static void vemit(const char *id, int lvl, int prio, const char *fmt, va_list ap)
 {
     if (prio < 0)
         prio = 0;
     if (prio > LOG_DEBUG)
         prio = LOG_DEBUG;
-    if (prio > level)
+    if (prio > lvl)
         return;
 
     char pkt[FFLOG_MSG_MAX];
-    size_t off = header(pkt, sizeof(pkt), prio);
-    va_list ap;
-    va_start(ap, fmt);
+    size_t off = header(pkt, sizeof(pkt), prio, id);
     int n = vsnprintf(pkt + off, sizeof(pkt) - off, fmt, ap);
-    va_end(ap);
     if (n < 0)
         return;
     size_t len = off + (size_t)n;
@@ -240,7 +257,7 @@ void fflog(int prio, const char *fmt, ...)
     pkt[len] = '\0';
 
     if (echo_stderr)
-        fprintf(stderr, "%s: %s\n", ident, pkt + off);
+        fprintf(stderr, "%s: %s\n", id, pkt + off);
 
     if (send_raw(pkt, len) != 0) {
         __atomic_fetch_add(&dropped, 1, __ATOMIC_RELAXED);
@@ -251,11 +268,29 @@ void fflog(int prio, const char *fmt, ...)
     if (d != dropped_reported) {
         dropped_reported = d;
         char note[FFLOG_MSG_MAX];
-        size_t o = header(note, sizeof(note), LOG_WARNING);
+        size_t o = header(note, sizeof(note), LOG_WARNING, ident);
         int m = snprintf(note + o, sizeof(note) - o,
                          "fflog: %lu message(s) dropped (syslog socket "
                          "unavailable or full)", d);
         if (m > 0)
             (void)send_raw(note, o + (size_t)m);
     }
+}
+
+void fflog(int prio, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vemit(ident, level, prio, fmt, ap);
+    va_end(ap);
+}
+
+void fflog_ch(int ch, int prio, const char *fmt, ...)
+{
+    if (ch < 0 || ch >= nchans)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    vemit(chans[ch].ident, chans[ch].level, prio, fmt, ap);
+    va_end(ap);
 }
