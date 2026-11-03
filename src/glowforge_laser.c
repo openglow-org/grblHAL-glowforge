@@ -19,10 +19,10 @@
   charge-pump watchdog the kernel feeds while a run plays, and the
   BUTTON latch). On the first laser-on of a job this module:
 
-    1. refuses outright while a coolant fire gate is active (flow FAULT
-       or over-temperature - glowforge_cooling.c owns the verdicts),
-    2. forces the run fan profile on (so flow interrogation covers
-       every fire window) and unlocks the kernel laser latch,
+    1. refuses outright while a coolant fire gate is active (the run
+       ceiling, for one - glowforge_cooling.c owns the verdicts),
+    2. forces the run fan profile on (so the cut airflow covers every
+       fire window) and unlocks the kernel laser latch,
     3. lights the button white and BLOCKS the gcode stream - pumping
        real-time traffic like the homing session does - until the
        operator presses the physical button (EV_SW bit 2 on the input
@@ -622,7 +622,7 @@ static bool head_present (void)
 static bool arm_gates (void)
 {
     if(!gfcool_fire_ok()) {
-        report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
+        report_message("laser fire blocked: a cooling gate is closed", Message_Warning);
         system_raise_alarm(Alarm_AbortCycle);
         return false;
     }
@@ -671,8 +671,7 @@ static double ack_budget_s (void)
 static bool arm_complete (void)
 {
     /* The armed window is reported to the engine when it opens, and the
-     * engine answers by applying the cut airflow and the flow
-     * interrogation for the job. Until that answer arrives the verdict
+     * engine answers by applying the cut airflow for the job. Until that answer arrives the verdict
      * on file is the one computed for the idle session before the arm -
      * permissive, because nothing is wrong at idle - so firing on it
      * puts the beam on the work with the fans still at their idle duty.
@@ -701,7 +700,7 @@ static bool arm_complete (void)
     if(!gfcool_fire_ok()) {
         latch_lock(true);
         gfcool_laser_armed(false);
-        report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
+        report_message("laser fire blocked: a cooling gate is closed", Message_Warning);
         system_raise_alarm(Alarm_AbortCycle);
         return false;
     }
@@ -752,8 +751,8 @@ static bool gflaser_arm (void)
     if(!arm_gates())
         return false;
 
-    /* Fan run profile + flow interrogation cover the whole armed
-     * window, whatever the sender's M8/M9 state. */
+    /* The fan run profile covers the whole armed window, whatever
+     * the sender's M8/M9 state. */
     gfcool_laser_armed(true);
     if(!arm_unlock())
         return false;
@@ -1172,7 +1171,7 @@ void gflaser_poll (void)
         if(note != Suppress_None) {
             if(note != suppress_shown)
                 report_message(note == Suppress_Coolant
-                                ? "laser fire suppressed: coolant flow fault or over-temperature"
+                                ? "laser fire suppressed: a cooling gate is closed"
                                 : "laser fire suppressed: laser not armed", Message_Warning);
             suppress_shown = note;
             suppress_last = t;

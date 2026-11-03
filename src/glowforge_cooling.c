@@ -2,7 +2,7 @@
   glowforge_cooling.c - cooling-service client for the Glowforge board
 
   Part of grblHAL-glowforge. The cooling engine - fan/pump/TEC/heater
-  profiles, coolant-flow verification, over-temp policy - lives in
+  profiles, the over-temp policy - lives in
   forgectrl (the machine-services daemon); the shared contract is
   https://docs.forgefirm.org/technical/forgefirm/cooling-engine/. This client:
 
@@ -17,8 +17,8 @@
     handed it at its spawn (gfcool_report_secret). Level-triggered, re-sent every ~1 s from gfcool_poll and
     immediately on every change, so a lost report self-heals. The
     effective run window is the sender's M8/M9 OR'd with the laser
-    armed window: fire must never run without the cut airflow and the
-    flow interrogation that only lives inside a run session.
+    armed window: fire must never run without the cut airflow, which
+    only lives inside a run session.
 
   - reads the engine's verdict from /run/forgefirm/cooling.state every
     500 ms and enforces it in-process on every poll from the cached

@@ -30,8 +30,8 @@ coolant_state_t gfcool_coolant_get (void);
 // hold / resume / fallback enforcement.
 void gfcool_poll (void);
 
-// Laser fire gate: false while the engine's verdict says so - flow
-// FAULT or coolant over the run ceiling - and whenever the verdict is
+// Laser fire gate: false while the engine's verdict says so - coolant
+// over the run ceiling, for one - and whenever the verdict is
 // missing or stale (the engine being gone must look like a fault).
 // Read from the stepper producer thread as well - cached flag reads,
 // no file IO on that path.
@@ -58,6 +58,6 @@ bool gfcool_decel_lit (void);
 bool gfcool_run_ack (void);
 
 // Armed-window hook from glowforge_laser.c: reported to the engine,
-// which forces the run fan profile and flow interrogation while armed,
+// which forces the run fan profile while armed,
 // whatever the sender's M8/M9 state.
 void gfcool_laser_armed (bool armed);
