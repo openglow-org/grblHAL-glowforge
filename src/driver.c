@@ -300,6 +300,7 @@ static on_settings_changed_ptr settings_changed_chain;
 
 /* The machine's pinned settings are never typed: $100/$101 come from
  * the microstep mode, $102 from the lens screw, $32 is laser mode,
+ * bit 0 of $63 (the laser off in a hold) is on,
  * $110/$111 are held under what the stream can carry (one step per
  * machine tick per axis, which matters when the bench lowers the tick
  * under GFSINK_RATE), and $44-$46 are the core's default homing cycles,

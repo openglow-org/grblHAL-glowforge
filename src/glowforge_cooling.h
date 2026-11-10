@@ -57,7 +57,24 @@ bool gfcool_decel_lit (void);
 // so the arm waits on this before it lets the gate above decide.
 bool gfcool_run_ack (void);
 
+// A failure waits for the operator's Acknowledge on the control panel: a
+// fresh verdict whose ack_wait field is true, or whose name is ACK (the
+// name the engine publishes when no other verdict stands; under another
+// verdict only the field says it). fire_ok is false meanwhile and is the
+// gate; this picks the refusal's words and keeps a held job held instead
+// of resuming it.
+bool gfcool_ack_waits (void);
+
 // Armed-window hook from glowforge_laser.c: reported to the engine,
 // which forces the run fan profile while armed,
 // whatever the sender's M8/M9 state.
 void gfcool_laser_armed (bool armed);
+
+// A fresh verdict that blocks firing short of the fail tier: a pause by
+// name (OVERTEMP, COLD, WARMUP, SENSOR, FLAME, BUMP, EXT), or a fault
+// that waits for its Acknowledge. It is the pause tier as a job with its
+// window closed meets it: the resume of a held job is refused under it
+// and the job stays held, where the fail tier (FIRE, CRASH, AIRFLOW,
+// CRITICAL) and a stale verdict end the job. False for both of those,
+// and for a verdict that lets the laser fire.
+bool gfcool_hold_stands (void);

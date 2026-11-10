@@ -90,6 +90,8 @@ static int failures;
 } while (0)
 
 static char verdict_path[] = "/tmp/cooling_test.XXXXXX";
+/* Fields a case adds to the published document (the ack_wait field). */
+static const char *publish_extra = "";
 
 /* Publish a verdict the way the engine does: the whole document, then a
    rename into place. age_s backdates ts_mono (a stale publisher); a
@@ -107,10 +109,10 @@ static void publish (bool fire_ok, const char *name, bool hold, bool resume_ok,
        must not see a timestamp from its future. */
     double now = (double)ts.tv_sec + ts.tv_nsec / 1e9 - 0.001;
     fprintf(f, "{\"seq\":1,\"ts_mono\":%.3f,\"fire_ok\":%s,\"verdict\":\"%s\",\"hold\":%s,"
-               "\"resume_ok\":%s,\"armed\":%s,\"reason\":\"%s\",\"down_c\":20.0,\"up_c\":20.0}\n",
+               "\"resume_ok\":%s,\"armed\":%s,\"reason\":\"%s\"%s,\"down_c\":20.0,\"up_c\":20.0}\n",
             now - age_s, fire_ok ? "true" : "false", name, hold ? "true" : "false",
             resume_ok ? "true" : "false", armed ? "true" : "false",
-            fire_ok ? "" : "test: fire blocked");
+            fire_ok ? "" : "test: fire blocked", publish_extra);
     fclose(f);
     rename(tmp, verdict_path);
     next_verdict_ms = mono_ms();        /* the next poll reads it */
@@ -154,6 +156,7 @@ static void reset_state (void)
     coolant_reported.flood = Off;
     atomic_store(&v_fresh_until_ms, 0);
     v_reason_shown[0] = '\0';
+    publish_extra = "";
 }
 
 int main (void)
@@ -247,6 +250,62 @@ int main (void)
           "the whole pause episode wrote no latch");
     CHECK(!gfcool_decel_lit(), "the clean verdict leaves no lit-deceleration grace behind");
 
+    /* A fault that waits for its Acknowledge: the cause gone, the verdict
+     * ACK (fire blocked, no hold, resume_ok): the held job stays held, and
+     * the Acknowledge (a clean verdict) resumes it. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cur_state = STATE_CYCLE;
+    publish(false, "SENSOR", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(hold_ours, "SENSOR holds the job");
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Complete;
+    laser_on_window = false;            /* the window closed during the hold */
+    armed_val = false;
+    ncmds = 0;
+    publish(false, "ACK", false, true, false, 0.0);
+    gfcool_poll();
+    gfcool_poll();
+    CHECK(!enqueued(CMD_CYCLE_START) && hold_ours, "under ACK the held job is not resumed");
+    publish(true, "OK", false, true, false, 0.0);
+    gfcool_poll();
+    CHECK(enqueued(CMD_CYCLE_START) && !hold_ours, "the Acknowledge resumes it");
+
+    /* The acknowledgment is its own field: ack_wait says a fault waits
+     * for its Acknowledge under any verdict name, the name ACK says it
+     * without the field, a document without the field says nothing, and
+     * a stale verdict says nothing at all. */
+    reset_state();
+    publish_extra = ",\"ack_wait\":true";
+    publish(false, "OVERTEMP", true, false, false, 0.0);
+    verdict_read();
+    CHECK(gfcool_ack_waits(), "ack_wait true under another verdict's name: a fault waits for its Acknowledge");
+    publish_extra = "";
+    publish(false, "OVERTEMP", true, false, false, 0.0);
+    verdict_read();
+    CHECK(!gfcool_ack_waits(), "no ack_wait field reads as false");
+    publish_extra = ",\"ack_wait\":false";
+    publish(false, "ACK", false, true, false, 0.0);
+    verdict_read();
+    CHECK(gfcool_ack_waits(), "the name ACK still says it");
+    publish_extra = ",\"ack_wait\":true";
+    publish(false, "OVERTEMP", true, false, false, 0.0);
+    verdict_read();
+    atomic_store(&v_fresh_until_ms, mono_ms() - 1);
+    CHECK(!gfcool_ack_waits(), "a stale verdict's ack_wait says nothing");
+    /* And the held job is not resumed under it, whatever the name. */
+    reset_state();
+    hold_ours = true;
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Complete;
+    publish_extra = ",\"ack_wait\":true";
+    publish(false, "EXT", false, true, false, 0.0);
+    gfcool_poll();
+    CHECK(!enqueued(CMD_CYCLE_START) && hold_ours, "under ack_wait the held job is not resumed, whatever the name");
+    publish_extra = "";
+
     /* A second episode says so again. */
     reset_state();
     armed_val = true;
@@ -281,6 +340,28 @@ int main (void)
         snprintf(msg, sizeof(msg), "%s inside the window is the pause tier", pause_names[i]);
         CHECK(fail_calls == 0 && hold_ours && pause_said, msg);
     }
+
+    /* The pause tier as a held job with its window closed meets it
+       (gfcool_hold_stands): a fresh verdict that blocks firing short of
+       the fail tier, a fault waiting for its Acknowledge included. The
+       fail tier, a clean verdict and a stale one are not it. */
+    reset_state();
+    publish(false, "OVERTEMP", true, false, false, 0.0);
+    verdict_read();
+    CHECK(gfcool_hold_stands(), "OVERTEMP over a closed window is a standing hold");
+    publish(false, "ACK", false, true, false, 0.0);
+    verdict_read();
+    CHECK(gfcool_hold_stands(), "so is a fault waiting for its Acknowledge");
+    publish(false, "CRITICAL", true, false, false, 0.0);
+    verdict_read();
+    CHECK(!gfcool_hold_stands(), "the fail tier is not");
+    publish(true, "OK", false, true, false, 0.0);
+    verdict_read();
+    CHECK(!gfcool_hold_stands(), "a verdict that lets the laser fire is not");
+    publish(false, "OVERTEMP", true, false, false, 0.0);
+    verdict_read();
+    atomic_store(&v_fresh_until_ms, mono_ms() - 1);     /* the same verdict, gone stale */
+    CHECK(!gfcool_hold_stands(), "a stale verdict is not");
 
     /* A stale verdict inside the window is the pause tier, with the
        fallback airflow once and the heater off. */

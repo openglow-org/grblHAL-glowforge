@@ -87,6 +87,8 @@ bool protocol_enqueue_realtime_command(uint8_t c)
 void driver_request_exit(void) {}
 uint8_t platform_poll_stdin(void) { return 0; }
 bool gflaser_resume_gate(void) { return false; }   /* no held laser job here */
+static int input_polls;                             /* gflaser_input_poll() calls */
+void gflaser_input_poll(void) { input_polls++; }
 struct pollfd;
 void ctlport_poll(void) {}                          /* no controller port here */
 unsigned ctlport_pollfds(struct pollfd *fds) { (void)fds; return 0; }
@@ -466,6 +468,13 @@ int main(void)
     n = drain(got, 200, &bad, "G1 X-30 F1500", "G1 Y0.3 F1500");
     CHECK(n == 1 && bad == 0 && strcmp(got[0], "G1 Y0.3 F1500") == 0,
           "a line sent after the overrun arrives whole");
+
+    /* Every read the core makes runs the laser module's input poll first,
+       a read that finds the ring empty included: that read is the one the
+       core's main loop makes before it starts what the last line planned. */
+    input_polls = 0;
+    CHECK(serialGetC() == SERIAL_NO_DATA && input_polls == 1,
+          "a read of an empty stream runs the laser module's input poll");
 
     /* --- the banner on a connect --------------------------------------- */
     printf("The welcome banner on a connect:\n");

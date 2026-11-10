@@ -128,7 +128,7 @@ static const char *const ENV_OVERRIDES[] = {
  * names the ones that are set there, and none with GFSINK set.
  * serial_test holds this list to the sources too. */
 static const char *const TEST_HOOKS[] = {
-    "GF_STATE_DIR", "GF_SWITCH_DEV", "GF_SWITCH_FILE", "GF_VERDICT_FILE",
+    "GF_LED_ROOT", "GF_STATE_DIR", "GF_SWITCH_DEV", "GF_SWITCH_FILE", "GF_VERDICT_FILE",
 };
 
 /* Adds a name to the notice line: false when the line has no room. */

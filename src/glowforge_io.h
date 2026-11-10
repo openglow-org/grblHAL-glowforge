@@ -16,8 +16,9 @@
 #include "grbl/settings.h"
 
 // The test hooks: GF_SWITCH_DEV moves the switch device, GF_SWITCH_FILE
-// the file-backed switch source, GF_VERDICT_FILE the cooling verdict file
-// and GF_STATE_DIR the state directory (default /run/forgefirm), for a
+// the file-backed switch source, GF_VERDICT_FILE the cooling verdict file,
+// GF_LED_ROOT the LED class (default /sys/class/leds) and GF_STATE_DIR
+// the state directory (default /run/forgefirm), for a
 // host harness or a host test. The controller honors
 // a test hook only in a null-sink run, that is with GFSINK unset or empty:
 // there this returns the variable's value. With GFSINK set it returns NULL,
@@ -161,7 +162,12 @@ static inline float gfio_xy_rate_ceiling (unsigned tick_hz, float steps_per_mm)
 // microstep mode, $110/$111 held under the feed the tick carries, $102
 // the lens screw's constant (a typed 0 would turn the Z envelope into
 // NaN and silently drop the Z soft limit), $32 laser mode (the laser's
-// M3/M4 semantics are the machine's, not a sender's choice), and
+// M3/M4 semantics are the machine's, not a sender's choice), bit 0 of $63,
+// "disable laser during hold" (a held job's laser is off, which is what
+// starts the armed window's grace under a hold: with the bit clear the
+// core leaves the laser on through the hold, the grace never runs, and a
+// resume hours later fires on the old press; the other bits of $63 stay
+// the sender's), and
 // $44-$46, the homing cycle masks, at the core's defaults (Z, then X
 // and Y). The driver's $H never runs the core's cycles, but the core
 // recomputes its homing mask from them after every write of one and
@@ -187,6 +193,7 @@ static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, uns
     }
     s->axis[Z_AXIS].steps_per_mm = DEFAULT_Z_STEPS_PER_MM;
     s->mode = Mode_Laser;
+    s->flags.disable_laser_during_hold = On;
     _Static_assert(N_AXIS == 3, "the pin covers $44-$46: one homing cycle per axis");
     s->homing.cycle[0].mask = DEFAULT_HOMING_CYCLE_0;
     s->homing.cycle[1].mask = DEFAULT_HOMING_CYCLE_1;

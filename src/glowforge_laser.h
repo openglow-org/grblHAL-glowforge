@@ -19,6 +19,15 @@ void gflaser_init (void);
 // and surface deferred warnings from the producer thread.
 void gflaser_poll (void);
 
+// Called by the sender's stream each time the core's main loop reads its
+// input (hal.stream.read), on the protocol thread. Every line before that
+// read has been executed and its motion planned, and the core has run no
+// real-time processing since, so nothing it planned has started: this is
+// where the dark-job watch stops a cutting move planned with the laser
+// off before it moves (dark_watch_poll in glowforge_laser.c). One flag
+// test when the watch is not set.
+void gflaser_input_poll (void);
+
 // Immediate disarm + latch relock (driver reset / stream fault paths).
 // Idempotent; the relock does not depend on the window: the latch is
 // locked whenever this process unlocked it.

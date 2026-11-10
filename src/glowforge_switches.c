@@ -329,9 +329,10 @@ static void button_edge (sys_state_t st)
         protocol_enqueue_realtime_command(CMD_FEED_HOLD);
         report_message("button pressed - job paused", Message_Info);
     } else if(st == STATE_HOLD) {
-        if(gflaser_resume_gate())
-            report_message("button pressed - the job re-arms before it resumes", Message_Info);
-        else {
+        if(gflaser_resume_gate()) {
+            if(gflaser_arming())        /* the gate's own refusal said why otherwise */
+                report_message("button pressed - the job re-arms before it resumes", Message_Info);
+        } else {
             protocol_enqueue_realtime_command(CMD_CYCLE_START);
             report_message("button pressed - job resumed", Message_Info);
         }

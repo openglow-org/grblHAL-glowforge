@@ -17,7 +17,8 @@
   And the pins the settings dispatch re-asserts (gfio_apply_machine_pins):
   $100/$101 from the mode, $110/$111 under the ceiling, $102 the lens
   screw's constant (a typed 0 or 999 is overwritten), $32 laser mode (a
-  typed 0 is overwritten), and $44-$46, the homing cycle masks (a typed
+  typed 0 is overwritten), bit 0 of $63, the laser off in a hold (a typed
+  $63=0 is overwritten, the other bits kept), and $44-$46, the homing cycle masks (a typed
   $44=1, or all three typed 0, is overwritten with the driver's cycles,
   whose union holds Z: the core keeps an axis homed only while a cycle
   names it, and the lens hold rests on the Z homed bit).
@@ -129,10 +130,20 @@ int main (void)
     expect_u("the held axes are reported", held, 1u << X_AXIS);
     expect_f("$102 typed to 0 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
     expect_u("$32 typed to 0 is re-asserted", (unsigned)s.mode, (unsigned)Mode_Laser);
+    /* $63 bit 0, the laser off in a hold: a typed $63=0 is put back, and
+     * the setting's other two bits stay as they were typed. */
+    expect_u("$63 bit 0 typed to 0 is re-asserted", s.flags.disable_laser_during_hold, 1);
+    expect_u("$63 bit 1 typed to 0 is left alone", s.flags.restore_after_feed_hold, 0);
+    s.flags.disable_laser_during_hold = 0;
+    s.flags.restore_after_feed_hold = 1;
+    s.flags.set_rpm_0_during_hold = 1;
     s.axis[Z_AXIS].steps_per_mm = 999.0f;
     s.mode = Mode_Lathe;
     s.axis[X_AXIS].max_rate = 12000.0f;
     held = gfio_apply_machine_pins(&s, 32, 112640);
+    expect_u("$63 bit 0 is re-asserted again", s.flags.disable_laser_during_hold, 1);
+    expect_u("$63 bits 1 and 2 keep what was typed",
+             (unsigned)(s.flags.restore_after_feed_hold << 1 | s.flags.set_rpm_0_during_hold << 2), 6);
     expect_f("$102 typed to 999 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
     expect_u("$32 is re-asserted again", (unsigned)s.mode, (unsigned)Mode_Laser);
     expect_f("$100 follows the mode", s.axis[X_AXIS].steps_per_mm, 213.333f, 1e-4f);

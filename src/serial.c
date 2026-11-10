@@ -145,8 +145,16 @@ double serial_client_since (void)
 static int32_t serialGetC (void)
 {
     int32_t data;
-    uint_fast16_t bptr = rxbuffer.tail;
+    uint_fast16_t bptr;
 
+    /* The core's main loop is reading on: every line before this byte has
+     * been executed and its motion planned, and nothing has been started
+     * since. The laser module looks at the newest planned block here,
+     * while it can still be stopped before it moves. Ahead of the ring's
+     * pointers: a reset it asks for may touch the ring. */
+    gflaser_input_poll();
+
+    bptr = rxbuffer.tail;
     if(bptr == rxbuffer.head)
         return -1; // no data available else EOF
 

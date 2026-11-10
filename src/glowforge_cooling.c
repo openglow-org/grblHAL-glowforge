@@ -142,6 +142,10 @@ static _Atomic uint32_t v_fresh_until_ms = 0;
 static char v_reason[112];
 static char v_reason_shown[112];
 static char v_name[16];                 /* the verdict's name (its tier) */
+/* The verdict's ack_wait field: a fault waits for the operator's
+ * Acknowledge, whatever the verdict's name is. Protocol thread only, as
+ * the name is. */
+static bool v_ack_wait;
 static bool pause_said;                 /* one message per pause-tier episode */
 /* The pause tier's first hold decelerates lit: set when this client
  * takes the hold on a fresh verdict flip, cleared once the head has
@@ -413,6 +417,9 @@ static void verdict_read (void)
     atomic_store_explicit(&v_armed, json_bool(body, "armed", false), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
     json_str(body, "verdict", v_name, sizeof(v_name));
+    /* Absent reads as false: the field gates nothing by itself (fire_ok
+     * carries the block), and a verdict named ACK says the same thing. */
+    v_ack_wait = json_bool(body, "ack_wait", false);
     atomic_store_explicit(&v_fresh_until_ms,
         mono_ms() + (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),
         memory_order_release);
@@ -537,10 +544,21 @@ bool gfcool_fire_ok (void)
     return true;
 }
 
+bool gfcool_ack_waits (void)
+{
+    return verdict_fresh() && (v_ack_wait || !strcmp(v_name, "ACK"));
+}
+
 bool gfcool_run_ack (void)
 {
     return verdict_fresh() &&
             atomic_load_explicit(&v_armed, memory_order_relaxed);
+}
+
+bool gfcool_hold_stands (void)
+{
+    return verdict_fresh() && !verdict_fail_tier(v_name) &&
+           (!atomic_load_explicit(&v_fire_ok, memory_order_relaxed) || gfcool_ack_waits());
 }
 
 void gfcool_poll (void)
@@ -639,7 +657,12 @@ void gfcool_poll (void)
                 if(hold_ours) {
                     if(!(st & STATE_HOLD))
                         hold_ours = false;  /* operator resumed or reset */
-                    else if(v_resume_ok) {
+                    /* Not while a fault waits for its Acknowledge: the job
+                     * stays held until the panel's Acknowledge, then resumes
+                     * through the re-arm's press, instead of a resume the
+                     * resume gate would refuse, the hold no longer this
+                     * client's to resume. */
+                    else if(v_resume_ok && !gfcool_ack_waits()) {
                         hold_ours = false;
                         report_message("cooling verdict clean - resuming",
                                        Message_Info);
