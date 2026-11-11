@@ -88,7 +88,13 @@ void driver_request_exit(void) {}
 uint8_t platform_poll_stdin(void) { return 0; }
 bool gflaser_resume_gate(void) { return false; }   /* no held laser job here */
 static int input_polls;                             /* gflaser_input_poll() calls */
-void gflaser_input_poll(void) { input_polls++; }
+static void (*input_poll_does)(void);               /* what the poll's reset does to the ring */
+void gflaser_input_poll(void)
+{
+    input_polls++;
+    if(input_poll_does)
+        input_poll_does();
+}
 struct pollfd;
 void ctlport_poll(void) {}                          /* no controller port here */
 unsigned ctlport_pollfds(struct pollfd *fds) { (void)fds; return 0; }
@@ -475,6 +481,13 @@ int main(void)
     input_polls = 0;
     CHECK(serialGetC() == SERIAL_NO_DATA && input_polls == 1,
           "a read of an empty stream runs the laser module's input poll");
+    /* The poll runs before the ring's pointers are read: a reset it asks
+       for flushes the ring, and the byte it flushed is never returned. */
+    push("G");
+    input_poll_does = serialRxFlush;
+    CHECK(serialGetC() == SERIAL_NO_DATA && serialRxCount() == 0,
+          "a byte the input poll's reset flushed is never read");
+    input_poll_does = NULL;
 
     /* --- the banner on a connect --------------------------------------- */
     printf("The welcome banner on a connect:\n");

@@ -19,6 +19,10 @@
   of the kernel (idle without a device). The file is a switch source
   only in a null-sink run: with GFSINK set and no switch device, there
   is no switch source, and the laser arm has no button to read.
+
+  And a press in a hold that the laser module's resume gate takes: it
+  says the job re-arms before it resumes only when the gate started a
+  re-arm.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,8 +42,12 @@ static char last_message[128];
 
 bool gf_stream_kernel_idle (void) { return kernel_idle_val; }
 void gflaser_disarm (void) {}
-bool gflaser_arming (void) { return false; }
-bool gflaser_resume_gate (void) { return false; }
+/* The laser module's resume gate: whether it takes the resume
+   (gate_takes), and whether taking it started a re-arm (gate_rearms),
+   which gflaser_arming() then reports. */
+static bool gate_takes, gate_rearms, arming_val;
+bool gflaser_arming (void) { return arming_val; }
+bool gflaser_resume_gate (void) { arming_val = gate_takes && gate_rearms; return gate_takes; }
 int  gfio_conf_read (const char *k, char *v, size_t n) { (void)k; (void)v; (void)n; return -1; }
 void fflog (int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
 
@@ -110,6 +118,24 @@ int main (void)
 
     gfsw_init();
     CHECK(gfsw_available(), "the file-backed switch source is available");
+
+    printf("a press in a hold that the laser module's resume gate takes:\n");
+
+    /* The gate took the resume and refused it (its own words say why):
+       the press adds no words and no cycle start. The gate took it and
+       started a re-arm: the press says the job re-arms first. */
+    gate_takes = true;
+    gate_rearms = false;
+    last_message[0] = '\0';
+    button_edge(STATE_HOLD);
+    CHECK(last_message[0] == '\0' && cycle_starts == 0,
+          "a resume the gate refused gets no re-arm notice and no cycle start");
+    gate_rearms = true;
+    arming_val = false;
+    button_edge(STATE_HOLD);
+    CHECK(strstr(last_message, "re-arms before it resumes") != NULL && cycle_starts == 0,
+          "a resume the gate re-arms says the job re-arms before it resumes");
+    gate_takes = gate_rearms = arming_val = false;
 
     printf("a cancel in flight under a failed switch read:\n");
 
