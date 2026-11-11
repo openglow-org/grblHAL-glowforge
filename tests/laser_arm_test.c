@@ -1831,16 +1831,15 @@ int main(void)
             gflaser_poll();
             CHECK(led_val(root, 1, "target") == 255 && led_val(root, 2, "target") == 255 &&
                   led_val(root, 3, "target") == 255, "the lamp lost under it is written again");
-            /* The LED trigger reports a target of 255 as 254 once the fade
-               has settled: that is solid white, and nothing is written (a
-               write would put the speed back to 64). */
-            for (int i = 1; i <= 3; i++) { led_put(root, i, "target", 254); led_put(root, i, "speed", 7); }
+            /* Solid white as it stands: nothing is written (a write would
+               put the speed back to 64). */
+            for (int i = 1; i <= 3; i++) { led_put(root, i, "speed", 7); }
             clock_skip(LAMP_KEEP_S);
             gflaser_poll();
             CHECK(led_val(root, 1, "speed") == 7 && led_val(root, 2, "speed") == 7 &&
-                  led_val(root, 3, "speed") == 7 && led_val(root, 1, "target") == 254,
-                  "a solid white that has settled (254) is not written again");
-            led_put(root, 2, "target", 253);
+                  led_val(root, 3, "speed") == 7 && led_val(root, 1, "target") == 255,
+                  "a solid white is not written again");
+            led_put(root, 2, "target", 254);
             clock_skip(LAMP_KEEP_S);
             gflaser_poll();
             CHECK(led_val(root, 2, "target") == 255 && led_val(root, 2, "speed") == 64,

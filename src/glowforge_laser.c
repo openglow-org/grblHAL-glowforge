@@ -383,12 +383,6 @@ static bool lamp_red (const int p[3], const int t[3])
     return p[0] > 0 && p[1] <= 0 && p[2] <= 0 && t[1] <= 0 && t[2] <= 0;
 }
 
-/* Solid white as the LED trigger reports it. A fade stops within a
- * sixteenth of a count of its target and the trigger then reports where it
- * stopped, so a lamp that has settled on 255 reads its target back as 254;
- * one still fading reads 255. */
-#define LAMP_WHITE_MIN 254
-
 /* The lamp put back when something else wrote over it: the engine's red
  * flash, once it ends, leaves the button dark, and a press wait under it
  * must not look like no wait at all. Checked once a second; never written
@@ -407,8 +401,7 @@ static void lamp_keep (void)
         return;                         /* the red flash stands */
     bool ok = lamp_now == Lamp_Press ? (p[0] > 0 && p[1] > 0 && p[2] > 0)
             : lamp_now == Lamp_Run ? (p[0] == 0 && p[1] == 0 && p[2] == 0 &&
-                                      t[0] >= LAMP_WHITE_MIN && t[1] >= LAMP_WHITE_MIN &&
-                                      t[2] >= LAMP_WHITE_MIN)
+                                      t[0] == 255 && t[1] == 255 && t[2] == 255)
             : (p[0] == 0 && p[1] == 0 && p[2] == 0 && t[0] == 0 && t[1] == 0 && t[2] == 0);
     if(!ok) {
         lamp_t want = (lamp_t)lamp_now;
