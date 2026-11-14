@@ -590,7 +590,6 @@ bool driver_init (void)
     hal.get_elapsed_ticks = millis;
     hal.get_micros = micros;
 
-    hal.driver_cap.amass_level = 3;
     /* Required for the hal to initialize properly (POST checks the bit
      * whether or not a pulse delay is configured). */
     hal.driver_cap.step_pulse_delay = On;
