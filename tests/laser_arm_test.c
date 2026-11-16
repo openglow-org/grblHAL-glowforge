@@ -195,6 +195,10 @@ bool gfsw_read_raw(uint8_t *sw)
 
 void gfcool_laser_armed(bool armed) { cool_armed_calls++; cool_armed_last = armed; }
 void gf_stream_laser(unsigned char power, bool fire) { (void)power; (void)fire; }
+static bool on_producer;            /* the caller stands for the stepper producer thread */
+bool gf_stream_on_producer(void) { return on_producer; }
+static int  rpm_unknown;            /* st_rpm_changed() calls that marked the core's power cache unknown */
+void st_rpm_changed(float rpm) { if(rpm < 0.0f) rpm_unknown++; }
 void gf_stream_laser_arm(bool armed) { stream_armed = armed; }
 void gf_stream_jog(bool jog) { (void)jog; }   /* the jog mask lives in the stream */
 void gf_stream_fire_gate(bool open) { fire_gate_last = open; }
@@ -756,6 +760,21 @@ int main(void)
     spindleSetState(NULL, on, 300.0f);          /* and M3 again */
     CHECK(sw_calls == 0 && laser_ok && stream_armed,
           "an M5 then an M3 inside the open window does not re-prompt");
+
+    /* Case I2 - a laser push the core makes outside a segment (a G1 to the
+       current position under M3, a power override at Idle) leaves the
+       core's power cache saying the level before it: the push marks it
+       unknown, so the next block's first segment carries its own level. A
+       segment's update, on the producer, leaves the cache as the core
+       recorded it. */
+    rpm_unknown = 0;
+    on_producer = false;
+    spindleUpdatePWM(NULL, 60);
+    CHECK(rpm_unknown == 1, "a laser push off the producer marks the core's power cache unknown");
+    on_producer = true;
+    spindleUpdatePWM(NULL, 60);
+    CHECK(rpm_unknown == 1, "a segment's update on the producer leaves the cache as the core recorded it");
+    on_producer = false;
 
     printf("a window does not outlive its job, and the next job is prompted:\n");
 

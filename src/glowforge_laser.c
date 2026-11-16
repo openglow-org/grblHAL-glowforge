@@ -8,9 +8,11 @@
   exactly 127), and fire rides the per-tick FIRE bit. Power lands via
   the core's per-segment spindle update, which the stepper producer runs
   at exact virtual-tick positions - so the laser only ever fires inside
-  motion segments of laser blocks. G0 and homing are fire-free by
-  construction; a jog carries the modal spindle in Grbl, so the stream
-  masks fire for as long as the core is jogging (gf_stream_jog). The
+  motion segments of laser blocks. Every other motion is fire-free by
+  construction: the core plans a G0, the traversals of a G28 or G30,
+  every move of a canned drilling cycle and a jog at zero power in laser
+  mode, homing runs with the spindle off, and the stream masks fire for as
+  long as the core is jogging as well (gf_stream_jog). The
   kernel's end-of-data backstop forces the lines low whenever a stream
   ends.
 
@@ -1411,7 +1413,18 @@ static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
 
 /* Runs on the stepper producer thread (per-segment, under the core
  * lock) as well as the protocol thread (state changes, overrides) - no
- * reporting from here, only the deferred suppression note. */
+ * reporting from here, only the deferred suppression note.
+ *
+ * A segment's update reaches here after the core has recorded its level
+ * in the power cache it compares the next segments against. Every other
+ * push does not: a G1 to the current position under M3 sets the laser
+ * state directly, and so does a power override at Idle. The stream keeps
+ * the pushed state for the next run's first byte, and a cache that still
+ * says the level before the push would let a rapid or an S0 move, whose
+ * level equals it, run on with no update of its own. So a push off the
+ * producer marks the cache unknown, and the next block's first segment
+ * carries its own level. On the set_state path the core records the real
+ * level right after this returns. */
 static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
 {
     (void)spindle;
@@ -1429,6 +1442,8 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
     }
 
     gf_stream_laser((uint8_t)(pwm > PWM_PERIOD ? PWM_PERIOD : pwm), fire);
+    if(!gf_stream_on_producer())
+        st_rpm_changed(-1.0f);
 }
 
 /* --- lifecycle ------------------------------------------------------------ */
@@ -1722,9 +1737,8 @@ static void onHomingCompleted (axes_signals_t cycle, bool success)
         on_homing_completed(cycle, success);
 }
 
-/* A jog carries the modal spindle in Grbl (the core copies it into the
- * jog block and never disables the laser for it), so the stream masks
- * fire for as long as the core is jogging: the mask follows the state
+/* The core plans a laser jog at zero power. The stream masks fire for as
+ * long as the core is jogging as well: the mask follows the state
  * transitions, which bracket the jog's own blocks in the stream. */
 static void onStateChange (sys_state_t state)
 {

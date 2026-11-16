@@ -79,6 +79,17 @@ void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks);
 // as well: a transition queued after the window closed carries no fire.
 void gf_stream_laser_arm (bool armed);
 void gf_stream_jog (bool jog);
+
+// A run has ended (the core's go-idle with no reset). Called off the
+// producer (the core stopped the run: st_reset), the stream wants nothing
+// lit until the core pushes a laser state again, so the next run's first
+// byte relights only a push made after this. Called on the producer (the
+// run ran out of segments), the wanted state stays for the rest of the
+// block.
+void gf_stream_run_end (void);
+
+// True on the producer thread, where every laser update is a segment's.
+bool gf_stream_on_producer (void);
 bool gf_stream_kernel_idle (void);
 
 // The per-tick fire gate: the armed window AND the cooling verdict, as

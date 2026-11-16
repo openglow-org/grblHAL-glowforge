@@ -72,9 +72,10 @@
                                                      the answer to the M-code state names
 
   The port's only motion is the core's jog, $J=. A jog ships dark whatever
-  the modal spindle state is, because the stream masks FIRE while the core
-  is jogging; no other motion has that property, so the port's only motion
-  line starts with $J=, and <words> is held to the characters a jog needs.
+  the modal spindle state is, on two counts: the core plans a laser jog at
+  zero power, and the stream masks FIRE while the core is jogging. So the
+  port's only motion line starts with $J=, and <words> is held to the
+  characters a jog needs.
   The one g-code line it forms besides is the tray op's M103 P0 or P1,
   which moves nothing and carries no laser word.
 

@@ -44,6 +44,14 @@ jobs:
           repository: openglow-org/forgefirm
           ref: ${{ (github.ref_name == 'next' || github.base_ref == 'next') && 'next' || '' }}
           path: forgefirm
+      # The board runs the controller with cap_sys_nice, so its producer
+      # runs SCHED_FIFO and keeps its lead on a busy host. Without it a
+      # loaded runner can starve the producer inside an armed window, and
+      # the stream faults the run on purpose. A harness reruns a session
+      # starved that way once, from a new controller; a second starve
+      # fails it.
+      - name: Give the controller cap_sys_nice, as the board does
+        run: sudo setcap cap_sys_nice+ep build/grblHAL_glowforge
       - name: Laser stream emission rules
         run: python3 forgefirm/scripts/bench/laser_stream_test.py build/grblHAL_glowforge
       - name: Armed-window lifecycle

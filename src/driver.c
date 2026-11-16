@@ -164,7 +164,8 @@ static stepper_t *core_stepper;
 
 static void stepperGoIdle (bool clear_signals)
 {
-    (void)clear_signals;   /* pulse bytes have no persistent pin state */
+    /* clear_signals is st_wake_up's idle ahead of a run: pulse bytes have
+     * no persistent pin state to reset, and no run ends there. */
 
     /* mc_reset sets EXEC_RESET before it kills the steppers during
      * motion: the stream that ends here is then the reset's, and the
@@ -188,6 +189,17 @@ static void stepperGoIdle (bool clear_signals)
         dirs = (uint8_t)core_stepper->dir_out.bits;
     }
     gf_stream_go_idle(reset, steps, dirs);
+
+    /* A run ends dark: the stream turns fire off at its last byte. A run
+     * the core stopped from off the producer (st_reset: a canceled jog, a
+     * stop) leaves the stream wanting nothing lit, as st_reset leaves the
+     * core's power cache at zero. A run that ran out of segments on the
+     * producer keeps the wanted fire, which the cache still matches, for
+     * the rest of its block (gf_stream_run_end); a hold that ends a run
+     * that way then turns the laser off with a push of its own. A reset's
+     * own idle is gf_stream_reset's, which drops the wanted state itself. */
+    if(!clear_signals && !reset)
+        gf_stream_run_end();
     gf_core_unlock();
 }
 
@@ -430,12 +442,46 @@ static bool motion_parked (uint_fast16_t state)
     }
 }
 
+/* The harness's protocol-thread stall, a test hook (GFSINK_PROTO_STALL_MS,
+ * honored only in a null-sink run): once, a second into a cycle, the
+ * protocol thread sleeps that many milliseconds (at most 2000), so the
+ * producer runs out of prepared segments in the middle of a block. */
+static void proto_stall (uint_fast16_t state)
+{
+    static int stall_ms = -1;
+    static bool in_cycle;
+    static uint32_t cycle_at;
+
+    if(stall_ms < 0) {
+        const char *v = gfio_test_hook("GFSINK_PROTO_STALL_MS");
+        stall_ms = v ? atoi(v) : 0;
+        if(stall_ms < 0 || stall_ms > 2000)
+            stall_ms = 0;
+    }
+    if(stall_ms == 0)
+        return;
+    if(state != STATE_CYCLE) {
+        in_cycle = false;
+        return;
+    }
+    if(!in_cycle) {
+        in_cycle = true;
+        cycle_at = millis();
+    } else if((int32_t)(millis() - cycle_at) >= 1000) {
+        struct timespec ts = { .tv_sec = stall_ms / 1000, .tv_nsec = (stall_ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        stall_ms = 0;
+    }
+}
+
 /* Realtime hook, chained on grbl.on_execute_realtime: everything the
  * driver must do periodically on the protocol thread. Also paces the
  * loop - without a wait the protocol thread busy-spins and starves the
  * rest of the single-core i.MX6. */
 static void glowforge_process_realtime (uint_fast16_t state)
 {
+    proto_stall(state);
+
     /* The lens reference forgectrl left before this controller started.
      * Taken here rather than at driver_init or the settings-changed hook:
      * the step scale it converts through is not loaded at the first, and

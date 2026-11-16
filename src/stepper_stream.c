@@ -288,7 +288,9 @@ static struct {
 
     /* The laser state the core last asked for, recorded whether or not
      * the stream was running: a change made while idle has no event to
-     * ride, so the next run re-asserts it at its first byte. */
+     * ride, so the next run re-asserts it at its first byte. A run the
+     * core stops from off the producer forgets the fire
+     * (gf_stream_run_end): only a push made after it lights the next run. */
     uint8_t want_power;
     bool want_fire;
     bool jogging;               /* the core is in STATE_JOG: fire masked */
@@ -773,13 +775,30 @@ void gf_stream_laser_arm (bool state)
     laser_armed = state;
 }
 
-/* The core is jogging, or has stopped. A jog block carries the modal
- * spindle, so its ticks would fire at the S in force: the mask holds
- * fire off from the transition into STATE_JOG (queued at the current
- * virtual time, ahead of the jog's own ticks) until the transition out,
- * where the core's wanted state is re-asserted for whatever follows.
- * The wanted state itself is left alone: the jog changes nothing about
- * what the next cut lights with. */
+/* A run has ended (the core's go-idle, no reset). A run the core stopped
+ * from off the producer (st_reset after a canceled jog, a stop) leaves
+ * the stream wanting nothing lit: the next run's first byte lights only
+ * what the core pushes after this. A run that ran out of prepared
+ * segments on the producer (the planner ran dry, a hold, the end of a
+ * cancel's deceleration) keeps the wanted fire, so the rest of a block
+ * that a starve cut in two relights at the next run's first byte: the
+ * core sends that rest no update of its own. */
+void gf_stream_run_end (void)
+{
+    if(gf_stream_on_producer())
+        return;
+    pthread_mutex_lock(&gf.lock);
+    gf.want_fire = false;
+    pthread_mutex_unlock(&gf.lock);
+}
+
+/* True on the producer thread: a laser update there is a segment's, which
+ * the core has recorded in its power cache before it made the call. */
+bool gf_stream_on_producer (void)
+{
+    return gf.threads_started && pthread_equal(pthread_self(), gf.producer_tid);
+}
+
 /* True when the kernel reports idle (or cannot be asked: no device). A
  * read that fails reads as "not idle" for the callers that wait on it,
  * which are all bounded. */
@@ -793,6 +812,11 @@ bool gf_stream_kernel_idle (void)
     return strcmp(state, "idle") == 0;
 }
 
+/* The core is jogging, or has stopped. The core plans a laser jog at zero
+ * power; the mask holds fire off as well, from the transition into
+ * STATE_JOG (queued at the current virtual time, ahead of the jog's own
+ * ticks) until the transition out, where the core's wanted state is
+ * re-asserted for whatever follows. */
 void gf_stream_jog (bool jog)
 {
     if(gf.failed)
@@ -862,14 +886,16 @@ void gf_stream_wakeup (void)
          * only inside an armed window, so a window that closed during
          * the gap cannot be resurrected here; the leading power byte
          * still precedes it, because the shipper drains events before
-         * emitting the tick. */
+         * emitting the tick. The event is queued whatever the shipper
+         * plays now: the fire state at the cursor is not the state at
+         * the run's first byte while the ended run's laser-off still
+         * waits in the queue for that byte. The core's first segment
+         * update, when it sends one, lands on the same byte and wins. */
         bool want_fire = gf.want_fire && laser_armed && !gf.jogging;
-        if(gf.want_power != gf.cur_power || want_fire != gf.cur_fire) {
-            if(gf.lev_tail - gf.lev_head < LEV_N) {
-                gf.lev[gf.lev_tail & LEV_MASK] = (struct laser_ev){
-                    .idx = gf.base, .power = gf.want_power, .fire = want_fire };
-                gf.lev_tail++;
-            }
+        if(gf.lev_tail - gf.lev_head < LEV_N) {
+            gf.lev[gf.lev_tail & LEV_MASK] = (struct laser_ev){
+                .idx = gf.base, .power = gf.want_power, .fire = want_fire };
+            gf.lev_tail++;
         }
 
         if(gf.active)

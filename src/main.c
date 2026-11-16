@@ -129,6 +129,7 @@ static const char *const ENV_OVERRIDES[] = {
  * serial_test holds this list to the sources too. */
 static const char *const TEST_HOOKS[] = {
     "GF_LED_ROOT", "GF_STATE_DIR", "GF_SWITCH_DEV", "GF_SWITCH_FILE", "GF_VERDICT_FILE",
+    "GFSINK_PROTO_STALL_MS",
 };
 
 /* Adds a name to the notice line: false when the line has no room. */

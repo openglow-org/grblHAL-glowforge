@@ -74,11 +74,16 @@
 /* --- stubs the serial source links against -------------------------- */
 
 static int realtime_seen;           /* bytes taken by the real-time path */
+static int door_seen;               /* door bytes that reached the core */
 
 bool protocol_enqueue_realtime_command(uint8_t c)
 {
     if(c == '?' || c == '!' || c == '~' || c == 0x18) {
         realtime_seen++;
+        return true;
+    }
+    if(c == 0x84) {                 /* the core takes it as a door in any state */
+        door_seen++;
         return true;
     }
     return false;
@@ -488,6 +493,17 @@ int main(void)
     CHECK(serialGetC() == SERIAL_NO_DATA && serialRxCount() == 0,
           "a byte the input poll's reset flushed is never read");
     input_poll_does = NULL;
+
+    /* The machine's door is the lid. A door byte from the sender, alone or
+       as the second byte of a UTF-8 character in a comment, reaches
+       neither the core's real-time path nor the line. */
+    serialRxFlush();
+    push("\x84");
+    push("G1 X5 (\xc5\x84)\n");
+    CHECK(door_seen == 0, "a door byte from the sender never reaches the core");
+    n = drain(got, 200, &bad, "G1 X5 (\xc5)", "");
+    CHECK(n == 1 && bad == 0 && strcmp(got[0], "G1 X5 (\xc5)") == 0,
+          "and the line it rode arrives without it");
 
     /* --- the banner on a connect --------------------------------------- */
     printf("The welcome banner on a connect:\n");

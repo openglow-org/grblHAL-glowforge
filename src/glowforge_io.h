@@ -17,8 +17,9 @@
 
 // The test hooks: GF_SWITCH_DEV moves the switch device, GF_SWITCH_FILE
 // the file-backed switch source, GF_VERDICT_FILE the cooling verdict file,
-// GF_LED_ROOT the LED class (default /sys/class/leds) and GF_STATE_DIR
-// the state directory (default /run/forgefirm), for a
+// GF_LED_ROOT the LED class (default /sys/class/leds), GF_STATE_DIR
+// the state directory (default /run/forgefirm), and GFSINK_PROTO_STALL_MS
+// stalls the protocol thread once in a cycle (driver.c), for a
 // host harness or a host test. The controller honors
 // a test hook only in a null-sink run, that is with GFSINK unset or empty:
 // there this returns the variable's value. With GFSINK set it returns NULL,

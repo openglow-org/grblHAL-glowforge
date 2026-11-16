@@ -341,6 +341,14 @@ static void rx_byte (uint8_t data)
         return;
     }
 
+    /* The machine's door is the lid, and the switch module reads it. A
+     * door byte from the sender is no door: taken, it would hold a jog
+     * that a cycle start then resumes as a cycle, and a UTF-8 character
+     * whose second byte it is, in a comment, would cancel a job as a lid
+     * opened with the lid closed. */
+    if(data == CMD_SAFETY_DOOR)
+        return;
+
     if((data == CMD_CYCLE_START_LEGACY || data == CMD_CYCLE_START) && gflaser_resume_gate())
         return;                             // a held laser job re-arms first; the gate issues the start
 

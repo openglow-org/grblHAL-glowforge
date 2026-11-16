@@ -69,6 +69,13 @@
   - the mid-run check: a kernel that stops running while it owns bytes
     of the live stream (an underrun, or a stop another writer made)
     faults the stream;
+  - the run-start re-assert: a laser state the core pushed while nothing
+    streamed relights the next run at its first byte only inside the
+    armed window, and a run that restarts while the last one's lit tail
+    still ships relights at its first byte all the same; a run the core
+    stops from off the producer forgets the wanted fire, so only a push
+    made after it relights, and a run that ran out of segments on the
+    producer keeps it for the rest of its block;
   - one alarm per stream fault: a fault that another thread lands during
     a state read raised its own alarm, so the run request and the mid-run
     check raise no second one;
@@ -179,15 +186,41 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     return -1;
 }
 
+static unsigned char ring_buf[4096];   /* the first bytes the stand-in took, in order */
+
 static void ring_drain (void)
 {
     unsigned char b[512];
     ssize_t n;
     while(ring_rd >= 0 && (n = read(ring_rd, b, sizeof(b))) > 0) {
+        for(ssize_t i = 0; i < n; i++)
+            if(ring_took + (uint32_t)i < sizeof(ring_buf))
+                ring_buf[ring_took + (uint32_t)i] = b[i];
         ring_took += (uint32_t)n;
         ring_tail[0] = n > 1 ? b[n - 2] : ring_tail[1];
         ring_tail[1] = b[n - 1];
     }
+}
+
+/* The tick bytes the ring took from stream tick `from` up to `to`, and
+ * how many of them carry FIRE. A power byte (bit 7) is no tick. */
+static int lit_ticks (uint32_t from, uint32_t to, int *ticks)
+{
+    uint32_t tick = 0;
+    int lit = 0, n = 0;
+    ring_drain();
+    for(uint32_t i = 0; i < ring_took && i < sizeof(ring_buf); i++) {
+        if(ring_buf[i] & 0x80)
+            continue;
+        if(tick >= from && tick < to) {
+            n++;
+            if(ring_buf[i] & 0x10)
+                lit++;
+        }
+        tick++;
+    }
+    *ticks = n;
+    return lit;
 }
 
 /* The kernel's position record: the step counters and the processed
@@ -767,6 +800,117 @@ int main (void)
     check_kernel_state();
     CHECK(gf.failed && atomic_exchange(&fault_flag, false),
           "a kernel stopped under a live stream with no request pending faults the stream");
+
+    printf("the run-start re-assert:\n");
+
+    /* The core's laser state pushed while nothing streams (an S word, an
+     * M3 at Idle) has no event to ride: the next run re-asserts it at its
+     * first byte, and lights it only inside the armed window. With the
+     * window closed and the per-tick gate open, so that the re-assert's
+     * own mask is the only thing left to hold it, the run ships dark. */
+    int ticks;
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&fire_gate, true);
+    gf_stream_laser(100, true);         /* pushed at Idle: the wanted state only */
+    gf_stream_wakeup();                 /* a fresh stream: its first byte is the depth */
+    ship_pass();
+    gf.ship_t0 -= 0.05;                 /* 50 more ticks are due */
+    ship_pass();
+    int relit = lit_ticks(100, 150, &ticks);
+    CHECK(ticks == 50 && relit == 0, "a run start outside the window relights nothing the core wanted at Idle");
+    ring_close();
+
+    /* A run that restarts while the last one's tail still plays (a
+     * continuation inside the producer's lead) relights at its first
+     * byte: the last run's laser-off waits in the queue for that byte
+     * while the shipper still plays the lit tail, and the re-assert goes
+     * behind it, whatever the fire state at the cursor. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf_stream_laser(100, true);
+    gf_stream_wakeup();
+    ship_pass();
+    gf.ship_t0 -= 0.05;
+    ship_pass();                        /* lit from the run's first byte, 100, to the cursor */
+    gf.produced = gf.shipped + 30;      /* the producer leads the cursor */
+    uint64_t next_base = gf.produced;
+    gf_stream_go_idle(false, 0, 0);     /* the run ends: its laser-off at its last byte */
+    gf_stream_wakeup();                 /* and the next starts inside the lead, at that byte */
+    CHECK(gf.base == next_base, "the restart is a continuation at the ended run's last byte");
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    int lit_tail = lit_ticks(100, (uint32_t)next_base, &ticks);
+    CHECK(lit_tail == ticks && ticks > 0, "the ended run's tail ships lit to its last byte");
+    relit = lit_ticks((uint32_t)next_base, (uint32_t)next_base + 20, &ticks);
+    CHECK(ticks == 20 && relit == 20, "and the restarted run is lit from its first byte");
+    ring_close();
+
+    /* A run the core stops from off the producer (st_reset's go-idle after
+     * a canceled jog; this test's thread is not the producer) forgets the
+     * wanted fire: the next run lights nothing the core wanted before the
+     * end, and a laser state the core pushes after it lights the run after. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf_stream_laser(100, true);
+    stream_ended(0);                    /* lit from its first byte, and its end */
+    gf_stream_run_end();                /* the driver's go-idle, no reset, off the producer */
+    lit_ticks(0, UINT32_MAX, &ticks);
+    uint32_t t0 = (uint32_t)ticks;      /* the next stream's ticks follow these */
+    gf_stream_wakeup();
+    ship_pass();
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    relit = lit_ticks(t0 + 100, t0 + 150, &ticks);
+    CHECK(ticks == 50 && relit == 0, "after a run end the next run relights nothing wanted before it");
+    gf_stream_go_idle(false, 0, 0);
+    gf_stream_run_end();
+    ship_pass();
+    k_processed = ring_total();
+    gf_stream_laser(100, true);         /* the core pushes a laser-on at Idle */
+    lit_ticks(0, UINT32_MAX, &ticks);
+    t0 = (uint32_t)ticks;
+    gf_stream_wakeup();
+    ship_pass();
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    relit = lit_ticks(t0 + 100, t0 + 150, &ticks);
+    CHECK(ticks == 50 && relit == 50, "and a push after the end lights the next run from its first byte");
+    ring_close();
+
+    /* A run that ran out of prepared segments on the producer (the planner
+     * ran dry in the middle of a block) keeps the wanted fire: the core
+     * sends the rest of that block no update of its own, and the next
+     * run's first byte relights it. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf_stream_laser(100, true);
+    stream_ended(0);
+    pthread_t real_producer = gf.producer_tid;
+    gf.producer_tid = pthread_self();   /* the go-idle comes from the producer */
+    gf.threads_started = true;
+    gf_stream_run_end();
+    gf.threads_started = false;
+    gf.producer_tid = real_producer;
+    lit_ticks(0, UINT32_MAX, &ticks);
+    t0 = (uint32_t)ticks;
+    gf_stream_wakeup();
+    ship_pass();
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    relit = lit_ticks(t0 + 100, t0 + 150, &ticks);
+    CHECK(ticks == 50 && relit == 50, "a run that ran out on the producer keeps the wanted fire for the rest of its block");
+    ring_close();
 
     printf("the dropped backlog:\n");
 
