@@ -81,8 +81,9 @@ The board binary is a cross-build:
 ### CI coupling that sets the push order
 
 This repository's CI fetches the eleven harnesses from the head of the
-`forgefirm` default branch, unpinned. **Push a harness change to `forgefirm`
-first**, then the driver change that needs it.
+`forgefirm` default branch (of its `next` in a run on `next`), unpinned.
+**Push a harness change to `forgefirm` first**, then the driver change that
+needs it.
 
 ## Project-wide rules
 
