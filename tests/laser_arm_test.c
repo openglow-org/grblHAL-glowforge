@@ -41,7 +41,7 @@
   refuses the arm; the head is checked again after the wait; a press
   counts only after the button has been seen up; three unreadable
   switch reads end the wait; a latch that does not unlock refuses the
-  arm; the disarm locks the latch whenever this process unlocked it,
+  arm, a refusal because the cooling engine holds it included; the disarm locks the latch whenever this process unlocked it,
   window or no window; the relock at a job's end treats a faulted or
   underrun kernel as done and an unreadable one as done after a bound;
   the verdict's pause tier closes the fire gate and writes no latch,
@@ -100,6 +100,7 @@ static bool  latch_locked_last;     /* the stream engine's ownership record */
 static int   latch_writes;
 static bool  latch_lock_fail;       /* a lock write does not take */
 static bool  latch_unlock_fail;     /* an unlock write does not take */
+static bool  latch_unlock_refused;  /* ...because the cooling engine holds the latch */
 static int   cool_armed_calls;      /* gfcool_laser_armed() calls */
 static bool  cool_armed_last;
 static const char *rd_state;            /* cnc/state as gfio_rd_attr reads it, NULL = unreadable */
@@ -211,6 +212,7 @@ bool gf_stream_laser_latch(bool lock)
     return true;
 }
 bool gf_stream_latch_locked_by_us(void) { return latch_locked_last; }
+bool gf_stream_latch_refused(void) { return latch_unlock_fail && latch_unlock_refused; }
 int  gfio_rd_attr(const char *a, char *b, size_t l)
 {
     if (l) b[0] = '\0';
@@ -497,6 +499,7 @@ static void reset_state(void)
     latch_locked_last = true;
     latch_writes = 0;
     latch_lock_fail = latch_unlock_fail = false;
+    latch_unlock_refused = false;
     cool_armed_calls = 0;
     cool_armed_last = false;
     rd_state = NULL;
@@ -1273,6 +1276,17 @@ int main(void)
     CHECK(latch_locked_last, "the ownership record still says locked after the failed unlock");
     CHECK(alarms_raised == 1 && resets_requested == 1, "the failed unlock is an alarm and a reset");
     CHECK(cool_armed_last == false, "the engine is told the window is not armed after the failed unlock");
+
+    /* Case S6b - an unlock the kernel refuses (the cooling engine holds
+       the latch) refuses the arm the same way: no window, no press asked
+       for, an alarm and a reset. */
+    reset_state();
+    script(true, true, 2);
+    latch_unlock_fail = latch_unlock_refused = true;
+    CHECK(!gflaser_arm(), "an unlock the kernel refuses refuses the arm");
+    CHECK(!laser_ok && !stream_armed && lamp_at_press == -2,
+          "no window opens and no press is asked for on a refused unlock");
+    CHECK(alarms_raised == 1 && resets_requested == 1, "the refused unlock is an alarm and a reset");
 
     /* Case S5 - the disarm locks the latch whenever this process
        unlocked it, window or no window (a reset in the button wait); a

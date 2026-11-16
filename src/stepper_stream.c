@@ -43,9 +43,12 @@
   The latch has an owner. Every cnc/laser_latch write in the process
   goes through gf_stream_laser_latch, which records which way this
   process last wrote it. A run start relights (unlocks) only a lock this
-  process wrote inside an open window; a lock it did not write, the
-  cooling engine's fail tier, is never undone here: the job goes dark
-  and the verdict closes the window.
+  process wrote inside an open window; a lock it did not write (the
+  supervisor's, or the controller's hold that the cooling engine's lock
+  takes with it) is never undone here: the job goes dark and the
+  verdict closes the window. The cooling engine locks through its own
+  holder in the kernel, and while it holds, the kernel refuses every
+  unlock from this process.
 
   Threading model (three actors):
 
@@ -336,6 +339,9 @@ static pthread_mutex_t latch_mx = PTHREAD_MUTEX_INITIALIZER;
  * "unlocked" that the hardware does not share means someone else locked
  * it: that lock is never undone here. */
 static bool latch_locked_by_us = true;
+/* The last unlock was refused: the cooling engine holds the latch (under
+ * latch_mx). */
+static bool latch_refused;
 static bool latch_fail_reported;
 static int latch_log_fd = -1;       /* GFSINK_LATCH_LOG: one line per latch write */
 
@@ -368,30 +374,37 @@ static void latch_log (const char *what)
 
 /* One latch write with retries. A sysfs store that fails is retried
  * LATCH_RETRIES times, LATCH_RETRY_NS apart; the record follows only a
- * write that took. An unlock of a latch this process already believes
- * unlocked writes nothing: the write would undo a lock someone else
- * made. Call with latch_mx held. */
+ * write that took. An unlock the kernel refuses with EBUSY is not
+ * retried: the cooling engine holds the latch through its own holder,
+ * which no controller unlock undoes, and it releases it on its own
+ * clock; nothing changed. An unlock of a latch this process already
+ * believes unlocked writes nothing: the write would undo a lock someone
+ * else made. Call with latch_mx held. */
 #define LATCH_RETRIES 3
 #define LATCH_RETRY_NS 10000000L    /* 10 ms */
 
 static bool latch_write_locked (bool lock)
 {
+    latch_refused = false;
     if(!lock && !latch_locked_by_us) {
         latch_log("unlock-skipped");
         return true;
     }
     const char *val = lock ? "1" : "0";
     int rc = gfio_wr_attr("cnc/laser_latch", val);
-    for(int i = 0; rc != 0 && i < LATCH_RETRIES; i++) {
+    bool refused = rc != 0 && !lock && errno == EBUSY;
+    for(int i = 0; rc != 0 && !refused && i < LATCH_RETRIES; i++) {
         sleep_ns(LATCH_RETRY_NS);
         rc = gfio_wr_attr("cnc/laser_latch", val);
+        refused = rc != 0 && !lock && errno == EBUSY;
     }
+    latch_refused = refused;
     if(rc == 0) {
         latch_locked_by_us = lock;
         latch_fail_reported = false;
         latch_log(lock ? "lock" : "unlock");
     } else
-        latch_log(lock ? "lock-failed" : "unlock-failed");
+        latch_log(refused ? "unlock-refused" : lock ? "lock-failed" : "unlock-failed");
     return rc == 0;
 }
 
@@ -429,6 +442,14 @@ bool gf_stream_latch_locked_by_us (void)
     bool locked = latch_locked_by_us;
     pthread_mutex_unlock(&latch_mx);
     return locked;
+}
+
+bool gf_stream_latch_refused (void)
+{
+    pthread_mutex_lock(&latch_mx);
+    bool refused = latch_refused;
+    pthread_mutex_unlock(&latch_mx);
+    return refused;
 }
 
 void gf_stream_fire_gate (bool open)

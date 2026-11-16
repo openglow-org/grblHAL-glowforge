@@ -105,14 +105,20 @@ void gf_stream_fire_gate (bool open);
 // relight undoes only a lock this process wrote. A lock is retried and,
 // if it still fails, faults the stream (the realtime hook alarms and
 // disarms). An unlock that fails returns false and unlocks nothing; an
-// unlock of a latch this process already believes unlocked writes
-// nothing (it would undo someone else's lock). With GFSINK_LATCH_LOG
-// set, every write appends one line to that file (the host harnesses'
-// sideband).
+// unlock the kernel refuses because the cooling engine holds the latch
+// is not retried (gf_stream_latch_refused). An unlock of a latch this
+// process already believes unlocked writes nothing (it would undo
+// someone else's lock). With GFSINK_LATCH_LOG set, every write appends
+// one line to that file (the host harnesses' sideband).
 bool gf_stream_laser_latch (bool lock);
 
 // True while this process's last latch write was a lock.
 bool gf_stream_latch_locked_by_us (void);
+
+// True when the last unlock was refused by the kernel because the
+// cooling engine holds the latch (its own holder, which no controller
+// unlock undoes).
+bool gf_stream_latch_refused (void);
 
 // hal.driver_reset hook body. A reset that ends a live stream (a reset
 // during motion) drops the unshipped backlog and stops the kernel with

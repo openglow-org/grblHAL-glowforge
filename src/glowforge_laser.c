@@ -930,14 +930,21 @@ static bool arm_open (unsigned sender_gen)
 }
 
 /* The arm's unlock of the latch. An unlock that does not take refuses
- * the arm: the window never opens against a latch of unknown state. */
+ * the arm: the window never opens against a latch of unknown state. The
+ * kernel refuses it while the cooling engine holds the latch, and the
+ * refusal is named for what it is. */
 static bool arm_unlock (void)
 {
     if(latch_lock(false))
         return true;
     gfcool_laser_armed(false);
-    report_message("laser fire blocked: the laser latch did not unlock", Message_Warning);
-    fflog(LOG_ERR, "gflaser: arm refused - the latch unlock write failed");
+    if(gf_stream_latch_refused()) {
+        report_message("laser fire blocked: the cooling engine holds the laser latch", Message_Warning);
+        fflog(LOG_WARNING, "gflaser: arm refused - the cooling engine holds the laser latch");
+    } else {
+        report_message("laser fire blocked: the laser latch did not unlock", Message_Warning);
+        fflog(LOG_ERR, "gflaser: arm refused - the latch unlock write failed");
+    }
     arm_refused();
     return false;
 }

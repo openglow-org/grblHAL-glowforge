@@ -20,6 +20,9 @@
     acknowledgment opens a new one);
   - an unlock that fails returns false, faults nothing, and leaves the
     record locked;
+  - an unlock the kernel refuses because the cooling engine holds the
+    latch is tried once, faults nothing, leaves the record locked, and
+    is told apart from a failed write;
   - an unlock of a latch this process already believes unlocked writes
     nothing: it would undo a lock someone else made;
   - the run-start relight undoes only a lock this process wrote inside
@@ -113,6 +116,7 @@
 static char wr_log[64][40];         /* "attr=val" per sysfs write */
 static int  wr_n;
 static int  latch_fail_left;        /* latch writes that fail before one takes */
+static bool latch_engine_holds;     /* the kernel refuses an unlock: the cooling engine holds */
 static const char *rd_state = "idle";
 static bool ring_empty;             /* the kernel's ring at a run request */
 static int  idle_refusal;           /* errno of a run refused at idle, 0 = none */
@@ -135,6 +139,11 @@ int gfio_wr_attr (const char *attr, const char *val)
     wr_n++;
     if(!strcmp(attr, "cnc/laser_latch") && latch_fail_left > 0) {
         latch_fail_left--;
+        errno = EIO;
+        return -1;
+    }
+    if(!strcmp(attr, "cnc/laser_latch") && !strcmp(val, "0") && latch_engine_holds) {
+        errno = EBUSY;
         return -1;
     }
     /* The kernel's run request: refused while running, in underrun or
@@ -329,6 +338,8 @@ static void reset_state (void)
 {
     wr_n = 0;
     latch_fail_left = 0;
+    latch_engine_holds = false;
+    latch_refused = false;
     rd_state = "idle";
     atomic_store(&fault_flag, false);
     atomic_store(&laser_armed, false);
@@ -460,6 +471,15 @@ int main (void)
     CHECK(!gf_stream_laser_latch(false), "an unlock that fails reports failure");
     CHECK(latch_locked_by_us, "the record still says locked after a failed unlock");
     CHECK(!atomic_load(&fault_flag) && !gf.failed, "a failed unlock faults nothing");
+    CHECK(!gf_stream_latch_refused(), "a failed unlock is not a refusal");
+
+    reset_state();
+    latch_engine_holds = true;
+    CHECK(!gf_stream_laser_latch(false), "an unlock the kernel refuses (the cooling engine holds) reports failure");
+    CHECK(latch_writes() == 1, "and is tried once: the engine releases on its own clock");
+    CHECK(gf_stream_latch_refused(), "the refusal is told apart from a failed write");
+    CHECK(latch_locked_by_us && !atomic_load(&fault_flag) && !gf.failed,
+          "the record still says locked, and the refusal faults nothing");
 
     printf("the run-start relight:\n");
 
