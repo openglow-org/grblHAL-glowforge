@@ -38,11 +38,12 @@
   latch - at program end (M2/M30), whenever the sender's connection
   changes (the consent belonged to the displaced session), after
   laser_disarm_s of grace (counting down with the spindle off in Idle,
-  in a jog, and in a job parked in Hold, Door or Tool Change, and with
-  M3/M4 still modal whenever the machine is at rest, which is Idle with
-  nothing planned or a jog - a window does not outlive its job, and a
+  in a jog, and in a job parked in Hold or Door, and with M3/M4 still
+  modal whenever the machine is at rest, which is Idle with nothing
+  planned, a jog, or a hold - a window does not outlive its job, and a
   jog is not the job the press consented to; only a cycle, or a spindle
-  left on in a parked job, keeps the window open), on the cooling
+  left on in a job parked in Door, keeps the window open, and no job
+  parks in Tool Change: $341 is pinned to ignore M6), on the cooling
   verdict's fail tier (FIRE, CRASH, AIRFLOW, CRITICAL: the latch locks,
   the job is reset with ALARM:3 and nothing resumes it), or immediately
   on alarm, homing, reset or a stream fault. A window that closes with
@@ -1583,14 +1584,23 @@ static void window_poll (void)
 
     /* Otherwise the window closes after a grace. The grace counts down
      * whenever the spindle is off outside a cycle - including a jog, and
-     * a job parked in Hold, Door or Tool Change - and, with the spindle
+     * a job parked in Hold or Door - and, with the spindle
      * still on (a job that left M3/M4 modal), whenever the machine is at
-     * rest: Idle with nothing planned, or a jog. A window does not
+     * rest: Idle with nothing planned, a jog, or a hold. A window does not
      * outlive its job at rest, and a jog is not the job the press
-     * consented to, so neither widens the window. Only a cycle, or a
-     * spindle the core left on in a parked job, keeps it open. */
+     * consented to, so neither widens the window. A hold counts whatever
+     * the spindle reads: the core turns the laser off in a hold ($63 is
+     * pinned), and a sender's spindle-stop override (0x9E) turns it back
+     * on in the hold at level 0, which would otherwise keep the window
+     * open for as long as the hold lasts. A hold's resume restores the
+     * laser and starts the cycle with no wait between them ($673, the
+     * coolant on-delay that would put one there, is pinned to 0). Only a
+     * cycle, or a spindle the core left on in a job parked in Door, keeps
+     * the window open; no job parks in Tool Change ($341 is pinned to
+     * ignore M6). */
     spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
-    bool at_rest = st == STATE_JOG || (st == STATE_IDLE && plan_get_current_block() == NULL);
+    bool at_rest = st == STATE_JOG || (st & STATE_HOLD) ||
+                   (st == STATE_IDLE && plan_get_current_block() == NULL);
     if((st & STATE_CYCLE) || (cur.on && !at_rest)) {
         disarm_at = 0.0;
         return;
@@ -1623,9 +1633,9 @@ static void window_poll (void)
  * parser and in the reports, and the spindle told off, which asks for no
  * arm), so the next M3/M4 is a state change and asks for the press.
  *
- * A parked job keeps its M3/M4: in Hold, Door or Tool Change the drop
- * waits, because the resume gate re-arms a held job by its modal state,
- * and an arm that opens the window again cancels it. Under an alarm, a
+ * A parked job keeps its M3/M4: in Hold or Door the drop waits, because
+ * the resume gate re-arms a held job by its modal state, and an arm that
+ * opens the window again cancels it. Under an alarm, a
  * homing session or a jog it waits for Idle, which the machine reaches
  * before the parser takes another line. */
 static void modal_poll (void)

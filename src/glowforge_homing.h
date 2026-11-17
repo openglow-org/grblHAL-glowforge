@@ -37,11 +37,12 @@ static inline int gfhome_park_steps (float edge_z_mm, float park_z_mm, float z_s
     return k < -down ? -down : k > up ? up : (int)k;
 }
 
-// The homing session's budget, seconds, held to 10..3600: a value out of
-// range lands on the nearer end, and one that is not a number (NaN, an
-// unparsable key) takes `dflt`. The session runs with the pulse device
-// handed over, so it is always bounded.
-#define GFHOME_TIMEOUT_MIN_S 10.0f
+// The homing session's budget, seconds, held to 30..3600, the range the
+// daemon's settings page holds the key to: a value out of range lands on
+// the nearer end, and one that is not a number (NaN, an unparsable key)
+// takes `dflt`. The session runs with the pulse device handed over, so it
+// is always bounded.
+#define GFHOME_TIMEOUT_MIN_S 30.0f
 #define GFHOME_TIMEOUT_MAX_S 3600.0f
 
 static inline float gfhome_clamp_timeout_s (float s, float dflt)
@@ -50,6 +51,17 @@ static inline float gfhome_clamp_timeout_s (float s, float dflt)
         return dflt;
     return s < GFHOME_TIMEOUT_MIN_S ? GFHOME_TIMEOUT_MIN_S
          : s > GFHOME_TIMEOUT_MAX_S ? GFHOME_TIMEOUT_MAX_S : s;
+}
+
+// The runner's share of a budget, seconds from the session's start: the
+// controller ends the session at the budget, so the runner stops its own
+// session this long before and keeps the rest for its last steps (the lens
+// reference and park, its stop, its socket close). 30 s are kept from a
+// budget over 60 s, half of a shorter one, so the share is always under
+// the budget and never nothing.
+static inline float gfhome_runner_share_s (float timeout_s)
+{
+    return timeout_s > 60.0f ? timeout_s - 30.0f : timeout_s / 2.0f;
 }
 
 // The coordinate a home declares. Each homing provider has its own pair of

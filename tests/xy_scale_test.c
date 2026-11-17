@@ -17,8 +17,13 @@
   And the pins the settings dispatch re-asserts (gfio_apply_machine_pins):
   $100/$101 from the mode, $110/$111 under the ceiling, $102 the lens
   screw's constant (a typed 0 or 999 is overwritten), $32 laser mode (a
-  typed 0 is overwritten), bit 0 of $63, the laser off in a hold (a typed
-  $63=0 is overwritten, the other bits kept), and $44-$46, the homing cycle masks (a typed
+  typed 0 is overwritten), $63 at 3, the laser off in a hold and restored
+  on resume (a typed $63=0 or $63=7 is overwritten), $34 at 0, the
+  laser's off value (a typed 10 is overwritten), the $22 bits of the
+  core's homing cycle off (a typed $22 with every bit set loses those six
+  and keeps the rest), $341 at 4, M6 ignored (a typed 1 is overwritten),
+  $673 at 0, no coolant on-delay (a typed 3 s is overwritten), and
+  $44-$46, the homing cycle masks (a typed
   $44=1, or all three typed 0, is overwritten with the driver's cycles,
   whose union holds Z: the core keeps an axis homed only while a cycle
   names it, and the lens hold rests on the Z homed bit).
@@ -130,20 +135,37 @@ int main (void)
     expect_u("the held axes are reported", held, 1u << X_AXIS);
     expect_f("$102 typed to 0 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
     expect_u("$32 typed to 0 is re-asserted", (unsigned)s.mode, (unsigned)Mode_Laser);
-    /* $63 bit 0, the laser off in a hold: a typed $63=0 is put back, and
-     * the setting's other two bits stay as they were typed. */
-    expect_u("$63 bit 0 typed to 0 is re-asserted", s.flags.disable_laser_during_hold, 1);
-    expect_u("$63 bit 1 typed to 0 is left alone", s.flags.restore_after_feed_hold, 0);
-    s.flags.disable_laser_during_hold = 0;
+    /* $63 at 3, the laser off in a hold and restored on resume: a typed
+     * $63=0 is put back, and so is a typed $63=7, whose bit 2 would leave
+     * the laser on at its floor through the hold. */
+    expect_u("$63 typed to 0 is re-asserted as 3",
+             (unsigned)(s.flags.disable_laser_during_hold | s.flags.restore_after_feed_hold << 1 |
+                        s.flags.set_rpm_0_during_hold << 2), 3);
+    s.flags.disable_laser_during_hold = 1;
     s.flags.restore_after_feed_hold = 1;
     s.flags.set_rpm_0_during_hold = 1;
+    /* $34, the laser's off value: a typed 10 is put back to 0. */
+    s.pwm_spindle.pwm_off_value = 10.0f;
+    /* $22: a sender's every bit set. The six bits of the core's homing
+     * cycle go; the rest of the word stays as typed. */
+    s.homing.flags.value = 0x7FF;
+    /* $341: a sender's manual tool change (1) goes back to "ignore M6";
+     * $673: a typed 3 s coolant on-delay goes back to none. */
+    s.tool_change.mode = ToolChange_Manual;
+    s.coolant.on_delay = 3000;
     s.axis[Z_AXIS].steps_per_mm = 999.0f;
     s.mode = Mode_Lathe;
     s.axis[X_AXIS].max_rate = 12000.0f;
     held = gfio_apply_machine_pins(&s, 32, 112640);
-    expect_u("$63 bit 0 is re-asserted again", s.flags.disable_laser_during_hold, 1);
-    expect_u("$63 bits 1 and 2 keep what was typed",
-             (unsigned)(s.flags.restore_after_feed_hold << 1 | s.flags.set_rpm_0_during_hold << 2), 6);
+    expect_u("$63 typed to 7 is re-asserted as 3",
+             (unsigned)(s.flags.disable_laser_during_hold | s.flags.restore_after_feed_hold << 1 |
+                        s.flags.set_rpm_0_during_hold << 2), 3);
+    expect_f("$34 typed to 10 is re-asserted", s.pwm_spindle.pwm_off_value, 0.0f, 0.0f);
+    expect_u("$22 typed to 0x7FF keeps only the bits outside the homing cycle",
+             s.homing.flags.value, 0x7FF & ~0x6Fu);
+    expect_u("$341 typed to 1 is re-asserted as 4", (unsigned)s.tool_change.mode,
+             (unsigned)ToolChange_Ignore);
+    expect_u("$673 typed to 3 is re-asserted as 0", s.coolant.on_delay, 0);
     expect_f("$102 typed to 999 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
     expect_u("$32 is re-asserted again", (unsigned)s.mode, (unsigned)Mode_Laser);
     expect_f("$100 follows the mode", s.axis[X_AXIS].steps_per_mm, 213.333f, 1e-4f);

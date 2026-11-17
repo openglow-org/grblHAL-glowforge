@@ -43,6 +43,7 @@
 #include "glowforge_cooling.h"
 #include "glowforge_homing.h"
 #include "glowforge_release.h"
+#include "glowforge_startup.h"
 #include "glowforge_laser.h"
 #include "glowforge_mcode.h"
 #include "glowforge_status.h"
@@ -310,17 +311,13 @@ static void irqEnable (void)
 
 static on_settings_changed_ptr settings_changed_chain;
 
-/* The machine's pinned settings are never typed: $100/$101 come from
- * the microstep mode, $102 from the lens screw, $32 is laser mode,
- * bit 0 of $63 (the laser off in a hold) is on,
- * $110/$111 are held under what the stream can carry (one step per
- * machine tick per axis, which matters when the bench lowers the tick
- * under GFSINK_RATE), and $44-$46 are the core's default homing cycles,
- * whose union names Z (glowforge_io.h: the core keeps an axis homed
- * only while a cycle names it, and the lens hold rests on the Z homed
- * bit). Re-asserted before the chain runs, so everything the chain
- * derives (the spindle's laser capability included) sees the values in
- * force, in RAM only like $35. */
+/* The machine's pinned settings are never typed; gfio_apply_machine_pins
+ * (glowforge_io.h) holds the list and the reason for each: the XY scale
+ * and its rate ceiling, the lens screw, laser mode, the laser's hold and
+ * off settings, $22's homing bits, the tool-change mode, the coolant
+ * on-delay and the homing cycles. Re-asserted before the chain runs, so
+ * everything the chain derives (the spindle's laser capability included)
+ * sees the values in force, in RAM only like $35. */
 static void apply_machine_pins (settings_t *settings)
 {
     unsigned mode = gfio_xy_microsteps();
@@ -569,6 +566,10 @@ bool driver_setup (settings_t *settings)
     grbl.on_settings_changed(settings, changed_flags);
     hal.stepper.go_idle(true);
     hal.coolant.set_state((coolant_state_t){0});
+    /* The settings are loaded and the protocol loop has not started yet:
+     * the stored startup lines are checked before the core first runs
+     * them. */
+    gfstartup_check();
 
     return settings->version.id == 23;
 }
@@ -582,6 +583,7 @@ bool driver_init (void)
     gfstatus_init();
     gfhome_init();
     gfrelease_init();
+    gfstartup_init();
     gflaser_init();
     gfmcode_init();             /* after gflaser_init: M102 stays the laser's */
     gftray_init();              /* M103, and the mode the marker persisted */

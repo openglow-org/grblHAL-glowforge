@@ -886,17 +886,19 @@ int main(void)
     gflaser_poll();
     CHECK(!gc_state.modal.spindle[0].state.on && spindle_off_calls == 1, "back at Idle the parser's M4 goes");
 
-    /* Case W5 - a parked job whose spindle the core left on keeps its
-       window: the grace runs with the spindle on only at rest, and a hold
-       is not rest. */
+    /* Case W5 - a held job whose spindle reads on (a sender's spindle-stop
+       override turns it back on in the hold) does not keep its window: a
+       hold is rest, and the grace closes the window whatever the spindle
+       reads. */
     reset_state();
     script(true, true, 2);
-    CHECK(gflaser_arm() && laser_ok, "armed for the parked job");
+    CHECK(gflaser_arm() && laser_ok, "armed for the held job");
     atomic_store(&cur_state_value, on.value);
     cur_state = STATE_HOLD;
     disarm_at = 1.0;                            /* a grace that has expired */
     gflaser_poll();
-    CHECK(laser_ok && disarm_at == 0.0, "a spindle left on in a parked job keeps the window open");
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last, "a spindle on in a hold does not keep the window open");
 
     /* Case W6 - the drop waits while an arm waits for its press, the poll
        running inside the arm's pump. No path owes a drop with M3/M4 modal

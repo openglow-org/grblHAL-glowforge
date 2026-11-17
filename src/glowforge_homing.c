@@ -19,7 +19,9 @@
                             is.
     homing_mode = switches  $H is refused: no limit switch backend exists.
     homing_mode = none      $H falls through to the core, which rejects
-                            it while homing is disabled ($22=0).
+                            it: homing is disabled, and $22's homing bits
+                            are pinned off (glowforge_io.h), so $HX, $HY
+                            and $HZ are rejected in every mode.
 
   The registered "H" system command shadows the core's (the command
   chain searches driver registrations first) and re-reads the config on
@@ -79,6 +81,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CMD_DEFAULT       "/usr/sbin/gfhome.py"
@@ -417,13 +420,17 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
 
     fflog(LOG_INFO, "gfhome: starting homing session: %s", cmd);
 
-    /* Hand the runner its share of the budget so it gives up before the
-     * SIGTERM deadline. Set pre-fork (env calls are not async-signal-
-     * safe in the child); every getenv user runs on this thread. */
-    char budget[16];
-    snprintf(budget, sizeof(budget), "%u",
-             timeout_ms > 60000 ? timeout_ms / 1000 - 30 : 30);
-    setenv("GFHOME_TIMEOUT_S", budget, 1);
+    /* Hand the runner its share of the budget as a time on the monotonic
+     * clock it shares with this process (GFHOME_DEADLINE, seconds), so the
+     * runner's own start-up counts against it and it gives up before the
+     * SIGTERM below. Set pre-fork (env calls are not async-signal-safe in
+     * the child); every getenv user runs on this thread. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    char runner_deadline[32];
+    snprintf(runner_deadline, sizeof(runner_deadline), "%.3f",
+             (double)ts.tv_sec + (double)ts.tv_nsec / 1e9 + (double)gfhome_runner_share_s(timeout_s));
+    setenv("GFHOME_DEADLINE", runner_deadline, 1);
     /* The park: from the edge to the park height, in whole half-steps,
      * inside the window every head reaches without touching a stop. The
      * runner takes the steps after its reference; Z below is set to
@@ -457,7 +464,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
-    unsetenv("GFHOME_TIMEOUT_S");
+    unsetenv("GFHOME_DEADLINE");
     unsetenv("GFHOME_PARK_HALF_STEPS");
     unsetenv("GF_REPORT_SECRET");
     if(pid < 0) {

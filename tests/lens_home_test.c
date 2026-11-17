@@ -13,7 +13,8 @@
     - the park is a whole number of half-steps from the edge's grid step
       to the park height's (gfhome_park_steps), kept inside the window
       every head reaches without touching a stop
-    - the session's budget is held to 10..3600 s and the post-homing
+    - the session's budget is held to 30..3600 s, the runner's share of
+      it is under it at every budget (gfhome_runner_share_s), and the post-homing
       coordinates to the bed (gfhome_clamp_timeout_s,
       gfhome_clamp_home_mm), a camera home's to the travel either side of
       the origin (gfhome_clamp_cloud_home_mm): a value in range stands, and
@@ -142,13 +143,13 @@ int main (void)
         }
     }
 
-    /* The session budget: 10..3600 s, the nearer end for a value out of
+    /* The session budget: 30..3600 s, the nearer end for a value out of
      * range, the default for a value that is not a number. */
     {
         const float dflt = 300.0f;
         struct { float in, want; const char *what; } cases[] = {
             { 60.0f, 60.0f, "an in-range budget stands" },
-            { 0.0f, 10.0f, "a zero budget lands on 10, never wait-forever" },
+            { 0.0f, 30.0f, "a zero budget lands on 30, never wait-forever" },
             { 90000.0f, 3600.0f, "a huge budget lands on 3600" },
             { NAN, 300.0f, "a budget that is not a number takes the default" },
         };
@@ -160,6 +161,25 @@ int main (void)
             } else {
                 printf("ok   timeout %g -> %g: %s\n", (double)cases[i].in, (double)got, cases[i].what);
             }
+        }
+    }
+
+    /* The runner's share: under the budget at every budget the clamp
+     * lets through, so the runner always stops before the controller's
+     * SIGTERM, and the budget less 30 s above 60 s. */
+    {
+        long over = 0;
+        for (int t = (int)GFHOME_TIMEOUT_MIN_S; t <= (int)GFHOME_TIMEOUT_MAX_S; t++) {
+            float share = gfhome_runner_share_s((float)t);
+            if (!(share > 0.0f && share < (float)t))
+                over++;
+        }
+        if (over || !near_f(gfhome_runner_share_s(300.0f), 270.0f)) {
+            printf("FAIL the runner's share: %ld budgets give a share at or over the budget, "
+                   "300 s gives %g\n", over, (double)gfhome_runner_share_s(300.0f));
+            failures++;
+        } else {
+            printf("ok   the runner's share is under the budget at every budget, 270 s of 300\n");
         }
     }
 

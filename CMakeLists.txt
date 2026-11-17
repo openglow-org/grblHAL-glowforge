@@ -71,6 +71,7 @@ set(DRIVER_SOURCES
     src/glowforge_cooling.c
     src/glowforge_homing.c
     src/glowforge_release.c
+    src/glowforge_startup.c
     src/glowforge_laser.c
     src/glowforge_mcode.c
     src/glowforge_tray.c

@@ -119,8 +119,10 @@
 //   which becomes machine origin (workspace all-positive); Z ends on
 //   the hall sensor's edge, placed in the focal frame from the focus
 //   card's numbers (never blind-drive Z).
-// - switches: $H falls through to the core homing cycle. The core
-//   defaults below keep it disabled until the physical switches exist
-//   (the limit signals are stubbed in driver.c); the same home-corner
+// - switches: $H is refused until the physical switches exist (the
+//   limit signals are stubbed in driver.c); the same home-corner
 //   convention carries over.
+// The core's own homing cycle stays off: $22's homing bits are pinned
+// off on every settings dispatch (glowforge_io.h), so a sender's $22
+// cannot turn it on.
 #define DEFAULT_HOMING_ENABLE Off

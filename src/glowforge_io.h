@@ -163,13 +163,34 @@ static inline float gfio_xy_rate_ceiling (unsigned tick_hz, float steps_per_mm)
 // microstep mode, $110/$111 held under the feed the tick carries, $102
 // the lens screw's constant (a typed 0 would turn the Z envelope into
 // NaN and silently drop the Z soft limit), $32 laser mode (the laser's
-// M3/M4 semantics are the machine's, not a sender's choice), bit 0 of $63,
-// "disable laser during hold" (a held job's laser is off, which is what
-// starts the armed window's grace under a hold: with the bit clear the
-// core leaves the laser on through the hold, the grace never runs, and a
-// resume hours later fires on the old press; the other bits of $63 stay
-// the sender's), and
-// $44-$46, the homing cycle masks, at the core's defaults (Z, then X
+// M3/M4 semantics are the machine's, not a sender's choice), $63 at 3:
+// bit 0, "disable laser during hold", on, and bit 2, "set RPM to
+// minimum during hold", off (a held job's laser is off whatever a sender
+// typed; the armed window's grace counts in a hold whatever the laser
+// reads, glowforge_laser.c, so a resume past it, a sender's or the
+// cooling verdict's own clear, asks for the button), and bit 1,
+// "restore spindle on resume", on (with it clear a resumed job's laser
+// stays off after its buffered blocks while the job runs on, and no
+// watch stops it), $34 at 0 (the laser's off value: the core turns the
+// laser off between blocks with 0, and fire is judged against $34, so
+// any other value reads that off as fire), the $22 bits of the core's homing cycle off (enabled,
+// single-axis commands, the start-up lock, set origin, manual, override
+// locks: the core's cycle drives an axis for one and a half times its
+// travel toward a switch this machine does not have, so $H, $HX, $HY and
+// $HZ answer that homing is disabled whatever a sender typed; the other
+// bits of the word are left alone, keep-on-reset among them, which the
+// reset-actions setting, $676, writes), $341, the tool-change mode, at
+// 4, "ignore M6" (a laser has no tool to change; under the default mode,
+// 0, an M6 parks the job in Tool Change with the laser state on, which
+// is not a hold, so the core never turns the laser off there, a lit
+// job's window stays open with nothing to bound it, and the sender's
+// cycle start resumes it; modes 1 to 3 run the core's tool change, which
+// turns the laser off and moves the lens to its home position), $673,
+// the coolant on-delay, at 0 (M8 and M9 drive the fan profile here, and
+// the delay runs inside a hold's resume, after the laser is restored and
+// before the cycle starts, long enough for the window's grace to close
+// under the resume, which would then run on dark), and $44-$46, the
+// homing cycle masks, at the core's defaults (Z, then X
 // and Y). The driver's $H never runs the core's cycles, but the core
 // recomputes its homing mask from them after every write of one and
 // keeps an axis homed only while the union names it: a typed $44 that
@@ -195,6 +216,17 @@ static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, uns
     s->axis[Z_AXIS].steps_per_mm = DEFAULT_Z_STEPS_PER_MM;
     s->mode = Mode_Laser;
     s->flags.disable_laser_during_hold = On;
+    s->flags.restore_after_feed_hold = On;
+    s->flags.set_rpm_0_during_hold = Off;
+    s->pwm_spindle.pwm_off_value = 0.0f;
+    s->homing.flags.enabled = Off;
+    s->homing.flags.single_axis_commands = Off;
+    s->homing.flags.init_lock = Off;
+    s->homing.flags.force_set_origin = Off;
+    s->homing.flags.manual = Off;
+    s->homing.flags.override_locks = Off;
+    s->tool_change.mode = ToolChange_Ignore;
+    s->coolant.on_delay = 0;
     _Static_assert(N_AXIS == 3, "the pin covers $44-$46: one homing cycle per axis");
     s->homing.cycle[0].mask = DEFAULT_HOMING_CYCLE_0;
     s->homing.cycle[1].mask = DEFAULT_HOMING_CYCLE_1;
