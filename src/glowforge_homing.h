@@ -168,6 +168,23 @@ void gfhome_invalidate (void);
 bool gfhome_wait_kernel_idle (uint32_t timeout_ms);
 
 // Drop the X and Y reference alone: the head is about to be moved by hand
-// (a motor release). The lens is not released, so Z keeps its reference
-// and the anchor keeps carrying it.
+// (a motor release), or late steps owed X or Y a full step. Z keeps its
+// reference and the anchor keeps carrying it.
 void gfhome_invalidate_xy (void);
+
+// Drop the lens reference alone: late steps owed the lens a full step. Z
+// is held until it is referenced again; X and Y keep theirs and the anchor
+// keeps carrying them.
+void gfhome_invalidate_z (void);
+
+// An unreferenced lens holds one half-step (its envelope is that step's
+// cell: a new block plans no Z step, and lines that move X and Y alone
+// run). While planned motion may still move it (after a late-step drop
+// mid-move, after a reset) the step is the planner's, where every queued
+// block ends; at rest it is taken again where the lens stands: this, from
+// the realtime hook, every pass.
+void gfhome_z_hold_poll (uint_fast16_t state);
+
+// A reset read back where the motion stopped: an unreferenced lens's hold
+// is taken again at rest. From the driver's reset, after the readback.
+void gfhome_z_hold_reset (void);

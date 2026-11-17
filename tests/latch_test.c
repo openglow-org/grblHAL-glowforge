@@ -100,6 +100,17 @@
     clears with no seek and owes the backlog alone; a failed stream's
     reset during motion owes no read-back, and its residue clear still
     runs.
+
+  And the motor currents and the clamp: the shipper only finds the hold
+  currents owed (the null sink too), and the protocol thread takes the
+  drop once, never over a stream started since; a handover writes an
+  owed drop itself; a run current that does not take faults the stream
+  before a byte ships, with one alarm; a stepper driver configuration
+  that does not take refuses the resume, and every start after it until
+  a write takes; an unarmed clamp faults nothing, and owes the homing
+  anchor's drop once a stream, when one axis's late steps reach a full
+  step (the mode's microsteps of X or Y, two lens half-steps) and not a
+  step before, at x8, x16 and x32; a laser event's clamp counts no step.
 */
 #include <errno.h>
 #include <stdbool.h>
@@ -116,6 +127,7 @@
 static char wr_log[64][40];         /* "attr=val" per sysfs write */
 static int  wr_n;
 static int  latch_fail_left;        /* latch writes that fail before one takes */
+static bool tick_fails;             /* the machine tick (step_freq) write does not take */
 static bool latch_engine_holds;     /* the kernel refuses an unlock: the cooling engine holds */
 static const char *rd_state = "idle";
 static bool ring_empty;             /* the kernel's ring at a run request */
@@ -144,6 +156,10 @@ int gfio_wr_attr (const char *attr, const char *val)
     }
     if(!strcmp(attr, "cnc/laser_latch") && !strcmp(val, "0") && latch_engine_holds) {
         errno = EBUSY;
+        return -1;
+    }
+    if(!strcmp(attr, "cnc/step_freq") && tick_fails) {
+        errno = EINVAL;
         return -1;
     }
     /* The kernel's run request: refused while running, in underrun or
@@ -258,10 +274,16 @@ void gfio_set_hw (bool active) { (void)active; }
 bool gfio_pulse_inherited (void) { return true; }
 int  gfio_open_pulse_dev (const char *path) { (void)path; return -1; }
 int  gfio_open_pulse_dev_nb (const char *path) { (void)path; return -1; }
-void gfio_analog_config (void) {}
-void gfio_currents_run (void) {}
-void gfio_currents_hold (void) {}
-unsigned gfio_xy_microsteps (void) { return 8; }
+/* The stepper drivers' configuration and the motor currents: whether a
+ * write takes, and how many were made. */
+static bool config_fails;           /* a driver configuration write does not take */
+static bool run_current_fails;      /* the X or Y run current does not take */
+static int  run_currents, hold_currents, config_writes;
+bool gfio_analog_config (void) { config_writes++; return !config_fails; }
+bool gfio_currents_run (void) { run_currents++; return !run_current_fails; }
+bool gfio_currents_hold (void) { hold_currents++; return true; }
+static unsigned stub_mode = 32;     /* the microstep mode the controller's start read */
+unsigned gfio_xy_microsteps (void) { return stub_mode; }
 float gfio_conf_read_float (const char *k, float fb) { (void)k; return fb; }
 int  gfio_conf_read (const char *k, char *v, size_t n) { (void)k; (void)v; (void)n; return -1; }
 void gfhome_invalidate (void) {}
@@ -372,6 +394,13 @@ static void reset_state (void)
     on_pos_read = NULL;
     latch_locked_by_us = true;
     latch_fail_reported = false;
+    config_fails = run_current_fails = tick_fails = false;
+    run_currents = hold_currents = config_writes = 0;
+    gf.hold_due = false;
+    gf.late_noted = 0;
+    gf.suspended = false;
+    atomic_store(&late_flags, 0);
+    stub_mode = 32;
 }
 
 /* The ring stand-in: a pipe whose write end is the pulse device, so what
@@ -1221,6 +1250,170 @@ int main (void)
     gf.fd = open("/dev/null", O_WRONLY);
     CHECK(pending_pass() && !gf.clear_pending && gf_stream_readback(owed, 0) == 0,
           "a failed stream's reset owes no read-back, and the residue clear still runs");
+    ring_close();
+
+    printf("the motor currents:\n");
+
+    /* The shipper finds the hold currents owed once the kernel has played
+     * the stream out, and writes no current itself: the protocol thread
+     * takes the drop (gf_stream_hold_take), once, and a stream started
+     * before it does keeps its run currents. */
+    reset_state();
+    ring_open();
+    stream_ended(0);
+    gf.hold_poll_at = 0.0;              /* the kernel's idle is read now */
+    ship_pass();
+    CHECK(run_currents == 1 && hold_currents == 0 && gf.hold_due,
+          "the shipper owes the hold drop and writes no current");
+    CHECK(gf_stream_hold_take() && !gf_stream_hold_take(), "the protocol thread takes the drop, once");
+    gf.hold_due = true;                 /* owed again, and a start comes first */
+    gf_stream_wakeup();
+    CHECK(!gf_stream_hold_take() && run_currents == 2,
+          "a stream started before the drop is taken keeps its run currents");
+    gf_stream_go_idle(false, 0, 0);
+    ring_close();
+
+    /* A handover with the drop owed writes it before the device changes
+     * hands, and leaves none for the protocol pass to write into the other
+     * holder's session. */
+    reset_state();
+    ring_open();
+    gf.hold_due = true;
+    CHECK(gf_stream_suspend() && hold_currents == 1 && !gf_stream_hold_take(),
+          "a handover writes the owed drop itself and leaves none owed");
+    gf.suspended = false;
+    ring_close();
+
+    /* A run current that does not take is no run: the stream faults at
+     * its start, one alarm, and nothing reaches the kernel. */
+    reset_state();
+    ring_open();
+    run_current_fails = true;
+    gf_stream_wakeup();
+    ship_pass();
+    CHECK(gf.failed && !gf.streaming && atomic_exchange(&fault_flag, false) && ring_total() == 0,
+          "a run current that does not take faults the stream before a byte ships");
+    gf_stream_wakeup();
+    CHECK(!atomic_load(&fault_flag), "and raises one alarm for it");
+    ring_close();
+
+    /* The controller's start: a latch lock that does not take refuses it
+     * before the stepper drivers are configured; a configuration that does
+     * not take refuses it, and so does a machine tick that does not take;
+     * all three taking start it. */
+    reset_state();
+    latch_fail_left = 1 + LATCH_RETRIES + 1;
+    {
+        const char *why = start_config();
+        CHECK(why != NULL && strstr(why, "latch") && config_writes == 0,
+              "a latch lock that does not take refuses the controller's start, the drivers left unconfigured");
+    }
+    reset_state();
+    config_fails = true;
+    CHECK(start_config() != NULL, "a driver configuration that does not take refuses the controller's start");
+    reset_state();
+    tick_fails = true;
+    CHECK(start_config() != NULL, "a machine tick that does not take refuses it");
+    reset_state();
+    CHECK(start_config() == NULL && config_writes == 1, "all three taking start it");
+
+    /* It refuses the resume after a homing session too. */
+    reset_state();
+    ring_open();
+    gf.suspended = true;
+    config_fails = true;
+    CHECK(!gf_stream_resume(), "a driver configuration that does not take refuses the resume");
+    /* The session's alarm cleared ($X), the refusal stands: the next start
+     * writes the configuration again and does not stream while it does not
+     * take, and the reset that acknowledges that start's fault leaves the
+     * refusal standing; once a write takes, the start streams. */
+    gf_stream_wakeup();
+    CHECK(gf.failed && !gf.streaming && atomic_exchange(&fault_flag, false),
+          "after the refused resume a start does not stream");
+    gf_stream_reset();
+    gf_stream_wakeup();
+    CHECK(gf.failed && !gf.streaming && atomic_exchange(&fault_flag, false),
+          "after the fault's reset, a start whose configuration still does not take does not stream");
+    gf_stream_reset();
+    config_fails = false;
+    gf_stream_wakeup();
+    CHECK(gf.streaming && !gf.failed && !gf.config_pending,
+          "the configuration written again and taken: the start streams");
+    gf_stream_go_idle(false, 0, 0);
+    config_fails = false;
+    gf.suspended = true;
+    CHECK(gf_stream_resume(), "one that takes resumes");
+    ring_close();
+
+    /* The null sink has no kernel queue to drain and owes the hold drop all
+     * the same, so its attribute log shows the run currents and then the
+     * hold currents after a move. */
+    reset_state();
+    ring_open();
+    gf.active = false;
+    stream_ended(0);
+    gf.hold_poll_at = 0.0;
+    ship_pass();
+    CHECK(run_currents == 1 && gf_stream_hold_take(), "the null sink owes the hold drop after a move");
+    gf.active = true;
+    ring_close();
+
+    printf("late events outside the window:\n");
+
+    /* Unarmed, a clamp faults nothing and the move goes on. The steps it
+     * pushes forward are counted per axis for the stream, from the step
+     * bits alone: X and Y's reference is owed its drop once X or Y has
+     * owed a full step (the mode the controller's start read, which the
+     * stub plays), the lens's once it has owed two half-steps, each once.
+     * gf.shipped forged ahead of the producer's clock makes every pulse a
+     * late one. A laser event's clamp counts no step, and the X and Y
+     * pulses carry every axis's direction bit: a direction is no step. */
+    static const uint32_t modes[] = { 8, 16, 32 };
+    for(int i = 0; i < 3; i++) {
+        char what[112];
+        reset_state();
+        ring_open();
+        stub_mode = modes[i];
+        gf_stream_wakeup();
+        gf.shipped = gf.base + gf.vticks / VTICKS_PER_BYTE + 1000;
+        pthread_mutex_lock(&gf.lock);
+        for(int n = 0; n < 50; n++)
+            clamp_locked();             /* a laser event's clamp */
+        pthread_mutex_unlock(&gf.lock);
+        for(uint32_t n = 0; n + 1 < modes[i]; n++)
+            gf_stream_pulse(0x01, 0x07);    /* X: one microstep short of a full step */
+        for(uint32_t n = 0; n + 1 < modes[i]; n++)
+            gf_stream_pulse(0x02, 0x07);    /* and Y the same, apart */
+        snprintf(what, sizeof(what), "x%u: %u late X and %u late Y steps owe no drop, and fault nothing",
+                 modes[i], modes[i] - 1, modes[i] - 1);
+        CHECK(!gf_stream_clamp_take() && !gf.failed && !atomic_load(&fault_flag), what);
+        gf_stream_pulse(0x01, 0x07);
+        snprintf(what, sizeof(what), "x%u: %u late X steps owe X and Y's drop alone, once",
+                 modes[i], modes[i]);
+        CHECK(gf_stream_clamp_take() == GF_LATE_XY && !gf_stream_clamp_take(), what);
+        gf_stream_go_idle(false, 0, 0);
+        ring_close();
+    }
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf.shipped = gf.base + gf.vticks / VTICKS_PER_BYTE + 1000;
+    for(int n = 0; n < 31; n++)
+        gf_stream_pulse(0x02, 0);
+    CHECK(!gf_stream_clamp_take(), "31 late Y steps at x32 owe no drop");
+    gf_stream_pulse(0x02, 0);
+    CHECK(gf_stream_clamp_take() == GF_LATE_XY, "the 32nd owes X and Y's");
+    gf_stream_go_idle(false, 0, 0);
+    gf_stream_wakeup();                 /* a new stream starts its count over */
+    gf.shipped = gf.base + gf.vticks / VTICKS_PER_BYTE + 1000;
+    gf_stream_pulse(0x04, 0);
+    CHECK(!gf_stream_clamp_take(), "a new stream: one late lens half-step owes no drop");
+    gf_stream_pulse(0x04, 0);
+    CHECK(gf_stream_clamp_take() == GF_LATE_Z, "two late lens half-steps owe the lens's alone");
+    for(int n = 0; n < 32; n++)
+        gf_stream_pulse(0x01, 0);
+    CHECK(gf_stream_clamp_take() == GF_LATE_XY, "in the same stream, a full step of X then owes X and Y's");
+    gf_stream_go_idle(false, 0, 0);
     ring_close();
 
     printf("the sideband:\n");

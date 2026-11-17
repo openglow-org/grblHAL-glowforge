@@ -159,7 +159,10 @@ target_link_libraries(lens_home_test m)
 
 # Host unit test for the XY microstep scale (the pure helpers in
 # src/glowforge_io.h): the mode a config value names, and the $100/$101,
-# machine tick, stop ramp and feed ceiling derived from it. Headers only.
+# machine tick, stop ramp and feed ceiling derived from it. It includes
+# src/glowforge_io.c for the shared config's reader (a value too long for
+# its reader is refused, a float is the whole value) and the current
+# writes (a failure named once an episode); it must not link the core.
 add_executable(xy_scale_test tests/xy_scale_test.c)
 target_include_directories(xy_scale_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(xy_scale_test m)
@@ -186,7 +189,8 @@ target_link_libraries(cooling_test pthread)
 
 # Host unit test for the switch poll's cancel path
 # (src/glowforge_switches.c): a lid cancel in flight sends its reset and
-# runs its park on polls whose switch read fails. Includes the switch
+# runs its park on polls whose switch read fails, the third failed poll
+# reads the door open, and the device is opened again. Includes the switch
 # source, drives the file-backed test source; must not link the core.
 add_executable(switches_test tests/switches_test.c)
 target_include_directories(switches_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})

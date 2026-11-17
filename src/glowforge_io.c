@@ -26,6 +26,11 @@
 #include <unistd.h>
 
 #define GF_SYSFS "/sys/glowforge/"
+/* The attribute tree's root: a host test that includes this source defines
+ * GFIO_SYSFS_ROOT() as a tree of its own (it ends with '/'). */
+#ifndef GFIO_SYSFS_ROOT
+#define GFIO_SYSFS_ROOT() GF_SYSFS
+#endif
 
 /* PIC stepper currents from the factory print header (XSrc/XShc, YSrc/YShc;
  * identical across every captured job, 2018 and 2026 firmware alike). The
@@ -62,7 +67,7 @@ int gfio_wr_attr (const char *attr, const char *val)
         }
         return 0;
     }
-    snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
+    snprintf(path, sizeof(path), "%s%s", GFIO_SYSFS_ROOT(), attr);
     if((fd = open(path, O_WRONLY | O_CLOEXEC)) < 0)
         return errno == ENOENT ? GFIO_ENOATTR : GFIO_EREJECT;
     /* A sysfs store consumes the whole buffer or rejects it; anything
@@ -85,7 +90,7 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     char path[128];
     int fd;
     ssize_t n;
-    snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
+    snprintf(path, sizeof(path), "%s%s", GFIO_SYSFS_ROOT(), attr);
     if((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
         return -1;
     n = read(fd, buf, len - 1);
@@ -103,7 +108,7 @@ int gfio_rd_bin (const char *attr, void *buf, size_t len)
     char path[128];
     int fd;
     ssize_t n;
-    snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
+    snprintf(path, sizeof(path), "%s%s", GFIO_SYSFS_ROOT(), attr);
     if((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
         return -1;
     do
@@ -183,22 +188,36 @@ int gfio_open_pulse_dev_nb (const char *path)
     return open_pulse_dev(path, LOCK_EX | LOCK_NB);
 }
 
-void gfio_analog_config (void)
+/* One write of the stepper drivers' configuration, named when it fails. */
+static bool config_write (const char *attr, const char *val)
+{
+    int rc = gfio_wr_attr(attr, val);
+    if(rc != 0)
+        fflog(LOG_ERR, "gfio: %s=%s did not take (%s)", attr, val,
+              rc == GFIO_ENOATTR ? "no such attribute" : "refused");
+    return rc == 0;
+}
+
+bool gfio_analog_config (void)
 {
     char mode[12];
+    bool ok = true;
     snprintf(mode, sizeof(mode), "%u", gfio_xy_microsteps());
-    gfio_wr_attr("cnc/x_mode", mode);
-    gfio_wr_attr("cnc/y_mode", mode);
-    gfio_wr_attr("cnc/x_decay", "1");
-    gfio_wr_attr("cnc/y_decay", "1");
+    ok = config_write("cnc/x_mode", mode) && ok;
+    ok = config_write("cnc/y_mode", mode) && ok;
+    ok = config_write("cnc/x_decay", "1") && ok;
+    ok = config_write("cnc/y_decay", "1") && ok;
     /* Every axis in the pulse path, the lens included: Z is the focal
      * height and a job's Z moves the lens. The lens motor steps in
      * half-steps ($102) and rises only at its drive current, which the
      * run posture sets and the hold posture takes back. */
-    gfio_wr_attr("cnc/motor_lock", "0");
-    gfio_wr_attr("head/z_mode", "1");
-    gfio_wr_attr("head/z_enable", "0");
+    ok = config_write("cnc/motor_lock", "0") && ok;
+    /* The head's own: named when they fail, and no refusal, so a machine
+     * without its head still moves X and Y (no lens moves unreferenced). */
+    config_write("head/z_mode", "1");
+    config_write("head/z_enable", "0");
     gfio_currents_hold();
+    return ok;
 }
 
 /* Written on the protocol thread, read by the shipper's hold drop. */
@@ -214,18 +233,39 @@ bool gfio_xy_released (void)
     return xy_released;
 }
 
-void gfio_currents_run (void)
+/* A failed current write is named once per episode, X and Y (the PIC) and
+ * the lens (the head) apart; a write that takes ends its episode. Only the
+ * protocol thread writes the currents. */
+static bool xy_current_failed, z_current_failed;
+
+static bool currents_write (const char *x, const char *y, const char *z)
 {
-    gfio_wr_attr("pic/x_step_current", xy_released ? "0" : X_CURRENT_RUN);
-    gfio_wr_attr("pic/y_step_current", xy_released ? "0" : Y_CURRENT_RUN);
-    gfio_wr_attr("head/z_current", "0");
+    int rx = gfio_wr_attr("pic/x_step_current", x);
+    int ry = gfio_wr_attr("pic/y_step_current", y);
+    int rz = gfio_wr_attr("head/z_current", z);
+    bool xy_ok = rx == 0 && ry == 0;
+
+    if(!xy_ok && !xy_current_failed)
+        fflog(LOG_ERR, "gfio: the X and Y step currents did not take (x %d, y %d)", rx, ry);
+    else if(xy_ok && xy_current_failed)
+        fflog(LOG_NOTICE, "gfio: the X and Y step currents take again");
+    xy_current_failed = !xy_ok;
+    if(rz != 0 && !z_current_failed)
+        fflog(LOG_ERR, "gfio: the lens current did not take (%d)", rz);
+    else if(rz == 0 && z_current_failed)
+        fflog(LOG_NOTICE, "gfio: the lens current takes again");
+    z_current_failed = rz != 0;
+    return xy_ok;
 }
 
-void gfio_currents_hold (void)
+bool gfio_currents_run (void)
 {
-    gfio_wr_attr("pic/x_step_current", xy_released ? "0" : X_CURRENT_HOLD);
-    gfio_wr_attr("pic/y_step_current", xy_released ? "0" : Y_CURRENT_HOLD);
-    gfio_wr_attr("head/z_current", "1");
+    return currents_write(xy_released ? "0" : X_CURRENT_RUN, xy_released ? "0" : Y_CURRENT_RUN, "0");
+}
+
+bool gfio_currents_hold (void)
+{
+    return currents_write(xy_released ? "0" : X_CURRENT_HOLD, xy_released ? "0" : Y_CURRENT_HOLD, "1");
 }
 
 /* --- the shared machine config ("key = value", '#' comments) --------- */
@@ -238,6 +278,26 @@ static const char *conf_path (void)
     return (p && *p) ? p : CONF_DEFAULT;
 }
 
+/* A value too long for its reader is refused, never read as its first
+ * characters: a gate value cut short reads as another number. Named once
+ * for each key (a short table; past it, every refusal is named). */
+#define CONF_REFUSED_KEYS 8
+static char conf_refused[CONF_REFUSED_KEYS][48];
+
+static void conf_refuse (const char *key, size_t have, size_t room)
+{
+    for(int i = 0; i < CONF_REFUSED_KEYS; i++) {
+        if(!strcmp(conf_refused[i], key))
+            return;
+        if(conf_refused[i][0] == '\0') {
+            snprintf(conf_refused[i], sizeof(conf_refused[i]), "%s", key);
+            break;
+        }
+    }
+    fflog(LOG_WARNING, "gfio: the setting %s is %zu characters, over the %zu it is read in; "
+          "its default stands", key, have, room);
+}
+
 int gfio_conf_read (const char *key, char *val, size_t len)
 {
     FILE *f = fopen(conf_path(), "r");
@@ -247,6 +307,16 @@ int gfio_conf_read (const char *key, char *val, size_t len)
     char line[256];
     int found = -1;
     while(fgets(line, sizeof(line), f)) {
+        /* A line longer than the buffer is no setting: the rest of it is
+         * skipped, never read as a line of its own, and a key it names
+         * reads as refused. */
+        size_t n = strlen(line);
+        bool whole = n > 0 && (line[n - 1] == '\n' || feof(f));
+        if(!whole) {
+            int c;
+            while((c = fgetc(f)) != EOF && c != '\n')
+                ;
+        }
         char *p = line;
         while(isspace((unsigned char)*p))
             p++;
@@ -268,8 +338,15 @@ int gfio_conf_read (const char *key, char *val, size_t len)
         while(v_end > v && isspace((unsigned char)v_end[-1]))
             v_end--;
         *v_end = '\0';
-        snprintf(val, len, "%s", v);
-        found = 0;                  /* keep scanning: last occurrence wins */
+        /* Keep scanning: the last occurrence wins, a refused one too. */
+        size_t vlen = (size_t)(v_end - v);
+        if(!whole || vlen >= len) {
+            conf_refuse(key, whole ? vlen : sizeof(line) - 1, len - 1);
+            found = -1;
+            continue;
+        }
+        memcpy(val, v, vlen + 1);
+        found = 0;
     }
     fclose(f);
     return found;
@@ -280,8 +357,10 @@ float gfio_conf_read_float (const char *key, float fallback)
     char val[32], *end;
     if(gfio_conf_read(key, val, sizeof(val)) != 0)
         return fallback;
+    /* The whole value is the number, or the fallback stands: never a
+     * number read off its front. */
     float f = strtof(val, &end);
-    return end == val ? fallback : f;
+    return end == val || *end != '\0' ? fallback : f;
 }
 
 int gfio_conf_sibling (const char *name, char *buf, size_t len)

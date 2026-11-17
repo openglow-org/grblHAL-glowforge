@@ -49,6 +49,10 @@
   re-arm cancels it; check mode never arms; a jog does not hold the
   window open.
 
+  And the emission witness: with the window closed, a count above zero
+  relocks the latch and alarms, and three checks in a row that read no
+  count are a blind witness, met the same way, once per episode.
+
   And the end of a refused or canceled arm: every one alarms (unless an
   alarm already stands) and resets the job, so the parser drops the job's
   M3/M4 and the next laser-on asks for the press again.
@@ -104,6 +108,7 @@ static bool  latch_unlock_refused;  /* ...because the cooling engine holds the l
 static int   cool_armed_calls;      /* gfcool_laser_armed() calls */
 static bool  cool_armed_last;
 static const char *rd_state;            /* cnc/state as gfio_rd_attr reads it, NULL = unreadable */
+static const char *rd_emission = "0";   /* cnc/laser_on_sampled as read, NULL = unreadable */
 static int   rd_head_ok_calls = 1 << 30; /* head/hall_sensor reads that succeed before failing */
 static const char *conf_model_val;      /* laser_power_model in the config, NULL = absent */
 static const char *conf_curve_val;      /* laser_dose_curve, NULL = absent */
@@ -218,6 +223,10 @@ int  gfio_rd_attr(const char *a, char *b, size_t l)
     if (l) b[0] = '\0';
     if (!strcmp(a, "cnc/state") && rd_state != NULL) {
         snprintf(b, l, "%s", rd_state);
+        return 0;
+    }
+    if (!strcmp(a, "cnc/laser_on_sampled") && rd_emission != NULL) {
+        snprintf(b, l, "%s", rd_emission);
         return 0;
     }
     if (!strcmp(a, "head/hall_sensor") && rd_head_ok_calls-- > 0) {
@@ -503,6 +512,10 @@ static void reset_state(void)
     cool_armed_calls = 0;
     cool_armed_last = false;
     rd_state = NULL;
+    rd_emission = "0";
+    witness_blind = 0;
+    next_emission_check = 0.0;
+    disarmed_at = 0.0;
     tail_pumps = 0;
     pumps = 0;
     latch_locked_in_tail = false;
@@ -1412,6 +1425,41 @@ int main(void)
     CHECK(!laser_ok && latch_locked_last && pumps == 0 &&
           !((spindle_state_t){ .value = atomic_load(&cur_state_value) }).on,
           "a laser-on in a held state closes the pending window with no wait and stays dark");
+
+    printf("the emission witness, once a second with the window closed:\n");
+
+    /* Case W1 - a check that reads no count (a read that fails, an empty
+       one, one that is no number) is no reading: three in a row are a
+       blind witness, met as a sensed emission is (the latch relocked, an
+       alarm), once; a count read again ends it, and a count above zero
+       is emission with the window closed. */
+    reset_state();
+    hw_active = true;
+    latch_writes = 0;
+    rd_emission = NULL;
+    gflaser_poll();
+    clock_skip(1.0);
+    rd_emission = "";
+    gflaser_poll();
+    CHECK(alarms_raised == 0 && latch_writes == 0, "two checks with no count relock nothing and raise nothing");
+    clock_skip(1.0);
+    rd_emission = "x7";
+    gflaser_poll();
+    CHECK(alarms_raised == 1 && latch_writes == 1 && latch_locked_last,
+          "the third: the latch relocked and an alarm");
+    clock_skip(1.0);
+    rd_emission = NULL;
+    gflaser_poll();
+    CHECK(alarms_raised == 1 && latch_writes == 1, "a blind witness alarms once per episode");
+    clock_skip(1.0);
+    rd_emission = "0";
+    gflaser_poll();
+    CHECK(witness_blind == 0 && alarms_raised == 1, "a count read again ends the episode");
+    clock_skip(1.0);
+    rd_emission = "5";
+    gflaser_poll();
+    CHECK(alarms_raised == 2 && latch_writes == 2,
+          "emission with the window closed: the latch relocked and an alarm");
 
     printf("the cooling verdict's tiers under an open window:\n");
 

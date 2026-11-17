@@ -20,6 +20,9 @@
     tier (the job is held, said once, and the latch is never written);
   - a verdict stamped ahead of the reader's clock is no verdict, as a
     stale one is: fire stays blocked and the job is held;
+  - the freshness deadline never wraps: one 2^31 ms in the past is stale,
+    and before the first verdict nothing is fresh at any uptime, one in
+    [2^31, 2^32) ms included (the client's clock is moved on there);
   - a clean verdict with resume_ok resumes the hold the client took;
   - outside the window a blocking verdict is neither tier;
   - every change of the armed bit is reported at once, whatever the
@@ -64,6 +67,21 @@ int  gfio_wr_attr (const char *attr, const char *val)
     return 0;
 }
 void fflog (int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
+
+/* The client's clock, and the test's: CLOCK_MONOTONIC moved on by
+   clock_offset_ms, so a case can stand at an uptime the host does not
+   have. Zero for every case but the one that sets it. */
+#include <time.h>
+static long long clock_offset_ms;
+static int offset_clock_gettime (clockid_t id, struct timespec *ts)
+{
+    int r = clock_gettime(id, ts);
+    long long ns = (long long)ts->tv_sec * 1000000000LL + ts->tv_nsec + clock_offset_ms * 1000000LL;
+    ts->tv_sec = (time_t)(ns / 1000000000LL);
+    ts->tv_nsec = (long)(ns % 1000000000LL);
+    return r;
+}
+#define clock_gettime offset_clock_gettime
 
 /* --- driver source under test ---------------------------------------- */
 #include "../src/glowforge_cooling.c"
@@ -120,7 +138,7 @@ static void publish (bool fire_ok, const char *name, bool hold, bool resume_ok,
        own clock. A backdated publish models the engine gone for that
        long, so the cache's deadline is moved back the same way. */
     if(age_s > 0.0)
-        atomic_store(&v_fresh_until_ms, mono_ms() - 1);
+        atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
 }
 
 static bool enqueued (uint8_t c)
@@ -293,7 +311,7 @@ int main (void)
     publish_extra = ",\"ack_wait\":true";
     publish(false, "OVERTEMP", true, false, false, 0.0);
     verdict_read();
-    atomic_store(&v_fresh_until_ms, mono_ms() - 1);
+    atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
     CHECK(!gfcool_ack_waits(), "a stale verdict's ack_wait says nothing");
     /* And the held job is not resumed under it, whatever the name. */
     reset_state();
@@ -360,7 +378,7 @@ int main (void)
     CHECK(!gfcool_hold_stands(), "a verdict that lets the laser fire is not");
     publish(false, "OVERTEMP", true, false, false, 0.0);
     verdict_read();
-    atomic_store(&v_fresh_until_ms, mono_ms() - 1);     /* the same verdict, gone stale */
+    atomic_store(&v_fresh_until_ms, mono_ms64() - 1);     /* the same verdict, gone stale */
     CHECK(!gfcool_hold_stands(), "a stale verdict is not");
 
     /* A stale verdict inside the window is the pause tier, with the
@@ -393,7 +411,7 @@ int main (void)
         armed_val = true;
         laser_on_window = true;
         cur_state = STATE_CYCLE;
-        atomic_store(&v_fresh_until_ms, mono_ms() - 1);
+        atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
         publish(true, "OK", false, true, true, -ahead_s[i]);
         gfcool_poll();
         char msg[96];
@@ -412,7 +430,7 @@ int main (void)
     publish(true, "OK", false, true, true, 0.0);
     gfcool_poll();                      /* reads the file; the next read is 500 ms away */
     CHECK(!enqueued(CMD_FEED_HOLD) && !hold_ours, "a clean verdict holds nothing");
-    atomic_store(&v_fresh_until_ms, mono_ms() - 1);
+    atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
     gfcool_poll();
     CHECK(enqueued(CMD_FEED_HOLD) && hold_ours,
           "a cache that expires between reads holds the job before the next read");
@@ -425,6 +443,53 @@ int main (void)
     publish(false, "AIRFLOW", true, false, false, 0.0);
     gfcool_poll();
     CHECK(fail_calls == 0 && !pause_said && !hold_ours, "a blocking verdict outside the window is neither tier");
+
+    printf("the freshness deadline at any distance and any uptime:\n");
+
+    /* The client's clock stands at an uptime in [2^31, 2^32) ms (mod
+       2^32), where a 32-bit deadline of 0 reads ahead of it. */
+    struct timespec real;
+    clock_gettime(CLOCK_MONOTONIC, &real);
+    long long real_ms = (long long)real.tv_sec * 1000 + real.tv_nsec / 1000000 - clock_offset_ms;
+    clock_offset_ms = 3000000000LL - (real_ms % 4294967296LL);
+
+    /* A verdict that stopped refreshing 2^31 ms ago is as stale as one
+       that stopped a second ago: the deadline never wraps into fresh. */
+    reset_state();
+    publish(true, "OK", false, true, true, 0.0);
+    verdict_read();
+    CHECK(gfcool_verdict_fire_ok(), "a fresh verdict permits fire");
+    atomic_store(&v_fresh_until_ms, mono_ms64() - (1ull << 31));
+    CHECK(!verdict_fresh() && !gfcool_verdict_fire_ok() && !gfcool_run_ack(),
+          "a deadline 2^31 ms in the past is stale: fire blocked");
+
+    /* Before any verdict there is no verdict at that uptime: the stale
+       branch runs (the fallback for an open window). */
+    reset_state();
+    unlink(verdict_path);
+    laser_on_window = true;
+    armed_val = true;
+    cur_state = STATE_CYCLE;
+    uint64_t uptime = mono_ms64() % 4294967296ULL;
+    gfcool_poll();
+    CHECK(uptime >= 2147483648ULL && !verdict_fresh() && !gfcool_verdict_fire_ok() && stale_warned &&
+          strstr(all_messages, "cooling service lost") != NULL,
+          "at an uptime in [2^31, 2^32) ms no verdict is fresh before the first: fire blocked, the fallback runs");
+
+    /* The clock itself is 64 bits wide: a verdict read a second before the
+       millisecond count passes 2^32 is stale 4 s after it, never fresh
+       again on a count that wrapped. */
+    clock_offset_ms = 0;
+    clock_gettime(CLOCK_MONOTONIC, &real);
+    real_ms = (long long)real.tv_sec * 1000 + real.tv_nsec / 1000000;
+    clock_offset_ms = (real_ms / 4294967296LL + 1) * 4294967296LL - 1000 - real_ms;
+    reset_state();
+    publish(true, "OK", false, true, true, 0.0);
+    verdict_read();
+    CHECK(gfcool_verdict_fire_ok(), "a verdict read just under 2^32 ms is fresh");
+    clock_offset_ms += 5000;
+    CHECK(!verdict_fresh() && !gfcool_verdict_fire_ok(), "past 2^32 ms, 5 s on, it is stale");
+    clock_offset_ms = 0;
 
     unlink(verdict_path);
     printf(failures ? "FAIL: %d check(s) failed\n"

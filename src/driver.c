@@ -394,6 +394,7 @@ static void driverReset (void)
         gf_stream_reset();
         gfhome_envelope_close();
         readback_position();
+        gfhome_z_hold_reset();
         /* A position still lost (one that cannot be read back, or a reset
          * during the web-service homing session, where the device is the
          * session's and nothing is read back) is not trusted: X and Y
@@ -504,6 +505,31 @@ static void glowforge_process_realtime (uint_fast16_t state)
         gfhome_invalidate();
         system_raise_alarm(Alarm_MotorFault);
     }
+
+    /* Late step events clamped outside an armed window that owed an axis a
+     * full step: the move goes on, but that axis can have lost steps, so
+     * its reference goes. X and Y go together (the home and the bed's
+     * envelope are theirs together); the lens goes alone, and the sender
+     * is told which. */
+    uint8_t late = gf_stream_clamp_take();
+    if(late & GF_LATE_XY) {
+        fflog(LOG_WARNING, "gfstream: late step events dropped the X and Y reference");
+        report_message("late step events: X and Y are no longer trusted - home again",
+                       Message_Warning);
+        gfhome_invalidate_xy();
+    }
+    if(late & GF_LATE_Z) {
+        fflog(LOG_WARNING, "gfstream: late step events dropped the lens reference");
+        report_message("late step events: Z is no longer trusted - the lens holds until it is "
+                       "referenced again", Message_Warning);
+        gfhome_invalidate_z();
+    }
+    gfhome_z_hold_poll(state);
+
+    /* The hold currents once the kernel has played a stream out: written
+     * here, on the thread that writes a start's run currents. */
+    if(gf_stream_hold_take())
+        gfio_currents_hold();
 
     /* The sender overran the RX ring: lines are missing from the job,
      * so the job stops the way an incoming ^X stops it (the latch

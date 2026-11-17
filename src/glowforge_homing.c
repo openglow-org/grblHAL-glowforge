@@ -68,6 +68,7 @@
 
 #include "grbl/hal.h"
 #include "grbl/motion_control.h"
+#include "grbl/planner.h"
 #include "grbl/protocol.h"
 #include "grbl/report.h"
 #include "grbl/state_machine.h"
@@ -106,6 +107,28 @@
 static bool z_referenced;
 static float z_env_min, z_env_max;
 
+/* An unreferenced lens holds one half-step: the envelope is that step's
+ * cell, this many half-steps each side of it, under half of one. Every Z
+ * a line can name inside rounds to that step, so a new block plans no Z
+ * step; the parser's Z, which rounds to it, passes, so lines that move X
+ * and Y alone run. */
+#define Z_HOLD_HALF_CELL 0.49f
+
+/* Motion that was planned before the reference dropped may still move the
+ * lens (the rest of a move after a late-step drop, the motion a reset cut
+ * short): until the lens is at rest the held step is the planner's, where
+ * every queued block ends and every new block starts, and at rest it is
+ * taken again where the lens stands (gfhome_z_hold_poll). */
+static bool z_hold_moving;
+
+/* The step an unreferenced lens holds. */
+static int32_t z_hold_step (void)
+{
+    if(z_hold_moving)
+        return (int32_t)lroundf(plan_get_position()[Z_AXIS] * settings.axis[Z_AXIS].steps_per_mm);
+    return sys.position[Z_AXIS];
+}
+
 /* What the anchor file holds, so it can be rewritten for fewer axes. */
 static float anchor_home[N_AXIS];
 static uint8_t anchor_axes;
@@ -118,10 +141,10 @@ void gfhome_apply_z_limit (void)
         sys.work_envelope.min.values[Z_AXIS] = z_env_min;
         sys.work_envelope.max.values[Z_AXIS] = z_env_max;
     } else {
-        /* Unreferenced: Z stays where it is. */
-        float z = (float)sys.position[Z_AXIS] / z_spm;
-        sys.work_envelope.min.values[Z_AXIS] = z;
-        sys.work_envelope.max.values[Z_AXIS] = z;
+        /* Unreferenced: Z holds its step. */
+        float z = (float)z_hold_step();
+        sys.work_envelope.min.values[Z_AXIS] = (z - Z_HOLD_HALF_CELL) / z_spm;
+        sys.work_envelope.max.values[Z_AXIS] = (z + Z_HOLD_HALF_CELL) / z_spm;
     }
     /* The core checks the limit on homed axes only: Z is always
      * referenced, to the edge or to where it stands. X and Y are
@@ -221,10 +244,11 @@ void gfhome_invalidate (void)
 
 void gfhome_invalidate_xy (void)
 {
-    /* The head is about to move without the counters (a motor release):
-     * X and Y lose their reference. The lens is not released, so Z keeps
-     * its own, and the anchor keeps carrying it: the Z counter was not
-     * cleared, so the anchor's Z plus the counter is still the lens. */
+    /* X and Y no longer follow the counters (a motor release, or late
+     * steps that owed X or Y a full step): they lose their reference. The
+     * lens keeps its own, and the anchor keeps carrying it: the Z counter
+     * was not cleared, so the anchor's Z plus the counter is still the
+     * lens. */
     if(anchor_axes & Z_AXIS_BIT)
         anchor_write(anchor_home, Z_AXIS_BIT, anchor_source);
     else {
@@ -235,6 +259,43 @@ void gfhome_invalidate_xy (void)
     sys.soft_limits.mask &= (uint8_t)~(X_AXIS_BIT | Y_AXIS_BIT);
     gfhome_apply_z_limit();
     report_add_realtime(Report_Homed);
+}
+
+void gfhome_invalidate_z (void)
+{
+    /* The lens no longer follows its counter (late steps that owed it a
+     * full step): it loses its reference. The blocks already planned run
+     * to their end, and the lens is held on the step they end on, then
+     * where it comes to rest. X and Y keep theirs, and the anchor keeps
+     * carrying them without Z. */
+    z_referenced = false;
+    if(anchor_axes & (X_AXIS_BIT | Y_AXIS_BIT))
+        anchor_write(anchor_home, anchor_axes & (uint8_t)~Z_AXIS_BIT, anchor_source);
+    else {
+        unlink(HOMED_ANCHOR);
+        anchor_axes = 0;
+    }
+    z_hold_moving = true;
+    gfhome_apply_z_limit();
+}
+
+void gfhome_z_hold_reset (void)
+{
+    /* A reset cut the motion short and read back where the lens stopped:
+     * the core syncs the planner to it, and the hold follows at rest. */
+    if(!z_referenced)
+        z_hold_moving = true;
+}
+
+void gfhome_z_hold_poll (uint_fast16_t state)
+{
+    /* At rest (Idle, nothing left for the kernel to play) the counters
+     * are where the lens stopped: hold it there. */
+    if(z_hold_moving && state == STATE_IDLE && gf_stream_kernel_idle()) {
+        z_hold_moving = false;
+        if(!z_referenced)
+            gfhome_apply_z_limit();
+    }
 }
 
 /* `axes` names which components carry a reference: a full home writes
@@ -603,7 +664,9 @@ static void origin_jog_cancel (sys_state_t state)
  * door is hidden from the core while it jogs), and a jog cancel, a feed
  * hold, a cooling verdict or a reset ends it. $H answers once the head has
  * stopped, so a sender's next line never meets the jog. The home stands
- * whatever becomes of the move: the position is known all the way. */
+ * however the move ends, since the position is known all the way, unless
+ * the stream drops it under the move as it would under any other (an
+ * underrun, late steps that owed X or Y a full step). */
 static void manual_home_to_origin (void)
 {
     parser_block_t block;

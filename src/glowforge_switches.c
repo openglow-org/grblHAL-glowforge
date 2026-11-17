@@ -83,6 +83,15 @@
   machine's switches, and is not used: on hardware the laser arm then
   refuses, because there is no button to read.
 
+  A read that fails is never "still closed". One or two failed polls in
+  a row keep the last reading (a transient fakes no edge); the third
+  reads the door as open, from then until a read succeeds: the armed
+  window closes, the core is shown the door wherever it shows a real
+  one (a running job parks and the lid policy acts on it), and the
+  episode is logged once. The device is opened again, with the same
+  name check, once a second while the reads fail. A first read that
+  fails at startup reads as open too.
+
   Test hooks, honored only in a null-sink run (GFSINK unset or empty),
   read through the one gate, gfio_test_hook: GF_SWITCH_DEV moves the
   device path (the same name forgectrl uses for its own seam), and with
@@ -131,8 +140,17 @@
 #define PARK_ZERO_LENGTH_S     1.0
 #define DRAIN_WAIT_S           2.0   /* kernel drain of the hold tail (~depth) */
 
+/* Failed polls in a row that read the door open, and the pace of the
+   device's reopen while they last. */
+#define SWITCH_POLL_FAILS_MAX  3
+#define SWITCH_REOPEN_S        1.0
+
 static int sw_fd = -1;
+static const char *sw_dev;                 /* the device path, for the reopen */
 static const char *fake_path;              /* GF_SWITCH_FILE (host tests) */
+static int poll_fails;                     /* failed polls in a row */
+static bool device_lost;                   /* the third failed poll: the door reads open */
+static double reopen_at;                   /* the next reopen of the device */
 static control_signals_t state = {0};      /* raw reading of the switch device */
 static control_signals_t delivered = {0};  /* asserted signals the core has been told about */
 static uint8_t raw[SW_BYTES];              /* last raw word (button, reason strings) */
@@ -169,8 +187,8 @@ bool gfsw_available (void)
 
 /* Reads the raw EV_SW word (EVIOCGSW layout, SW_BYTES bytes). Returns
    false when there is no switch source or it cannot be read right now;
-   callers keep their previous state then, so a transient read failure
-   never fakes an edge. */
+   each caller bounds how long it tolerates that (the poll: three failed
+   polls read the door open; the arm: three failed reads end the wait). */
 bool gfsw_read_raw (uint8_t *sw)
 {
     memset(sw, 0, SW_BYTES);
@@ -259,6 +277,29 @@ static void onStateChange (sys_state_t new_state)
         on_state_change_chain(new_state);
 }
 
+/* Opens the switch device at dev: the descriptor, or -1. The device must
+   be the machine's switches: an input device of another name at this
+   path is not read. `say` logs why a device is not used. */
+static int switch_open (const char *dev, bool say)
+{
+    int fd = open(dev, O_RDONLY | O_CLOEXEC);
+    if(fd < 0) {
+        if(say)
+            fflog(LOG_INFO, "gfswitch: cannot open %s - no switch source", dev);
+        return -1;
+    }
+    char name[32] = "";
+    if(ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 ||
+       strcmp(name, SWITCH_DEV_NAME) != 0) {
+        if(say)
+            fflog(LOG_ERR, "gfswitch: %s reports '%s', not the '%s' switch device - no switch source",
+                  dev, name, SWITCH_DEV_NAME);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 void gfsw_init (void)
 {
     control_signals_t initial = {0};
@@ -269,20 +310,14 @@ void gfsw_init (void)
     const char *dev = gfio_test_hook("GF_SWITCH_DEV");
     if(dev == NULL || *dev == '\0')
         dev = SWITCH_DEV;
-    if((sw_fd = open(dev, O_RDONLY | O_CLOEXEC)) >= 0) {
-        /* The device must be the machine's switches: an input device
-         * of another name at this path is not read, and the arm flow
-         * treats the machine as having no button. */
-        char name[32] = "";
-        if(ioctl(sw_fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 ||
-           strcmp(name, SWITCH_DEV_NAME) != 0) {
-            fflog(LOG_ERR, "gfswitch: %s reports '%s', not the '%s' switch device - no switch source",
-                  dev, name, SWITCH_DEV_NAME);
-            close(sw_fd);
-            sw_fd = -1;
-        }
-    } else
-        fflog(LOG_INFO, "gfswitch: cannot open %s - no switch source", dev);
+    sw_dev = dev;
+    poll_fails = 0;
+    device_lost = false;
+    reopen_at = 0.0;
+    state.bits = 0;
+    /* Without the machine's switches the arm flow treats the machine as
+     * having no button. */
+    sw_fd = switch_open(dev, true);
     if(sw_fd < 0) {
         const char *p = gfio_test_hook("GF_SWITCH_FILE");
         if(p != NULL && *p != '\0')
@@ -300,11 +335,18 @@ void gfsw_init (void)
 
     hal.signals_cap.safety_door_ajar = On;
 
+    /* A first read that fails reads as open, never as closed: the polls
+     * that follow count from it. */
     if(read_signals(&initial))
         state = initial;
+    else {
+        state.safety_door_ajar = On;
+        poll_fails = 1;
+        fflog(LOG_WARNING, "gfswitch: the switches cannot be read at startup - the lid reads open");
+    }
     button_prev = gfsw_bit_set(raw, SW_BIT_BUTTON);
 
-    if(state.safety_door_ajar)
+    if(state.safety_door_ajar && poll_fails == 0)
         fflog(LOG_WARNING, "gfswitch: lid open or interlock loop open at startup");
 }
 
@@ -355,7 +397,8 @@ static void cancel_job (void)
        and relocks the kernel latch). */
     gflaser_disarm();
 
-    const char *why = gfsw_bit_set(raw, SW_BIT_INTERLOCK) && gfsw_bit_set(raw, SW_BIT_DOORS)
+    const char *why = device_lost ? "switches unreadable"
+                    : gfsw_bit_set(raw, SW_BIT_INTERLOCK) && gfsw_bit_set(raw, SW_BIT_DOORS)
                        ? "interlock open" : "lid opened";
     char msg[96];
     snprintf(msg, sizeof(msg), "%s - job canceled%s", why,
@@ -460,6 +503,45 @@ static void cancel_poll (sys_state_t st)
     }
 }
 
+/* The device opened again while its reads fail (a device that went away
+   under the open descriptor never answers on it again), once a second,
+   with the name check; the new descriptor replaces the old only once it
+   is open. The file-backed test source opens at every read. */
+static void switch_reopen (void)
+{
+    double now = wall_s();
+    if(sw_fd < 0 || now < reopen_at)
+        return;
+    reopen_at = now + SWITCH_REOPEN_S;
+    int fd = switch_open(sw_dev, false);
+    if(fd < 0)
+        return;
+    close(sw_fd);
+    sw_fd = fd;
+    fflog(LOG_INFO, "gfswitch: %s opened again", sw_dev);
+}
+
+/* A poll whose read failed. One or two in a row keep the last reading,
+   so a transient fakes no edge; from the third the door reads open until
+   a read succeeds, and the window closes, logged once. Returns true when
+   the door reads open this poll. */
+static bool poll_failed (void)
+{
+    if(poll_fails < SWITCH_POLL_FAILS_MAX)
+        poll_fails++;
+    if(poll_fails < SWITCH_POLL_FAILS_MAX)
+        return false;
+    if(!device_lost) {
+        device_lost = true;
+        fflog(LOG_ERR, "gfswitch: %d switch reads failed in a row - the lid reads open, "
+              "the laser window closed", poll_fails);
+        report_message("switches unreadable - the lid reads open", Message_Warning);
+        gflaser_disarm();
+    }
+    switch_reopen();
+    return true;
+}
+
 void gfsw_poll (void)
 {
     control_signals_t now = {0}, want, on, off;
@@ -468,21 +550,31 @@ void gfsw_poll (void)
     if(!gfsw_available())
         return;
 
-    /* A read that fails keeps the previous state (no false edge), but a
-     * cancel in flight keeps going: its reset and its park must not
-     * wait on a switch device that has stopped answering. */
+    /* A read that fails fakes no edge for two polls (poll_failed), and a
+     * cancel in flight keeps going either way: its reset and its park
+     * must not wait on a switch device that has stopped answering. From
+     * the third the door reads open and is delivered below as a real
+     * one is. The button is left as it was: a failed read is no press. */
     if(!read_signals(&now)) {
-        cancel_poll(st);
-        return;
+        if(!poll_failed()) {
+            cancel_poll(st);
+            return;
+        }
+        state.safety_door_ajar = On;
+        now = state;
+    } else {
+        if(device_lost)
+            fflog(LOG_NOTICE, "gfswitch: the switches read again");
+        poll_fails = 0;
+        device_lost = false;
+        state = now;
+
+        /* Button edge: pause / resume, outside the arm wait. */
+        bool button = gfsw_bit_set(raw, SW_BIT_BUTTON);
+        if(button && !button_prev)
+            button_edge(st);
+        button_prev = button;
     }
-
-    state = now;
-
-    /* Button edge: pause / resume, outside the arm wait. */
-    bool button = gfsw_bit_set(raw, SW_BIT_BUTTON);
-    if(button && !button_prev)
-        button_edge(st);
-    button_prev = button;
 
     /* What the core should currently see as asserted, given its state
        (the door signal is hidden while IDLE/JOG/HOMING and through a

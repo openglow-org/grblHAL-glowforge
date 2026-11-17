@@ -143,6 +143,24 @@ int gf_stream_readback (int32_t steps[3], uint32_t wait_ms);
 // write failure). Clears the flag; caller raises the alarm.
 bool gf_stream_fault_take (void);
 
+// The references late steps have cost: late steps clamped outside an armed
+// window that owed X or Y a full step (the microstep mode's count of steps,
+// gfio_xy_microsteps) give GF_LATE_XY, ones that owed the lens two
+// half-steps give GF_LATE_Z, each once per stream. Steps can have been lost
+// there while every counter agrees, so the caller drops that reference: X
+// and Y's together, the lens's alone. 0 when none is owed. Clears what it
+// returns. Protocol thread.
+#define GF_LATE_XY 0x01
+#define GF_LATE_Z  0x02
+uint8_t gf_stream_clamp_take (void);
+
+// True when the kernel has played out a stream and the motors are owed
+// their hold currents, which the caller writes (gfio_currents_hold): the
+// drop and a start's run currents both happen on the protocol thread, so
+// they never cross, and no real-time thread writes the PIC. False once a
+// new stream has started. Clears the owed drop. Protocol thread.
+bool gf_stream_hold_take (void);
+
 // Zero the kernel position counters (homing established a reference;
 // external status readers add the home offset to the counters). The
 // zero is a new base for the read-back.

@@ -272,6 +272,10 @@ static bool dark_watch;             /* the M3/M4 was dropped under a job that ma
 /* Consecutive unreadable switch reads that end a button wait. */
 #define SWITCH_READ_FAILS_MAX 3
 static double next_emission_check;  /* ~1 Hz witness pacing */
+/* Witness checks in a row that read no count; this many is a blind
+ * witness (about 3 s at the 1 Hz pacing). */
+#define WITNESS_BLIND_MAX 3
+static int witness_blind;
 static on_program_completed_ptr on_program_completed;
 static spindle_ptrs_t *hal_spindle;         /* the registered spindle's table entry */
 static dose_model_t cur_model = Model_Density;   /* the model last applied */
@@ -1518,18 +1522,42 @@ static void window_poll (void)
      * window's emitting samples on the gated output of the hardware
      * AND-gate - physical evidence, not a commanded state. Emission
      * while the window is closed (3 s of margin covers the sample
-     * window's lag past a disarm) is never legitimate. */
+     * window's lag past a disarm) is never legitimate. A check that
+     * cannot read a count is no reading: the first is said once, and
+     * WITNESS_BLIND_MAX of them in a row are a blind witness, met as a
+     * sensed emission is (the latch relocked, an alarm), once per
+     * episode; a count read again ends the episode. */
     if(hw_active) {
         double t = wall_s();
         if(t >= next_emission_check) {
             next_emission_check = t + 1.0;
-            char v[8] = "";
-            if(!laser_ok && (disarmed_at == 0.0 || t - disarmed_at > 3.0) &&
-               gfio_rd_attr("cnc/laser_on_sampled", v, sizeof(v)) == 0 &&
-               atoi(v) > 0) {
-                latch_lock(true);
-                report_message("uncommanded laser emission sensed - latch relocked", Message_Warning);
-                system_raise_alarm(Alarm_AbortCycle);
+            if(!laser_ok && (disarmed_at == 0.0 || t - disarmed_at > 3.0)) {
+                char v[8] = "";
+                char *end = v;
+                long n = gfio_rd_attr("cnc/laser_on_sampled", v, sizeof(v)) == 0 ? strtol(v, &end, 10) : -1;
+                if(end == v || *end != '\0' || n < 0) {
+                    if(witness_blind <= WITNESS_BLIND_MAX)
+                        witness_blind++;
+                    if(witness_blind == 1)
+                        fflog(LOG_WARNING, "gflaser: the emission witness cannot read cnc/laser_on_sampled");
+                    if(witness_blind == WITNESS_BLIND_MAX) {
+                        latch_lock(true);
+                        report_message("the emission witness cannot read the laser's output - latch relocked",
+                                       Message_Warning);
+                        fflog(LOG_ERR, "gflaser: emission witness blind for %d checks - latch relocked, alarm",
+                              witness_blind);
+                        system_raise_alarm(Alarm_AbortCycle);
+                    }
+                } else {
+                    if(witness_blind >= WITNESS_BLIND_MAX)
+                        fflog(LOG_NOTICE, "gflaser: the emission witness reads again");
+                    witness_blind = 0;
+                    if(n > 0) {
+                        latch_lock(true);
+                        report_message("uncommanded laser emission sensed - latch relocked", Message_Warning);
+                        system_raise_alarm(Alarm_AbortCycle);
+                    }
+                }
             }
         }
     }

@@ -28,6 +28,9 @@
   whose union holds Z: the core keeps an axis homed only while a cycle
   names it, and the lens hold rests on the Z homed bit).
 
+  And glowforge_io.c's shared config reader and current writes (see
+  conf_reader and current_writes below).
+
   Copyright 2026 514 LLC d/b/a OpenGlow
   Written by Scott Wiederhold
   SPDX-License-Identifier: GPL-3.0-or-later
@@ -39,6 +42,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+/* The shared config's reader and the current writes are glowforge_io.c's
+   own, included here: a value too long for its reader is refused, never
+   read as its first characters, and a float is the whole value or the
+   fallback; a failed current write is named once an episode. */
+static char test_sysfs[64];             /* the attribute tree, made by current_writes */
+#define GFIO_SYSFS_ROOT() test_sysfs
+#include "../src/glowforge_io.c"
+#include <sys/stat.h>                   /* after the core headers: its macros clash with vfs.h */
+
+static int log_lines;                   /* fflog lines at warning or worse */
+void fflog (int prio, const char *fmt, ...) { if(prio <= LOG_WARNING) log_lines++; (void)fmt; }
 
 static int failures = 0;
 
@@ -73,8 +89,147 @@ static void expect_f (const char *what, float got, float want, float tol)
     }
 }
 
+/* The shared config's reader: a value longer than the reader's buffer is
+   refused and the default stands, named once per key; a line longer than
+   the reader's line is skipped whole, so nothing in its tail reads as a
+   setting; a float is the whole value or the fallback. */
+static void conf_reader (void)
+{
+    char path[] = "/tmp/xy_scale_test.XXXXXX";
+    int fd = mkstemp(path);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (f == NULL) {
+        printf("FAIL cannot create the config file\n");
+        failures++;
+        return;
+    }
+    fprintf(f, "cool_fan_grace_s = 0000000000000000000000000000000688\n");   /* 34 characters */
+    fprintf(f, "laser_disarm_s = 12abc\n");
+    fputc('#', f);                      /* a comment longer than the reader's 255 characters, */
+    for (int i = 0; i < 254; i++)       /* with a setting in its tail */
+        fputc('x', f);
+    fprintf(f, "rail_settle_s = 9\n");
+    fprintf(f, "laser_floor_density = 12.5\n");
+    fprintf(f, "lid_policy = hold\n");
+    fclose(f);
+    setenv("GFHOME_CONF", path, 1);
+
+    char v[16];
+    int lines0 = log_lines;
+    expect_f("a value longer than the reader's 31 characters: the fallback",
+             gfio_conf_read_float("cool_fan_grace_s", 15.0f), 15.0f, 1e-6f);
+    gfio_conf_read_float("cool_fan_grace_s", 15.0f);
+    expect_u("the refusal is named once for its key", (unsigned)(log_lines - lines0), 1);
+    expect_f("a value that is not wholly a number: the fallback",
+             gfio_conf_read_float("laser_disarm_s", 60.0f), 60.0f, 1e-6f);
+    expect_f("a setting in the tail of a line longer than the reader's is none",
+             gfio_conf_read_float("rail_settle_s", 2.5f), 2.5f, 1e-6f);
+    expect_f("the line after it reads whole", gfio_conf_read_float("laser_floor_density", 10.0f), 12.5f, 1e-6f);
+    expect_u("a value that fits reads", (unsigned)(gfio_conf_read("lid_policy", v, sizeof(v)) == 0 &&
+                                                 !strcmp(v, "hold")), 1);
+    expect_u("a value as long as the buffer is refused", (unsigned)(gfio_conf_read("lid_policy", v, 4) != 0), 1);
+    unsetenv("GFHOME_CONF");
+    unlink(path);
+}
+
+/* The attribute tree the writes land in (test_sysfs): every attribute
+   present, or every one but `gone`, whose write then fails as a missing
+   attribute does. */
+static const char *const tree_attrs[] = {
+    "cnc/x_mode", "cnc/y_mode", "cnc/x_decay", "cnc/y_decay", "cnc/motor_lock",
+    "head/z_mode", "head/z_enable", "head/z_current", "pic/x_step_current", "pic/y_step_current" };
+
+static void tree (const char *gone)
+{
+    char path[160];
+    for (size_t i = 0; i < sizeof(tree_attrs) / sizeof(tree_attrs[0]); i++) {
+        snprintf(path, sizeof(path), "%s%s", test_sysfs, tree_attrs[i]);
+        if (gone && !strcmp(tree_attrs[i], gone)) {
+            unlink(path);
+            continue;
+        }
+        FILE *f = fopen(path, "w");
+        if (f)
+            fclose(f);
+    }
+}
+
+/* The current writes and the drivers' configuration, one attribute
+   failing at a time: an X or Y current that does not take is false and
+   named once for its episode, the lens's named apart and refusing
+   nothing; each of the X and Y modes and decays and the motor lock that
+   does not take makes the configuration false, the head's refuse nothing;
+   a write that takes ends an episode. */
+static void current_writes (void)
+{
+    char tmpl[] = "/tmp/xy_scale_sys.XXXXXX";
+    if (mkdtemp(tmpl) == NULL) {
+        printf("FAIL cannot create the attribute tree\n");
+        failures++;
+        return;
+    }
+    snprintf(test_sysfs, sizeof(test_sysfs), "%s/", tmpl);
+    char dir[96];
+    const char *const dirs[] = { "cnc", "head", "pic" };
+    for (int i = 0; i < 3; i++) {
+        snprintf(dir, sizeof(dir), "%s%s", test_sysfs, dirs[i]);
+        mkdir(dir, 0755);
+    }
+    gfio_set_hw(true);
+
+    tree(NULL);
+    int lines0 = log_lines;
+    expect_u("every attribute present: the run currents take", (unsigned)gfio_currents_run(), 1);
+    expect_u("and the configuration takes", (unsigned)gfio_analog_config(), 1);
+    expect_u("and nothing is named", (unsigned)(log_lines - lines0), 0);
+
+    tree("pic/y_step_current");
+    expect_u("the Y run current alone does not take: false", (unsigned)gfio_currents_run(), 0);
+    gfio_currents_hold();
+    expect_u("named once for its episode", (unsigned)(log_lines - lines0), 1);
+    tree(NULL);
+    gfio_currents_run();
+    lines0 = log_lines;
+    tree("pic/x_step_current");
+    expect_u("the X run current alone does not take: false", (unsigned)gfio_currents_run(), 0);
+    expect_u("after a write that took, a new episode, named again", (unsigned)(log_lines - lines0), 1);
+    tree("head/z_current");
+    lines0 = log_lines;
+    expect_u("the lens current alone does not take: still true", (unsigned)gfio_currents_run(), 1);
+    expect_u("and it is named", (unsigned)(log_lines - lines0) >= 1, 1);
+
+    static const char *const config_attrs[] = {
+        "cnc/x_mode", "cnc/y_mode", "cnc/x_decay", "cnc/y_decay", "cnc/motor_lock" };
+    for (size_t i = 0; i < sizeof(config_attrs) / sizeof(config_attrs[0]); i++) {
+        char what[96];
+        tree(config_attrs[i]);
+        snprintf(what, sizeof(what), "%s alone does not take: the configuration is false", config_attrs[i]);
+        expect_u(what, (unsigned)gfio_analog_config(), 0);
+    }
+    tree("head/z_mode");
+    expect_u("the head's Z mode alone does not take: the configuration still takes",
+             (unsigned)gfio_analog_config(), 1);
+    tree("head/z_enable");
+    expect_u("the head's Z enable alone: the same", (unsigned)gfio_analog_config(), 1);
+
+    gfio_set_hw(false);
+    for (size_t i = 0; i < sizeof(tree_attrs) / sizeof(tree_attrs[0]); i++) {
+        char path[160];
+        snprintf(path, sizeof(path), "%s%s", test_sysfs, tree_attrs[i]);
+        unlink(path);
+    }
+    for (int i = 0; i < 3; i++) {
+        snprintf(dir, sizeof(dir), "%s%s", test_sysfs, dirs[i]);
+        rmdir(dir);
+    }
+    rmdir(tmpl);
+}
+
 int main (void)
 {
+    conf_reader();
+    current_writes();
+
     /* The key names a mode or nothing: no rounding, no prefixes. */
     expect_parse("8", 8);
     expect_parse("16", 16);

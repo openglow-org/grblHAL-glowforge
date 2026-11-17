@@ -138,7 +138,14 @@ static _Atomic bool v_resume_ok = false;
  * with nothing wrong at idle - would otherwise stay fresh across the arm
  * and authorize the first fire before the run airflow is applied. */
 static _Atomic bool v_armed = false;
-static _Atomic uint32_t v_fresh_until_ms = 0;
+/* The deadline is CLOCK_MONOTONIC milliseconds in 64 bits: it never wraps,
+ * so a deadline left behind stays stale however long the controller runs,
+ * and the 0 it starts at is stale at any uptime. The stepper producer
+ * reads it, at real-time priority, so it must be lock-free there: on the
+ * i.MX6 (ARMv7-A) a 64-bit atomic is LDREXD/STREXD. */
+static _Atomic uint64_t v_fresh_until_ms = 0;
+_Static_assert(__atomic_always_lock_free(sizeof(uint64_t), 0),
+               "the verdict deadline is read by a real-time thread: its atomic must be lock-free");
 static char v_reason[112];
 static char v_reason_shown[112];
 static char v_name[16];                 /* the verdict's name (its tier) */
@@ -165,11 +172,18 @@ static uint32_t next_verdict_ms = 0;
 static int http_port = 80;
 static char report_secret[33];      /* from the supervisor, at the spawn; empty when there is none */
 
-static uint32_t mono_ms (void)
+static uint64_t mono_ms64 (void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* The pacing clocks (the next report, the next read) are refreshed every
+ * pass, so their 32-bit differences never span 2^31 ms. */
+static uint32_t mono_ms (void)
+{
+    return (uint32_t)mono_ms64();
 }
 
 static void warn (const char *msg)
@@ -421,14 +435,13 @@ static void verdict_read (void)
      * carries the block), and a verdict named ACK says the same thing. */
     v_ack_wait = json_bool(body, "ack_wait", false);
     atomic_store_explicit(&v_fresh_until_ms,
-        mono_ms() + (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),
+        mono_ms64() + (uint64_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),
         memory_order_release);
 }
 
 static bool verdict_fresh (void)
 {
-    return (int32_t)(mono_ms() -
-        atomic_load_explicit(&v_fresh_until_ms, memory_order_acquire)) < 0;
+    return mono_ms64() < atomic_load_explicit(&v_fresh_until_ms, memory_order_acquire);
 }
 
 /* The fail tier: the verdicts a job cannot continue from. Everything

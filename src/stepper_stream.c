@@ -67,9 +67,12 @@
   - The SHIPPER thread (SCHED_FIFO when permitted) writes due bytes to
     /dev/glowforge every ~10 ms (due = wall-elapsed x rate + depth, per
     the UAPI pacing rule) and owns the kernel state machine: run start,
-    underrun ack/retry, streaming=1/0, and the PIC run/hold current
-    switching (hold applied only after the kernel has drained its queue
-    and idled - the decel tail lives there).
+    underrun ack/retry, streaming=1/0, and the moment the PIC hold
+    currents are owed (only after the kernel has drained its queue and
+    idled - the decel tail lives there). The PIC writes themselves, run
+    and hold, are the protocol thread's: the shipper writes no PIC
+    register, so it never waits on the PIC's lock, and the two writes
+    have one owner.
 
   Lock order is strictly core -> gf. The shipper takes only gf.lock and
   NEVER calls core APIs; stream faults are surfaced through an atomic
@@ -77,9 +80,12 @@
   each chunk under gf.lock and writes it to the kernel with the lock
   released, so a write that blocks never holds the producer. A producer
   that falls behind real time has its late events clamped forward and
-  counted; inside an armed window the clamp faults the stream, because
-  the burst it compresses onto later bytes is energy where it was not
-  commanded.
+  counted, and once one axis has owed a full step in a stream its
+  reference drops, X and Y's together or the lens's (steps can be lost
+  while the counters agree); inside an armed window the clamp faults the
+  stream,
+  because the burst it compresses onto later bytes is energy where it
+  was not commanded.
 
   Without GFSINK the module runs in null-sink mode: producer, ring and
   shipper all operate identically but no device/sysfs I/O happens -
@@ -236,6 +242,13 @@ static struct {
     bool clear_pending;       /* a reset stopped the kernel mid-motion: drop
                                  its unplayed residue once it is idle */
     bool hold_pending;        /* drop to hold currents once kernel idles */
+    _Atomic bool hold_due;    /* the kernel idled: the protocol thread drops
+                                 to the hold currents (gf_stream_hold_take) */
+    uint8_t late_noted;       /* the GF_LATE_ references this stream has cost: reported */
+    uint32_t late_steps[3];   /* X, Y and Z steps this stream pushed forward */
+    bool config_pending;      /* a resume's driver configuration did not take: each
+                                 start writes it again, and refuses until it takes
+                                 (protocol thread only) */
     double hold_poll_at;      /* wall time of the next kernel-state poll */
     uint32_t written;         /* bytes the ring took since its last seek-clear,
                                  mod 2^32, as the kernel's processed count wraps */
@@ -322,6 +335,10 @@ static struct {
 static _Atomic bool armed = false;
 static _Atomic bool quit = false;
 static _Atomic bool fault_flag = false;
+/* Late events clamped outside an armed window that owed an axis a full
+ * step: the GF_LATE_ references the protocol thread drops
+ * (gf_stream_clamp_take). */
+static _Atomic uint8_t late_flags = 0;
 static _Atomic bool laser_armed = false;
 /* The per-tick fire gate (gf_stream_fire_gate): the armed window and
  * the cooling verdict, as glowforge_laser.c last published them. */
@@ -563,10 +580,12 @@ void gf_stream_cycles_per_tick (uint32_t cycles)
 /* A producer event that maps behind the ship cursor: the lead was
  * exhausted (the producer was kept off the CPU), and pushing the event
  * forward compresses it onto later bytes, a step burst the counters
- * still trust. Unarmed that is counted and warned; inside an armed
- * window it is a fault (the hook disarms, drops the homing anchor and
- * alarms), because the burst is also energy where it was not commanded.
- * Returns true when the caller must drop the event. Call under gf.lock. */
+ * still trust. Unarmed that is counted and warned, and the steps it
+ * pushes forward are counted per axis (clamp_steps_locked). Inside an
+ * armed window it is a fault (the hook disarms, drops the homing anchor
+ * and alarms), because the burst is also energy where it was not
+ * commanded. Returns true when the caller must drop the event. Call
+ * under gf.lock. */
 static bool clamp_locked (void)
 {
     gf.clamped++;
@@ -583,6 +602,36 @@ static bool clamp_locked (void)
             gfio_wr_attr("cnc/stop", "1");
     }
     return true;
+}
+
+/* The steps an unarmed clamp pushes forward, counted per axis for the
+ * stream from the event's step bits (its direction bits are no step). The
+ * burst ships them one per tick, faster than any planned move; a motor
+ * whose command jumps ahead by less than one full step follows it, and
+ * one that owes a full step or more can lose steps while every counter
+ * agrees. So once X or Y has owed a full step in this stream (the
+ * microstep mode's count of steps, read where the controller's start
+ * cached it), the X and Y reference drops, and once the lens has owed two
+ * half-steps (its full step), the lens reference drops: the hook, once a
+ * stream each. Under that the clamp is the log line alone. Call under
+ * gf.lock. */
+static void clamp_steps_locked (uint8_t step_bits)
+{
+    uint32_t full = gfio_xy_microsteps();
+    uint8_t owed = 0;
+
+    for(int a = 0; a < 3; a++)
+        if(step_bits & (1u << a))
+            gf.late_steps[a]++;
+    if(gf.late_steps[X_AXIS] >= full || gf.late_steps[Y_AXIS] >= full)
+        owed |= GF_LATE_XY;
+    if(gf.late_steps[Z_AXIS] >= 2)
+        owed |= GF_LATE_Z;
+    owed &= (uint8_t)~gf.late_noted;
+    if(owed) {
+        gf.late_noted |= owed;
+        atomic_fetch_or(&late_flags, owed);
+    }
 }
 
 /* A step event as a pulse byte. grblHAL bits: bit0=X bit1=Y bit2=Z, dir
@@ -625,6 +674,7 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits)
                 pthread_mutex_unlock(&gf.lock);
                 return;
             }
+            clamp_steps_locked(step_bits);
             idx = gf.shipped;
         }
         if(idx < gf.produced)           /* same machine tick as a previous event */
@@ -856,9 +906,33 @@ void gf_stream_wakeup (void)
 
     /* Factory run/idle scheme: full torque only while motion plays.
      * Playback starts a queue-depth behind, so the PIC settles first.
-     * PIC writes ride SPI (milliseconds) - never under gf.lock. */
-    if(gf.active)
-        gfio_currents_run();
+     * PIC writes ride SPI (milliseconds) - never under gf.lock. This runs
+     * on the protocol thread, as the hold drop does (gf_stream_hold_take),
+     * so the two current writes never cross. A run current that does not
+     * take is no run: the stream faults, and the hook alarms on the
+     * protocol thread, before a step plays at currents nobody set. So is a
+     * stepper driver configuration a resume could not write: it is written
+     * again at each start until it takes. The null sink writes nothing
+     * (GFSINK_ATTR_LOG records what the hardware would get). */
+    const char *refused = NULL;
+    if(gf.active && gf.config_pending) {
+        gf.config_pending = !gfio_analog_config();
+        if(gf.config_pending)
+            refused = "gfstream: the stepper drivers' configuration did not take - no motion, alarming\n";
+    }
+    if(refused == NULL && !gfio_currents_run())
+        refused = "gfstream: the run currents did not take - no motion, alarming\n";
+    if(refused != NULL) {
+        pthread_mutex_lock(&gf.lock);
+        bool report = !gf.failed;
+        gf.failed = true;
+        pthread_mutex_unlock(&gf.lock);
+        if(report) {
+            rt_log(refused);
+            fault_flag = true;
+        }
+        return;
+    }
 
     pthread_mutex_lock(&gf.lock);
     gf.killed = false;              /* a new stream: no reset ended this one */
@@ -868,6 +942,9 @@ void gf_stream_wakeup (void)
         gf.vticks = 0;
         gf.wall_epoch = wall_s();
         gf.hold_pending = false;
+        gf.hold_due = false;        /* the run currents stand: no drop owed */
+        gf.late_noted = 0;          /* a new stream owes no late steps yet */
+        memset(gf.late_steps, 0, sizeof(gf.late_steps));
         if(!gf.kernel_running) {
             /* Fresh stream after a completed one: restart the stream-
              * relative index space (produced/shipped/due must share an
@@ -1469,7 +1546,6 @@ static void ship_pass (void)
     uint64_t backlog = gf.produced > gf.shipped ? gf.produced - gf.shipped : 0;
 
     if(!streaming && backlog == 0) {
-        bool drop_hold = false;
         /* stream finished: tell the kernel the next end-of-data is normal */
         if(gf.kernel_running) {
             if(gf.last_lit) {
@@ -1509,21 +1585,25 @@ static void ship_pass (void)
             gf.hold_poll_at = wall_s() + 0.1;
         }
         /* Motors keep run current until the kernel has actually played out
-         * its queue (the decel tail lives there); then drop to hold. */
+         * its queue (the decel tail lives there); then the drop to hold is
+         * owed. The protocol thread writes it (gf_stream_hold_take): this
+         * thread runs at real-time priority and takes no PIC write, and
+         * the run currents of the next start are written there too. */
         if(gf.hold_pending && wall_s() >= gf.hold_poll_at) {
             char state[16] = "";
             if(!gf.active) {
+                /* The null sink has no queue to drain: the drop is owed
+                 * all the same, so GFSINK_ATTR_LOG shows it. */
+                gf.hold_due = true;
                 gf.hold_pending = false;
             } else if(gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
                        strcmp(state, "idle") == 0) {
-                drop_hold = true;
+                gf.hold_due = true;
                 gf.hold_pending = false;
             } else
                 gf.hold_poll_at = wall_s() + 0.1;
         }
         pthread_mutex_unlock(&gf.lock);
-        if(drop_hold)
-            gfio_currents_hold();   /* PIC-SPI: never under gf.lock */
         return;
     }
 
@@ -1889,6 +1969,21 @@ bool gf_stream_fault_take (void)
     return atomic_exchange(&fault_flag, false);
 }
 
+uint8_t gf_stream_clamp_take (void)
+{
+    return atomic_exchange(&late_flags, 0);
+}
+
+/* The hold drop the shipper found owed, taken on the protocol thread. A
+ * stream's start (gf_stream_wakeup) and a handover (gf_stream_suspend),
+ * both on this thread, clear it, so a drop is never taken over a start's
+ * run currents or into a device another process holds. Lock-free: every
+ * protocol pass asks. */
+bool gf_stream_hold_take (void)
+{
+    return atomic_exchange(&gf.hold_due, false);
+}
+
 void gf_stream_clear_position (void)
 {
     pthread_mutex_lock(&gf.lock);
@@ -1929,10 +2024,16 @@ bool gf_stream_suspend (void)
     if(!gf.active) {
         /* The null sink has no device to hand over, and records the
          * handover all the same: a reset during the session finds the
-         * device another process's, as it does on the machine. */
+         * device another process's, as it does on the machine, and an
+         * owed hold drop is written before it, as there. */
         pthread_mutex_lock(&gf.lock);
         gf.suspended = true;
+        bool drop = gf.hold_pending || gf.hold_due;
+        gf.hold_pending = false;
+        gf.hold_due = false;
         pthread_mutex_unlock(&gf.lock);
+        if(drop)
+            gfio_currents_hold();
         return true;
     }
 
@@ -1952,9 +2053,10 @@ bool gf_stream_suspend (void)
                 strcmp(state, "idle") == 0;
     }
     if(idle) {
-        if(gf.hold_pending) {
+        if(gf.hold_pending || gf.hold_due) {
             drop_hold = true;
             gf.hold_pending = false;
+            gf.hold_due = false;
         }
         gf.suspended = true;
         /* Under the broker the device stays open across the handover
@@ -2061,9 +2163,12 @@ bool gf_stream_resume (void)
     /* The homing session reconfigured the machine; re-apply the full
      * analog config and stream state exactly as at init. The latch is
      * locked first, through the process's one writer; a lock that does
-     * not take is a lost device. */
+     * not take is a lost device, and so is a stepper driver configuration
+     * that does not take (the drivers would run at the session's mode
+     * under this controller's scale). */
     bool ok = gf_stream_laser_latch(true);
-    gfio_analog_config();
+    bool config_ok = gfio_analog_config();
+    ok = config_ok && ok;
     ok = apply_tick() && ok;
     bool emptied = lseek(fd, 1, SEEK_SET) >= 0;   /* clear pulse data + byte counters */
     gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
@@ -2086,7 +2191,12 @@ bool gf_stream_resume (void)
     gf.streaming = false;
     gf.kernel_running = false;
     gf.hold_pending = false;
+    gf.hold_due = false;
     gf.failed = false;
+    /* A configuration that did not take stays refused past the session's
+     * alarm: the next start writes it again and does not stream until it
+     * takes (gf_stream_wakeup). */
+    gf.config_pending = !config_ok;
     gf.suspended = false;
     gf.lev_head = gf.lev_tail;
     gf.cur_power = 0;
@@ -2097,9 +2207,28 @@ bool gf_stream_resume (void)
     pthread_mutex_unlock(&gf.lock);
 
     if(!ok)
-        fflog(LOG_ERR, "gfstream: cannot restore the latch lock or step_freq");
+        fflog(LOG_ERR, "gfstream: cannot restore the latch lock, the stepper drivers' configuration "
+              "or step_freq");
 
     return ok;
+}
+
+/* The device's configuration at the controller's start, each part of
+ * which the start needs: the laser latch locked (glowforge_laser.c unlocks
+ * it only inside an operator-armed job window), through the process's one
+ * writer; the full factory analog configuration (modes, decay, motor
+ * lock, hold currents), since drivers left at another holder's mode would
+ * step under this controller's scale; and the machine tick. NULL when all
+ * three took, else what did not: the controller does not start. */
+static const char *start_config (void)
+{
+    if(!gf_stream_laser_latch(true))
+        return "cannot lock the laser latch";
+    if(!gfio_analog_config())
+        return "the stepper drivers' configuration did not take";
+    if(!apply_tick())
+        return "cannot set step_freq";
+    return NULL;
 }
 
 void gf_stream_init (void)
@@ -2193,18 +2322,9 @@ void gf_stream_init (void)
         else
             fflog(LOG_INFO, "gfstream: pulse device inherited from the broker");
 
-        /* Laser latch locked at init (glowforge_laser.c unlocks it only
-         * inside an operator-armed job window), through the process's
-         * one writer: a controller whose lock does not take does not
-         * start. Then the full factory analog config (modes, decay,
-         * motor lock, hold currents). */
-        if(!gf_stream_laser_latch(true)) {
-            fflog(LOG_ERR, "gfstream: cannot lock the laser latch");
-            exit(1);
-        }
-        gfio_analog_config();
-        if(!apply_tick()) {
-            fflog(LOG_ERR, "gfstream: cannot set step_freq");
+        const char *refused = start_config();
+        if(refused != NULL) {
+            fflog(LOG_ERR, "gfstream: %s", refused);
             exit(1);
         }
         /* Fresh stream state. */

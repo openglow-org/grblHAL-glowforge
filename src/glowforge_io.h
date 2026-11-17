@@ -67,11 +67,18 @@ bool gfio_pulse_inherited (void);
 // kernel does not restore any of this after a module reload. The laser
 // latch is not written here: every latch write goes through the stream
 // engine's one writer (gf_stream_laser_latch), which locks it first.
-void gfio_analog_config (void);
+// Returns false when a write of the stepper drivers' configuration (the
+// X and Y microstep mode and decay, the motor lock) did not take: the
+// caller refuses to start on it. The head's Z mode and enable are named
+// when they fail and refuse nothing.
+bool gfio_analog_config (void);
 
 // Factory run/idle current scheme: full torque only while motion plays.
-void gfio_currents_run (void);
-void gfio_currents_hold (void);
+// Written on the protocol thread only. Return false when the X or Y step
+// current did not take; a failed write (the lens's too) is logged once
+// per episode.
+bool gfio_currents_run (void);
+bool gfio_currents_hold (void);
 
 // The motor release (glowforge_release.c): while it is held, the run and
 // hold postures write 0 to the X and Y step currents and nothing else, so
@@ -84,7 +91,10 @@ bool gfio_xy_released (void);
 // '#' comments; GFHOME_CONF overrides the path). Written by the
 // forgectrl web UI; consumers re-read at their natural boundaries
 // (homing per $H, cooling per flood start). Returns 0 when the key
-// exists; the float variant falls back on a missing or unparsable key.
+// exists with a value that fits `len`; a longer value (or a line longer
+// than the reader's 255 characters) is refused, logged once per key, and
+// the caller's default stands. The float variant falls back on a missing
+// key or a value that is not wholly a number.
 int gfio_conf_read (const char *key, char *val, size_t len);
 float gfio_conf_read_float (const char *key, float fallback);
 
