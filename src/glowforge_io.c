@@ -185,7 +185,7 @@ int gfio_open_pulse_dev_nb (const char *path)
 
 void gfio_analog_config (void)
 {
-    char mode[8];
+    char mode[12];
     snprintf(mode, sizeof(mode), "%u", gfio_xy_microsteps());
     gfio_wr_attr("cnc/x_mode", mode);
     gfio_wr_attr("cnc/y_mode", mode);
