@@ -841,7 +841,7 @@ static status_code_t home_cmd (sys_state_t state, char *args)
 }
 
 static const sys_command_t homing_command_list[] = {
-    { "H", home_cmd }
+    { "H", home_cmd, { .flags = 0 }, { .str = NULL } }
 };
 
 static sys_commands_t homing_commands = {

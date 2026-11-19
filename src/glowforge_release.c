@@ -225,7 +225,7 @@ static void release_report_handlers_init (void)
 static const sys_command_t release_command_list[] = {
     { "MD", release_cmd, { .noargs = On }, { .str = "release the X and Y motors" } },
     { "ME", energize_cmd, { .noargs = On }, { .str = "energize the X and Y motors" } },
-    { "X", unlock_guard }
+    { "X", unlock_guard, { .flags = 0 }, { .str = NULL } }
 };
 
 static sys_commands_t release_commands = {

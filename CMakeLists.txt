@@ -98,13 +98,14 @@ if(NOT GFMCODE_WAIT_S STREQUAL "")
 endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    # The DRIVER's own sources are warning-free and held to that; the
-    # core submodule is upstream code and is not held to -Werror here.
+    # The DRIVER's own sources and its tests are free of the -Wall and
+    # -Wextra classes and held to that; the core submodule is upstream code
+    # and is not held to them here.
     set_source_files_properties(${DRIVER_SOURCES}
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
         tests/lens_home_test.c tests/xy_scale_test.c
         tests/latch_test.c tests/cooling_test.c tests/switches_test.c
-        PROPERTIES COMPILE_OPTIONS "-Werror")
+        PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 endif()
 
 target_link_libraries(grblHAL_glowforge PRIVATE

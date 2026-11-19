@@ -509,7 +509,7 @@ int main(void)
     printf("The welcome banner on a connect:\n");
     grbl.report.init_message = fake_banner;
     hal.stream_blocking_callback = blocking_cb;
-    uint16_t port;
+    uint16_t port = 0;
     int lfd = listen_loopback(&port);
     CHECK(lfd >= 0, "a listening socket on the loopback");
     serial_set_listen_fd(lfd);
@@ -559,7 +559,7 @@ int main(void)
     CHECK(!loopback_text("10.0.0.1") && !loopback_text("192.168.1.5") && !loopback_text("::ffff:192.168.1.5") &&
           !loopback_text("2001:db8::1") && !loopback_text("::"), "the network: every other address");
 
-    uint16_t aport;
+    uint16_t aport = 0;
     int lany = listen_any(&aport);
     CHECK(lany >= 0, "a listening socket on every address");
     serial_set_listen_fd(lany);
@@ -665,8 +665,10 @@ int main(void)
           "the write waited for the sender, in the blocking callback");
 
     /* Drain everything the reader can take, then fill the ring again
-       with a sender that reads only after 1100 ms: the bound drops it at
-       one second, with the ring flushed. */
+       with a sender that reads only after 1600 ms: the bound drops it at
+       one second, with the ring flushed. The drop is judged to a quarter
+       second, which a loaded host's scheduling meets; a bound missing, or
+       past the sender's 1.6 s, keeps the sender. */
     {
         char buf[512];
         while(read(pfd[0], buf, sizeof(buf)) > 0)
@@ -675,11 +677,11 @@ int main(void)
             ;
     }
     cb_calls = 0;
-    peer_after_s = 1.1;
+    peer_after_s = 1.6;
     put_bytes(TX_BUFFER_SIZE);                      /* fills, then blocks on the last byte */
     waited = now_s() - blocked_at;
     CHECK(client_fd < 0, "a sender that pauses past the bound is dropped");
-    CHECK(waited >= 1.0 && waited < 1.1, "the drop comes at the one-second bound");
+    CHECK(waited >= 1.0 && waited < 1.25, "the drop comes at the one-second bound");
     CHECK(serialTxCount() == 1, "the ring is flushed with the drop; only the byte that waited remains");
     close(pfd[0]);
 

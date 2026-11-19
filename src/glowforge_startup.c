@@ -146,8 +146,8 @@ void gfstartup_check (void)
 }
 
 static const sys_command_t startup_command_list[] = {
-    { "N0", store_line0 },
-    { "N1", store_line1 }
+    { "N0", store_line0, { .flags = 0 }, { .str = NULL } },
+    { "N1", store_line1, { .flags = 0 }, { .str = NULL } }
 };
 
 static sys_commands_t startup_commands = {

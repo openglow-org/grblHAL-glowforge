@@ -8,12 +8,13 @@ on:
 jobs:
   native:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      # Driver sources are -Werror via CMakeLists (the core submodule is
-      # upstream code and is not).
+      # Driver sources and tests are -Wall -Wextra -Werror via CMakeLists
+      # (the core submodule is upstream code and is not).
       # The harnesses below run this build: its M-code answer wait is 5 s,
       # not the image's 30 s, so mcode_test.py's no-answer case is short.
       - name: Configure
@@ -37,7 +38,11 @@ jobs:
       - name: Lid cancel under a failed switch read
         run: ./build/switches_test
       # The safety harnesses live in the forgefirm repo (scripts/bench/)
-      # and drive the null-sink build over TCP - no hardware, no root.
+      # and drive the null-sink build over TCP - no hardware, no root. They
+      # come from forgefirm's master (its next in a run on next) at the
+      # time of the run, unpinned: a harness change is pushed before the
+      # driver change that needs it, and a rerun of an old commit runs
+      # today's harnesses (the push order, forgefirm-docs release-flow.md).
       - name: Fetch the test harnesses
         uses: actions/checkout@v4
         with:
@@ -74,3 +79,49 @@ jobs:
         run: python3 forgefirm/scripts/bench/cool_report_test.py build/grblHAL_glowforge
       - name: The crumb tray moves Z and its envelope by the offset, persists, and moves nothing
         run: python3 forgefirm/scripts/bench/tray_test.py build/grblHAL_glowforge
+
+  # The build that ships: the board's 32-bit armhf target with the image's
+  # tune (cortex-a9, NEON, hard float), its hardening flags and 64-bit time,
+  # the driver held to -Wall -Wextra -Werror. Compile only.
+  armhf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: The armhf cross compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-arm-linux-gnueabihf
+      - name: Configure for the board, with the image's flags
+        run: >-
+          cmake -B build-armhf -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=arm
+          -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-DNDEBUG
+          "-DCMAKE_C_FLAGS=-mthumb -mfpu=neon -mfloat-abi=hard -mcpu=cortex-a9 -O2 -pipe -g
+          -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security -Werror=format-security
+          -D_TIME_BITS=64 -D_FILE_OFFSET_BITS=64"
+      - name: Build
+        run: cmake --build build-armhf -j"$(nproc)"
+
+  # The eight unit tests under AddressSanitizer and UndefinedBehaviorSanitizer:
+  # a report fails the test.
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure with ASan and UBSan
+        run: >-
+          cmake -B build-san -DCMAKE_BUILD_TYPE=Debug
+          "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+      - name: Build the unit tests
+        run: >-
+          cmake --build build-san -j"$(nproc)" --target switch_map_test laser_arm_test serial_test
+          lens_home_test xy_scale_test latch_test cooling_test switches_test
+      - name: The unit tests under the sanitizers
+        run: |
+          for t in switch_map_test laser_arm_test serial_test lens_home_test xy_scale_test latch_test cooling_test switches_test; do
+            ./build-san/$t
+          done
