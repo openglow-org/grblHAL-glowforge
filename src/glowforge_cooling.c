@@ -22,9 +22,11 @@
 
   - reads the engine's verdict from /run/forgefirm/cooling.state every
     500 ms and enforces it in-process on every poll from the cached
-    flags: gfcool_fire_ok() gates the laser (the stepper producer
-    thread reads a cached flag with a monotonic freshness deadline - no
-    file IO on that path), a hold verdict takes a real feed hold in the
+    flags: gfcool_verdict_fire_ok() gates the laser per tick and per
+    segment (the stepper producer thread reads a cached flag with a
+    monotonic freshness deadline - no file IO on that path), the
+    window's opening also waits for the engine's acknowledgment
+    (gfcool_run_ack, gfcool_fire_ok), a hold verdict takes a real feed hold in the
     same tick the fire gate closes (jogs are canceled instead - grblHAL
     never holds a jog), and resume_ok auto-resumes a hold this client
     took.
@@ -153,6 +155,11 @@ static char v_name[16];                 /* the verdict's name (its tier) */
  * Acknowledge, whatever the verdict's name is. Protocol thread only, as
  * the name is. */
 static bool v_ack_wait;
+/* The verdict's button_reserved field: a prompt on the control panel has
+ * the machine's button (a hold-gated action's dialog, a package's check
+ * or a package's ask for a press), so a press is no job's consent.
+ * Protocol thread only. */
+static bool v_button_reserved;
 static bool pause_said;                 /* one message per pause-tier episode */
 /* The pause tier's first hold decelerates lit: set when this client
  * takes the hold on a fresh verdict flip, cleared once the head has
@@ -431,6 +438,8 @@ static void verdict_read (void)
     atomic_store_explicit(&v_armed, json_bool(body, "armed", false), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
     json_str(body, "verdict", v_name, sizeof(v_name));
+    /* Absent reads as false, as ack_wait does: fire_ok carries the block. */
+    v_button_reserved = json_bool(body, "button_reserved", false);
     /* Absent reads as false: the field gates nothing by itself (fire_ok
      * carries the block), and a verdict named ACK says the same thing. */
     v_ack_wait = json_bool(body, "ack_wait", false);
@@ -544,12 +553,14 @@ bool gfcool_fire_ok (void)
     if(!gfcool_verdict_fire_ok())
         return false;
 
-    /* Inside our armed window the verdict must be one the engine
-     * computed with that window in effect, or it is an answer to the
-     * previous session. Before the window opens there is nothing to
-     * acknowledge, so the pre-arm gate reads the verdict as it stands.
-     * The engine re-reports at 1 Hz and on every change, so the wait
-     * here is bounded by one report and one engine tick. */
+    /* The window's opening: once the window is reported the verdict
+     * must be one the engine computed with that window in effect, or it
+     * is an answer to the previous session. Before it is reported there
+     * is nothing to acknowledge, so the pre-arm gate reads the verdict as
+     * it stands. The engine re-reports at 1 Hz and on every change, so
+     * the wait here is bounded by one report and one engine tick. The
+     * per-tick and per-segment gates inside the open window read the
+     * verdict alone (gfcool_verdict_fire_ok). */
     if(atomic_load_explicit(&laser_on_window, memory_order_relaxed) &&
         !atomic_load_explicit(&v_armed, memory_order_relaxed))
         return false;
@@ -560,6 +571,11 @@ bool gfcool_fire_ok (void)
 bool gfcool_ack_waits (void)
 {
     return verdict_fresh() && (v_ack_wait || !strcmp(v_name, "ACK"));
+}
+
+bool gfcool_button_reserved (void)
+{
+    return verdict_fresh() && v_button_reserved;
 }
 
 bool gfcool_run_ack (void)

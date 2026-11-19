@@ -897,6 +897,8 @@ int main (void)
     CHECK(lit_tail == ticks && ticks > 0, "the ended run's tail ships lit to its last byte");
     relit = lit_ticks((uint32_t)next_base, (uint32_t)next_base + 20, &ticks);
     CHECK(ticks == 20 && relit == 20, "and the restarted run is lit from its first byte");
+    uint32_t lit_now;
+    CHECK(!gf_stream_lit_ticks(&lit_now), "a stream still in motion has not shipped all it will make");
     ring_close();
 
     /* A run the core stops from off the producer (st_reset's go-idle after
@@ -908,8 +910,17 @@ int main (void)
     gf.dith_period = 0;
     atomic_store(&laser_armed, true);
     atomic_store(&fire_gate, true);
+    uint32_t lit_base;
+    (void)gf_stream_lit_ticks(&lit_base);
     gf_stream_laser(100, true);
     stream_ended(0);                    /* lit from its first byte, and its end */
+    /* The count the laser module asks at an M5 (a window that fired
+     * nothing closes there): every FIRE tick the ring took and only those,
+     * final once the stream has shipped all it made. */
+    int all_lit = lit_ticks(0, UINT32_MAX, &ticks);
+    CHECK(gf_stream_lit_ticks(&lit_now) && all_lit > 0 && ticks > all_lit &&
+          lit_now - lit_base == (uint32_t)all_lit,
+          "the stream counts the FIRE ticks it shipped, final once it has shipped all it made");
     gf_stream_run_end();                /* the driver's go-idle, no reset, off the producer */
     lit_ticks(0, UINT32_MAX, &ticks);
     uint32_t t0 = (uint32_t)ticks;      /* the next stream's ticks follow these */

@@ -313,6 +313,24 @@ int main (void)
     verdict_read();
     atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
     CHECK(!gfcool_ack_waits(), "a stale verdict's ack_wait says nothing");
+    /* The control panel's prompt that has the machine's button is its own
+     * field too: button_reserved says so under any name, a document
+     * without it says nothing, and a stale verdict says nothing at all. */
+    reset_state();
+    publish_extra = ",\"button_reserved\":true";
+    publish(false, "BUTTON", false, true, false, 0.0);
+    verdict_read();
+    CHECK(gfcool_button_reserved(), "button_reserved true: a prompt on the panel has the button");
+    publish_extra = "";
+    publish(false, "BUTTON", false, true, false, 0.0);
+    verdict_read();
+    CHECK(!gfcool_button_reserved(), "no button_reserved field reads as false");
+    publish_extra = ",\"button_reserved\":true";
+    publish(false, "COLD", true, false, false, 0.0);
+    verdict_read();
+    atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
+    CHECK(!gfcool_button_reserved(), "a stale verdict's button_reserved says nothing");
+    publish_extra = "";
     /* And the held job is not resumed under it, whatever the name. */
     reset_state();
     hold_ours = true;

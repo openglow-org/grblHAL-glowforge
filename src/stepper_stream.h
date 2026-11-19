@@ -99,6 +99,13 @@ bool gf_stream_kernel_idle (void);
 // queued fire-on, so fire returns only when the core asserts it again.
 void gf_stream_fire_gate (bool open);
 
+// The FIRE ticks the shipper has written since the process started, mod
+// 2^32: physical output commanded, the gate and the dose model applied.
+// Returns true when every byte the producer has made has shipped (no
+// motion in progress, nothing left in the ring), so the count is final
+// for the motion so far. Any thread; takes the stream lock.
+bool gf_stream_lit_ticks (uint32_t *lit);
+
 // Serialized cnc/laser_latch write (lock = 1 locks the latch). Every
 // latch write in the process goes through here: the writer records which
 // way this process last wrote the latch, and the shipper's run-start

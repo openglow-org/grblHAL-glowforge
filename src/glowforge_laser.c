@@ -31,11 +31,14 @@
        device), a soft reset aborts, the lid or the interlock loop
        opens (the job is canceled: relock, alarm), or the timeout
        expires. A press with the lid open does not arm - the hardware
-       button latch would not clear on it either.
+       button latch would not clear on it either - and neither does a
+       press while a prompt on the control panel has the machine's
+       button, or one that left the button latch set.
 
   The armed window is JOB-based: it persists across the job (S changes
   and M5/M3 toggles do not re-prompt) and closes - relocking the
-  latch - at program end (M2/M30), whenever the sender's connection
+  latch - at program end (M2/M30), at an M5 when nothing has fired
+  since the press (a test fire, an S0 frame), whenever the sender's connection
   changes (the consent belonged to the displaced session), after
   laser_disarm_s of grace (counting down with the spindle off in Idle,
   in a jog, and in a job parked in Hold or Door, and with M3/M4 still
@@ -61,7 +64,9 @@
   physical press clears, so a lock is a new press by construction and
   belongs to the fail tier alone. The coolant fire gate is re-checked
   after the button wait, so a window can never open against a verdict
-  that went bad during the wait. While unarmed or gated, fire requests
+  that went bad during the wait; the engine's acknowledgment gates that
+  opening, and inside the open window the per-tick and per-segment
+  gates read the verdict alone. While unarmed or gated, fire requests
   are suppressed at the stream: the stream engine masks the FIRE bit on
   every tick with the gate this module publishes (the window, and the
   verdict past the pause's deceleration), so no fire in flight survives
@@ -263,6 +268,9 @@ static double rearm_ack_budget;
 static bool fail_alarm_pending;     /* a reset this module asked for from a standstill still owes its alarm */
 static bool modal_drop;             /* a window closed: the parser's M3/M4 is owed its M5 */
 static bool dark_watch;             /* the M3/M4 was dropped under a job that may only have stalled */
+static uint32_t lit_at_open;        /* the stream's FIRE ticks shipped when the window opened */
+static bool unlit_check;            /* an M5 asks whether the window fired since it opened */
+static on_spindle_programmed_ptr on_spindle_programmed;
 
 /* How long an unreadable kernel state may defer the relock at a job's
  * end (the tail the relock waits for is one queue depth, 200 ms). */
@@ -432,10 +440,18 @@ static void lamp_follow (lamp_t lamp)
         button_lamp(lamp);
 }
 
-/* The refusal's words for a closed cooling gate: an ACK names the panel. */
+/* The refusal's words for a closed cooling gate. A reservation of the
+ * machine's button is named as that, whoever holds it (a prompt on the
+ * control panel, a package's check, a package's ask for a press: the
+ * engine's own reason, relayed beside it, says which); an ACK names the
+ * panel. */
+static const char BUTTON_WORDS[] =
+    "laser fire blocked: the machine's button is reserved for a prompt";
+
 static const char *cooling_refusal (void)
 {
-    return gfcool_ack_waits()
+    return gfcool_button_reserved() ? BUTTON_WORDS
+        : gfcool_ack_waits()
         ? "laser fire blocked: a fault waits for its Acknowledge on the control panel"
         : "laser fire blocked: a cooling gate is closed";
 }
@@ -460,6 +476,45 @@ static int arm_switches (void)
         return Arm_InterlockOpen;
 
     return gfsw_bit_set(sw, SW_BIT_BUTTON) ? Arm_Pressed : Arm_Waiting;
+}
+
+/* A press taken in a wait is consent only when it armed the laser. A
+ * reservation of the machine's button makes it no job's: a prompt asked
+ * for it. And on the machine the press must have
+ * cleared the button latch (cnc/button_latch reads 0): with the latch
+ * locked when it landed - the cooling engine's hold, taken between this
+ * wait's unlock and the press - the press does nothing at the laser, and
+ * a window opened on it would run dark on a verdict read before the lock.
+ * An unreadable latch arms nothing either. NULL when the press arms,
+ * else the refusal's words. */
+static const char *press_refusal (void)
+{
+    char v[8] = "";
+
+    if(gfcool_button_reserved())
+        return BUTTON_WORDS;
+    if(!hw_active)
+        return NULL;
+    if(gfio_rd_attr("cnc/button_latch", v, sizeof(v)) != 0)
+        return "laser fire blocked: the button latch cannot be read";
+    if(strcmp(v, "0"))
+        return "laser fire blocked: the press did not arm the laser (the laser latch was locked)";
+    return NULL;
+}
+
+/* The first arm refused on a press that is no consent: the latch relocked,
+ * the engine told disarmed, the words, an alarm and the reset. False. */
+static void arm_refused (void);
+static bool latch_lock (bool lock);
+
+static bool arm_refuse (const char *no)
+{
+    latch_lock(true);
+    gfcool_laser_armed(false);
+    report_message((char *)no, Message_Warning);
+    fflog(LOG_WARNING, "gflaser: arm refused - %s", no);
+    arm_refused();
+    return false;
 }
 
 /* Pump the protocol while blocked in the button wait (same pattern as
@@ -505,6 +560,7 @@ void gflaser_disarm (void)
     bool unlocked = !gf_stream_latch_locked_by_us();
 
     dark_watch = false;                 /* a reset, a fault, a cancel, a home: no stalled job is left */
+    unlit_check = false;                /* a closed window has nothing left to ask */
     laser_ok = false;
     gf_stream_laser_arm(false);
     gf_stream_fire_gate(false);
@@ -862,6 +918,10 @@ static bool arm_complete (unsigned sender_gen)
     double budget = ack_budget_s();
     double ack_deadline = wall_s() + budget;
     while(!gfcool_run_ack()) {
+        /* A prompt that reserved the button while this wait ran: the
+         * press was made for it, or will be. */
+        if(gfcool_button_reserved())
+            return arm_refuse(BUTTON_WORDS);
         if(!pump(50000)) {
             latch_lock(true);
             gfcool_laser_armed(false);
@@ -884,6 +944,14 @@ static bool arm_complete (unsigned sender_gen)
         arm_refused();
         return false;
     }
+
+    /* The press is asked again where the window opens: a lid opened and
+     * closed, or a latch hold taken and released, during the wait set the
+     * button latch after the press, and a window opened over it would run
+     * dark to its end. */
+    const char *no = press_refusal();
+    if(no)
+        return arm_refuse(no);
 
     return arm_open(sender_gen);
 }
@@ -924,6 +992,8 @@ static bool arm_open (unsigned sender_gen)
     disarm_request = false;
     modal_drop = false;
     dark_watch = false;
+    unlit_check = false;
+    (void)gf_stream_lit_ticks(&lit_at_open);    /* what this window fires counts from here */
     laser_ok = true;
     disarm_at = 0.0;
     armed_client_gen = sender_gen;
@@ -1066,6 +1136,10 @@ static bool gflaser_arm (void)
             gfcool_laser_armed(false);
             return false;
         }
+
+        const char *no = press_refusal();
+        if(no)
+            return arm_refuse(no);
     }
 
     return arm_complete(sender_gen);
@@ -1094,10 +1168,13 @@ static const char ACK_HOLD_WORDS[] =
     "laser fire blocked: a fault waits for its Acknowledge on the control panel - the job stays held";
 static const char GATE_HOLD_WORDS[] =
     "laser fire blocked: a cooling gate is closed - the job stays held";
+static const char BUTTON_HOLD_WORDS[] =
+    "laser fire blocked: the machine's button is reserved for a prompt - the job stays held";
 
 static const char *hold_refusal (void)
 {
-    return gfcool_ack_waits() ? ACK_HOLD_WORDS : GATE_HOLD_WORDS;
+    return gfcool_button_reserved() ? BUTTON_HOLD_WORDS
+         : gfcool_ack_waits() ? ACK_HOLD_WORDS : GATE_HOLD_WORDS;
 }
 
 static void rearm_end (bool armed)
@@ -1143,6 +1220,19 @@ static void rearm_complete (void)
         return;
     }
 
+    /* The press asked again where the window opens, as at the first arm:
+     * a button latch set during the wait ends the re-arm, the job held. */
+    {
+        const char *no = press_refusal();
+        if(no) {
+            char msg[112];
+            rearm_end(false);
+            snprintf(msg, sizeof(msg), "%s - the job stays held", no);
+            report_message(msg, Message_Warning);
+            return;
+        }
+    }
+
     rearm_end(arm_open(rearm_client_gen));
     if(laser_ok)
         protocol_enqueue_realtime_command(CMD_CYCLE_START);
@@ -1156,6 +1246,12 @@ bool gflaser_resume_gate (void)
         return false;
     if(rearm_pending)
         return true;                    /* the wait already running takes it */
+    /* A held job whose window is open resumes with no new press, so a press
+     * made for a prompt on the control panel must not resume it. */
+    if(laser_ok && gfcool_button_reserved()) {
+        report_message((char *)BUTTON_HOLD_WORDS, Message_Warning);
+        return true;                    /* refused, the job held */
+    }
     if(laser_ok || !gc_state.modal.spindle[0].state.on)
         return false;                   /* window open, or nothing to fire */
 
@@ -1235,6 +1331,16 @@ static void rearm_poll (void)
             if(rearm_pressed || !rearm_released)
                 break;                  /* taken already, or still the press that started the re-arm */
             gfsw_button_consumed();     /* not a pause toggle */
+            {
+                const char *no = press_refusal();
+                if(no) {
+                    char msg[112];
+                    rearm_end(false);
+                    snprintf(msg, sizeof(msg), "%s - the job stays held", no);
+                    report_message(msg, Message_Warning);
+                    return;
+                }
+            }
             rearm_press_taken();
             break;
         case Arm_LidOpen:
@@ -1348,6 +1454,77 @@ static bool window_close_pending (void)
     return ok;
 }
 
+/* A window that fired nothing since it opened is closed by the M5 that
+ * ends what it ran: a test fire (an M3 with a dwell and no motion), a
+ * frame at S0. Its press served nothing lit, and the next job asks for its
+ * own. A window that fired keeps its grace: lit jobs inside it share one
+ * press. The answer is the stream's count of FIRE ticks shipped
+ * since the opening, read once everything the motion before the M5
+ * produced has shipped (and, on the machine, the kernel is idle): 0 lit,
+ * the window closes; any lit, the check ends and the window stands; -1,
+ * not settled yet. */
+static int unlit_state (void)
+{
+    uint32_t lit;
+    bool drained = gf_stream_lit_ticks(&lit);
+
+    if(lit != lit_at_open)
+        return 0;
+    return drained && relock_ready() ? 1 : -1;
+}
+
+static void unlit_close (void)
+{
+    unlit_check = false;
+    report_message("the laser fired nothing since its press: the M5 closes the window, "
+                   "and the next job asks for the button", Message_Info);
+    gflaser_disarm();
+}
+
+/* A laser-on while the M5's question is open answers it first, the tail
+ * waited for as window_close_pending waits (bounded; at once in a held
+ * state, where the wait cannot run): an unlit window is closed before the
+ * laser-on meets it, so it asks for its own press. Unsettled at the bound
+ * is taken as unlit. Returns false when the system is aborting. */
+static bool unlit_finish (void)
+{
+    bool ok = true;
+
+    if(!(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR))) {
+        double deadline = wall_s() + RELOCK_WAIT_S;
+        while(ok && laser_ok && unlit_check && unlit_state() < 0 && wall_s() < deadline)
+            ok = pump(10000);
+    }
+    if(laser_ok && unlit_check) {
+        if(unlit_state() == 0)
+            unlit_check = false;
+        else
+            unlit_close();
+    }
+
+    return ok;
+}
+
+/* The M5 asks its question: the core calls this for a programmed spindle
+ * change after the planner has drained, before the spindle is told. Only
+ * the parser's change from on to off, which runs in Idle or a cycle, is an
+ * M5. An S word with the spindle off comes here too, and so do a held
+ * state's own changes: the laser turned off at every feed hold (the
+ * driver holds with the laser off) and turned back on at its resume,
+ * with the parser's M3 or M4 still modal. A hold is no M5, and the job it
+ * holds keeps its window. The door term is a guard: the core turns the
+ * spindle off at a safety door without coming here. */
+static void onSpindleProgrammed (spindle_ptrs_t *spindle, spindle_state_t state, float rpm,
+                                 spindle_rpm_mode_t mode)
+{
+    if(!state.on && gc_state.modal.spindle[0].state.on && laser_ok && !disarm_request &&
+       !(state_get() & (STATE_HOLD | STATE_SAFETY_DOOR)))
+        unlit_check = true;
+
+    if(on_spindle_programmed)
+        on_spindle_programmed(spindle, state, rpm, mode);
+}
+
 static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
     /* An M3 or M4 is a job speaking for itself: it gets the arm below,
@@ -1357,6 +1534,10 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
 
     /* A window whose close is pending is a closed window. */
     if(state.on && laser_ok && disarm_request && !window_close_pending())
+        state.on = Off;                 /* aborting: stay dark */
+
+    /* So is a window an M5 found unlit. */
+    if(state.on && laser_ok && unlit_check && !unlit_finish())
         state.on = Off;                 /* aborting: stay dark */
 
     /* The arm question is "is the window open", never "was the spindle
@@ -1447,7 +1628,10 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
         fire = false;
         pwm = spindle_pwm.off_value;
         suppressed = Suppress_Unarmed;
-    } else if(fire && !gfcool_fire_ok()) {
+    } else if(fire && !gfcool_verdict_fire_ok()) {
+        /* The verdict alone, as the per-tick gate: the acknowledgment
+         * gated the window's opening, and inside the window it gates
+         * nothing (glowforge_cooling.h). */
         fire = false;
         pwm = spindle_pwm.off_value;
         suppressed = Suppress_Coolant;
@@ -1606,6 +1790,18 @@ static void window_poll (void)
     if(disarm_request) {
         if(relock_ready()) {
             gflaser_disarm();
+            return;
+        }
+    }
+
+    /* An M5's question (unlit_state): a window that fired nothing closes,
+     * one that fired keeps its grace. */
+    if(unlit_check && !disarm_request) {
+        int u = unlit_state();
+        if(u == 0)
+            unlit_check = false;
+        else if(u > 0) {
+            unlit_close();
             return;
         }
     }
@@ -1856,6 +2052,8 @@ void gflaser_init (void)
     grbl.on_state_change = onStateChange;
     on_homing_completed = grbl.on_homing_completed;
     grbl.on_homing_completed = onHomingCompleted;
+    on_spindle_programmed = grbl.on_spindle_programmed;
+    grbl.on_spindle_programmed = onSpindleProgrammed;
     user_mcode = grbl.user_mcode;
     grbl.user_mcode.check = mcodeCheck;
     grbl.user_mcode.validate = mcodeValidate;

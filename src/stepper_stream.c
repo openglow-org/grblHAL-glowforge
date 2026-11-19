@@ -474,6 +474,19 @@ void gf_stream_fire_gate (bool open)
     fire_gate = open;
 }
 
+/* FIRE ticks shipped, mod 2^32 (gf_stream_lit_ticks). Written by the
+ * shipper under gf.lock. */
+static uint32_t lit_shipped;
+
+bool gf_stream_lit_ticks (uint32_t *lit)
+{
+    pthread_mutex_lock(&gf.lock);
+    *lit = lit_shipped;
+    bool drained = !gf.streaming && gf.shipped >= gf.produced;
+    pthread_mutex_unlock(&gf.lock);
+    return drained;
+}
+
 /* Logging from the SCHED_FIFO shipper, or from under gf.lock: a raw
  * write(2) to stderr instead of stdio, so a real-time thread never
  * queues on the stdio FILE lock behind a normal-priority thread that is
@@ -1670,8 +1683,10 @@ static void ship_pass (void)
              * gate (armed window and cooling verdict) withholds it as
              * permission, the density model withholds ticks of it as
              * dose. Emission stays exactly where the core commanded it. */
-            if(gf.cur_fire && gate && (!gf.dith_period || dither_tick()))
+            if(gf.cur_fire && gate && (!gf.dith_period || dither_tick())) {
                 b |= 0x10;
+                lit_shipped++;
+            }
             gf.last_lit = (b & 0x10) != 0;
             tick_steps(chunk_steps, b);
             chunk[n++] = b;

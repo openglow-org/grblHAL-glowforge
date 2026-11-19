@@ -30,17 +30,21 @@ coolant_state_t gfcool_coolant_get (void);
 // hold / resume / fallback enforcement.
 void gfcool_poll (void);
 
-// Laser fire gate: false while the engine's verdict says so - coolant
-// over the run ceiling, for one - and whenever the verdict is
-// missing or stale (the engine being gone must look like a fault).
-// Read from the stepper producer thread as well - cached flag reads,
-// no file IO on that path.
+// The gate of the window's opening: the verdict's own fire_ok while it
+// is fresh and, once the window is reported to the engine, the engine's
+// acknowledgment of it. The arm and the re-arm open the window on it
+// (after the wait for the acknowledgment, gfcool_run_ack): the
+// acknowledgment is the precondition of a window's first fire, never a
+// gate inside the open window.
 bool gfcool_fire_ok (void);
 
-// The verdict's own fire_ok while it is fresh: the input of the per-tick
-// fire gate. Unlike gfcool_fire_ok() it does not wait on the engine's
-// acknowledgment of the armed window, which is an arm-time
-// precondition and not a mid-job gate.
+// The verdict's own fire_ok while it is fresh: false while the engine's
+// verdict says so - coolant over the run ceiling, for one - and whenever
+// the verdict is missing or stale (the engine being gone must look like
+// a fault). The gate inside an open window: the per-tick fire gate and
+// the per-segment laser update both read it, and the acknowledgment
+// does not enter it. Read from the stepper producer thread as well -
+// cached flag reads, no file IO on that path.
 bool gfcool_verdict_fire_ok (void);
 
 // True while the pause tier's first hold is still decelerating: the
@@ -65,13 +69,21 @@ bool gfcool_run_ack (void);
 // of resuming it.
 bool gfcool_ack_waits (void);
 
+// A prompt on the control panel has the machine's button: a fresh verdict
+// whose button_reserved field is true (a hold-gated action's dialog, a
+// package's check, a package's ask for a press). fire_ok is false meanwhile
+// and is the gate;
+// this makes a press seen in the arm's wait no consent, and picks the
+// refusal's words. Protocol thread only.
+bool gfcool_button_reserved (void);
+
 // Armed-window hook from glowforge_laser.c: reported to the engine,
 // which forces the run fan profile while armed,
 // whatever the sender's M8/M9 state.
 void gfcool_laser_armed (bool armed);
 
 // A fresh verdict that blocks firing short of the fail tier: a pause by
-// name (OVERTEMP, COLD, WARMUP, SENSOR, FLAME, BUMP, EXT), or a fault
+// name (OVERTEMP, COLD, WARMUP, SENSOR, FANS, FLAME, BUMP, EXT, QUIET, BUTTON), or a fault
 // that waits for its Acknowledge. It is the pause tier as a job with its
 // window closed meets it: the resume of a held job is refused under it
 // and the job stays held, where the fail tier (FIRE, CRASH, AIRFLOW,
