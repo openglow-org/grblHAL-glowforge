@@ -192,34 +192,34 @@ unsigned long fflog_dropped(void)
     return __atomic_load_n(&dropped, __ATOMIC_RELAXED);
 }
 
-/* One datagram, never blocking. Returns 0 if queued, -1 if dropped. */
+/* One datagram, never blocking. Returns 0 if queued, -1 if dropped. The
+ * send runs under the lock a reconnect closes the socket under, so the
+ * number it sends on is never one another thread has just been handed (a
+ * client connection, the controller port's socket). The send never waits,
+ * so the lock is held for a system call's length. */
 static int send_raw(const char *pkt, size_t len)
 {
+    int rc = -1;
+    pthread_mutex_lock(&mu);
     for (int attempt = 0; attempt < 2; attempt++) {
-        int s = sock;
-        if (s < 0) {
-            pthread_mutex_lock(&mu);
+        if (sock < 0)
             connect_locked();
-            s = sock;
-            pthread_mutex_unlock(&mu);
-            if (s < 0)
-                return -1;
+        if (sock < 0)
+            break;
+        if (send(sock, pkt, len, MSG_NOSIGNAL | MSG_DONTWAIT) == (ssize_t)len) {
+            rc = 0;
+            break;
         }
-        if (send(s, pkt, len, MSG_NOSIGNAL | MSG_DONTWAIT) == (ssize_t)len)
-            return 0;
         int err = errno;
         if (err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS ||
             err == EMSGSIZE || err == EINTR)
-            return -1;            /* full: drop, never wait */
+            break;                /* full: drop, never wait */
         /* Peer gone (log daemon restarted): reconnect once and retry. */
-        pthread_mutex_lock(&mu);
-        if (sock == s) {
-            last_connect_try = -1e9;
-            connect_locked();
-        }
-        pthread_mutex_unlock(&mu);
+        last_connect_try = -1e9;
+        connect_locked();
     }
-    return -1;
+    pthread_mutex_unlock(&mu);
+    return rc;
 }
 
 static size_t header(char *buf, size_t cap, int prio, const char *id)
