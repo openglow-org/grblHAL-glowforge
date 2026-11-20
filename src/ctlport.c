@@ -2,7 +2,7 @@
   ctlport.c - the controller port: a local, non-displacing second channel
 
   Part of grblHAL-glowforge. The Grbl socket is one session, and a new
-  connection displaces the sender. The port is how the machine daemon jogs
+  connection takes it from an idle sender only. The port is how the machine daemon jogs
   and reads state while a sender stays connected: a Unix stream socket,
   mode 0600, one client, served from the protocol thread's poll set. It
   adds no thread and no lock.

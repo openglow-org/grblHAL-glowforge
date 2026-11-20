@@ -1,8 +1,8 @@
 /*
   glowforge_status.c - publish the controller's state for the machine daemon
 
-  Part of grblHAL-glowforge. forgectrl can never open the Grbl socket (a
-  new connection displaces the sender - last connection wins), so the
+  Part of grblHAL-glowforge. forgectrl cannot read the Grbl socket beside
+  a sender (the session is one sender's at a time), so the
   panel cannot see what a sender sees. This module publishes it the
   other way, mirroring the cooling verdict file forgectrl already
   publishes for this controller: two files under one tmpfs directory,

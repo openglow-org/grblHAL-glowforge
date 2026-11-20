@@ -33,11 +33,14 @@
 #include "ctlport.h"
 #include "driver.h"
 #include "glowforge_laser.h"
+#include "glowforge_mcode.h"
 #include "platform.h"
 
 #include "grbl/hal.h"
 #include "grbl/protocol.h"
 #include "grbl/gcode.h"
+#include "grbl/planner.h"
+#include "grbl/state_machine.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -504,6 +507,48 @@ static bool peer_loopback (const struct sockaddr_storage *sa)
 /* What a sender that is turned away or dropped reads before the socket
  * closes: a message line, which senders show in their consoles. */
 #define KEEP_OUT_MSG "[MSG:The machine is in use: senders are kept out for now]\r\n"
+#define BUSY_MSG     "[MSG:The machine is busy with another sender's job: connect again once it is idle]\r\n"
+#define DISPLACED_MSG "[MSG:Another sender connected: this session is closed]\r\n"
+
+/* A second sender may take the session only from one that is idle: the
+ * core Idle (or in an alarm or E-stop) with nothing planned, no line of
+ * the sender's running or waiting, no job waiting at an M-code and no arm
+ * waiting for the press. Anything else is a job under way, and the newcomer is
+ * refused: it would hold, disarm or reset a job that is not its own. */
+static bool session_busy (void)
+{
+    sys_state_t state = state_get();
+
+    return !(state == STATE_IDLE || state == STATE_ALARM || state == STATE_ESTOP) ||
+           plan_get_current_block() != NULL || sender_line_open || serial_sender_pending() ||
+           gfmcode_waiting() || gflaser_arming();
+}
+
+/* The connected sender has hung up, its last bytes perhaps unread: a
+ * close and reconnect is not a second sender. */
+static bool client_hung_up (void)
+{
+    struct pollfd p = { .fd = client_fd, .events = POLLRDHUP };
+
+    return poll(&p, 1, 0) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR));
+}
+
+/* A dead link with no FIN is noticed in seconds, not never. A quiet link:
+ * probes after 5 s of silence, 2 s apart, three unanswered (5 + 3 x 2 =
+ * 11 s). A link with the controller's answers outstanding (no probe goes
+ * out then): those bytes unacknowledged for 11 s. */
+#define KEEPALIVE_USER_TIMEOUT_MS 11000
+
+static void keepalive (int fd)
+{
+    int on = 1, idle = 5, intvl = 2, cnt = 3, user_ms = KEEPALIVE_USER_TIMEOUT_MS;
+
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_ms, sizeof(user_ms));
+}
 
 void serial_keep_out (bool on)
 {
@@ -560,9 +605,11 @@ static void rx_poll (void)
 {
     if(listen_fd >= 0) {
 
-        // Always accept: a new connection displaces any current session
-        // (last connection wins - single-operator machine, and a client
-        // that died without FIN would otherwise hold the port forever).
+        // A new connection takes the session when there is none, or when
+        // the one there is idle (session_busy()): the displaced sender
+        // reads why before its socket closes. While a job is under way the
+        // newcomer is refused instead, and reads why. A sender that died
+        // without a FIN is found by the keepalive (keepalive()).
         struct sockaddr_storage sa;
         socklen_t sl = sizeof(sa);
         int fd = accept4(listen_fd, (struct sockaddr *)&sa, &sl, SOCK_CLOEXEC);
@@ -575,8 +622,21 @@ static void rx_poll (void)
             close(fd);
             fd = -1;
         }
+        if(fd >= 0 && client_fd >= 0 && client_hung_up())
+            drop_client();                  // a close and reconnect: the old one is gone
+        if(fd >= 0 && client_fd >= 0 && session_busy()) {
+            (void)!write(fd, BUSY_MSG, sizeof(BUSY_MSG) - 1);
+            close(fd);
+            fd = -1;
+        }
         if(fd >= 0) {
+            if(client_fd >= 0)
+                (void)!write(client_fd, DISPLACED_MSG, sizeof(DISPLACED_MSG) - 1);
             drop_client();
+            /* What was still queued for the sender before is not the
+             * newcomer's: its first line is its welcome. */
+            txbuffer.tail = txbuffer.head;
+            keepalive(fd);
             client_loopback = peer_loopback(&sa);
             client_peer[0] = '\0';
             if(sa.ss_family == AF_INET)

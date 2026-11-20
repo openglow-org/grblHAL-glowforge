@@ -28,6 +28,17 @@
   sender that pauses under a second keeps its connection, and one that
   pauses longer is dropped with the ring flushed.
 
+  A second sender: the link of each is kept alive (probes after 5 s of
+  silence, 2 s apart, three unanswered, and 11 s for answers outstanding
+  to a dead link); a second connection takes the session from an idle
+  sender, an alarmed one included, which reads why before its socket
+  closes, and the newcomer's first line is its welcome, never what was
+  still queued for the sender before; while the first is at work (the
+  core running or holding, a block planned, a line of its own running or
+  waiting in the ring, a job at an M-code, the arm waiting for the press)
+  the newcomer is refused with a message line and the session stands;
+  and a sender that closed and reconnects at once is no second sender.
+
   Keeping senders out: a peer on this host is told from one on the
   network by its address, the dual-stack socket's mapped IPv4 included;
   while senders are kept out, one from the network is turned away with a
@@ -114,6 +125,16 @@ bool stream_rx_suspend(stream_rx_buffer_t *rx, bool suspend)
 { (void)rx; (void)suspend; return false; }
 bool stream_connected(void) { return true; }
 parser_state_t gc_state;        /* welcome() clears its last_error on a connect */
+
+/* What a second connection is judged by: the core's state, the planner,
+   a job's M-code wait and the arm's wait for the press. */
+static sys_state_t stub_state = STATE_IDLE;
+static plan_block_t stub_block, *stub_planned;
+static bool stub_mcode, stub_arming;
+sys_state_t state_get(void) { return stub_state; }
+plan_block_t *plan_get_current_block(void) { return stub_planned; }
+bool gfmcode_waiting(void) { return stub_mcode; }
+bool gflaser_arming(void) { return stub_arming; }
 
 /* The core's banner, as the report module writes it through the stream. */
 #define BANNER "\r\nGrblHAL test ['$' for help]\r\n"
@@ -507,6 +528,7 @@ int main(void)
 
     /* --- the banner on a connect --------------------------------------- */
     printf("The welcome banner on a connect:\n");
+    serialRxFlush();                                /* no sender bytes left from the cases above */
     grbl.report.init_message = fake_banner;
     hal.stream_blocking_callback = blocking_cb;
     uint16_t port = 0;
@@ -518,6 +540,22 @@ int main(void)
     CHECK(sender >= 0, "a sender connects");
     serial_poll();                                  /* accept, welcome, drain */
     (void)received(sender, 500);                    /* its banner */
+    {
+        int ka = 0, idle = 0, intvl = 0, cnt = 0, user = 0;
+        socklen_t kl = sizeof(ka);
+        getsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &ka, &kl);
+        kl = sizeof(idle);
+        getsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &kl);
+        kl = sizeof(intvl);
+        getsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, &kl);
+        kl = sizeof(cnt);
+        getsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, &kl);
+        kl = sizeof(user);
+        getsockopt(client_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user, &kl);
+        CHECK(ka == 1 && idle == 5 && intvl == 2 && cnt == 3,
+              "a sender's link is kept alive: probes after 5 s of silence, 2 s apart, three unanswered");
+        CHECK(user == 11000, "and answers outstanding to a dead link end it after 11 s");
+    }
 
     /* A second connect displaces the first and is welcomed in turn - but
        not from a poll that runs inside a blocked write. */
@@ -530,8 +568,73 @@ int main(void)
     serial_poll();
     CHECK(banners == 2 && strcmp(received(sender2, 500), BANNER) == 0,
           "the next top-level poll writes the banner to the new sender");
-    CHECK(received(sender, 100)[0] == '\0', "the displaced sender gets nothing");
+    CHECK(strstr(received(sender, 100), "[MSG:") != NULL, "the displaced sender reads why");
     close(sender);
+
+    /* A sender at work keeps its session: while the core runs, holds, or
+       has a block planned, while a line of the sender's runs or waits in
+       the ring, and while a job waits at an M-code or the arm waits for
+       the press, a second connection is refused and reads why. */
+    printf("A second sender while the first is at work:\n");
+    struct { const char *what; sys_state_t state; bool planned, line, pending, mcode, arming; } busy[] = {
+        { "a program runs", STATE_CYCLE, false, false, false, false, false },
+        { "a job is held", STATE_HOLD, false, false, false, false, false },
+        { "a block is planned", STATE_IDLE, true, false, false, false, false },
+        { "a line of the sender's runs (a dwell)", STATE_IDLE, false, true, false, false, false },
+        { "a line of the sender's waits in the ring", STATE_IDLE, false, false, true, false, false },
+        { "a job waits at an M-code", STATE_IDLE, false, false, false, true, false },
+        { "the arm waits for the press", STATE_IDLE, false, false, false, false, true },
+    };
+    for(size_t i = 0; i < sizeof(busy) / sizeof(busy[0]); i++) {
+        serialRxFlush();                            /* the last row's ring bytes go first */
+        stub_state = busy[i].state;
+        stub_planned = busy[i].planned ? &stub_block : NULL;
+        sender_line_open = busy[i].line;
+        stub_mcode = busy[i].mcode;
+        stub_arming = busy[i].arming;
+        if(busy[i].pending)
+            push("G1 X5 F600\n");
+        unsigned gen = serial_client_generation();
+        int late = connect_loopback(port);
+        serial_poll();
+        printf("  %s:\n", busy[i].what);
+        CHECK(client_fd >= 0 && serial_client_generation() == gen && strstr(received(late, 500), "[MSG:") != NULL,
+              "the newcomer is refused and reads why, the session stands");
+        char c;
+        CHECK(read(late, &c, 1) == 0, "the newcomer's socket is closed");
+        CHECK(received(sender2, 100)[0] == '\0', "the sender at work reads nothing of it");
+        close(late);
+    }
+    serialRxFlush();
+    stub_state = STATE_IDLE;
+    stub_planned = NULL;
+    sender_line_open = stub_mcode = stub_arming = false;
+    /* An alarmed sender with nothing under way is idle: a newcomer takes
+       the session, and its first line is its welcome, not what was still
+       queued for the sender before it. */
+    stub_state = STATE_ALARM;
+    {
+        unsigned gen = serial_client_generation();
+        serialWriteS("ok\r\n<Alarm|MPos:0.000,0.000,0.000>\r\n");
+        int s4 = connect_loopback(port);
+        serial_poll();
+        CHECK(serial_client_generation() == gen + 2 && strcmp(received(s4, 500), BANNER) == 0,
+              "an alarmed sender is displaced, and the newcomer reads its welcome first");
+        CHECK(strstr(received(sender2, 100), "[MSG:") != NULL, "the alarmed sender reads why");
+        close(sender2);
+        sender2 = s4;
+    }
+    stub_state = STATE_IDLE;
+    /* Held, but gone: a sender that closed is no session to keep, and what
+       was still queued for it is not the newcomer's. */
+    stub_state = STATE_HOLD;
+    serialWriteS("ok\r\n");
+    close(sender2);
+    sender2 = connect_loopback(port);
+    serial_poll();
+    CHECK(client_fd >= 0 && strcmp(received(sender2, 500), BANNER) == 0,
+          "a sender that closed and reconnects at once takes the session back from its own hang-up");
+    stub_state = STATE_IDLE;
     close(sender2);
     drop_client();
 
