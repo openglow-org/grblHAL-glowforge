@@ -982,6 +982,27 @@ int main(void)
     gflaser_poll();
     CHECK(!laser_ok && latch_locked_last, "a spindle on in a hold does not keep the window open");
 
+    /* Case W7 - a cycle keeps the window open only while the cooling
+       verdict allows fire. A job resumed inside the verdict's hold (a ~,
+       the button) is in its cycle, dark, until the cooling client holds
+       it again: that cycle does not start the grace over, and a grace
+       that has run out under the verdict closes the window. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && laser_ok, "armed for the job the verdict holds");
+    atomic_store(&cur_state_value, on.value);
+    cur_state = STATE_CYCLE;
+    disarm_at = wall_s() + 100.0;               /* a grace that is running */
+    gflaser_poll();
+    CHECK(laser_ok && disarm_at == 0.0, "a cycle under a clean verdict ends the grace");
+    verdict_fire_ok_val = false;
+    disarm_at = wall_s() + 100.0;
+    gflaser_poll();
+    CHECK(laser_ok && disarm_at != 0.0, "a cycle under a verdict that blocks fire does not start the grace over");
+    disarm_at = 1.0;                            /* the grace has run out under the verdict */
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last, "and the grace closes the window under it");
+
     /* Case W6 - the drop waits while an arm waits for its press, the poll
        running inside the arm's pump. No path owes a drop with M3/M4 modal
        at that moment (a close pending at a laser-on follows M2, which
@@ -1987,6 +2008,19 @@ int main(void)
           "a held job with its window open: its resume under a reservation is refused, the job held");
     button_reserved_val = false;
     CHECK(!gflaser_resume_gate(), "with the prompt gone it resumes");
+    /* Nor does a ~ or a press while the cooling verdict blocks fire (a
+       pause tier, or a verdict gone stale): refused in the gate's words,
+       the job held, the window kept; the clear verdict's resume is taken. */
+    cur_state = STATE_HOLD;
+    verdict_fire_ok_val = false;
+    double grace_end = wall_s() + 30.0;
+    disarm_at = grace_end;              /* the grace running from the verdict */
+    CHECK(gflaser_resume_gate() && laser_ok && !rearm_pending &&
+          strstr(last_message, "a cooling gate is closed") && strstr(last_message, "stays held"),
+          "a held job with its window open: its resume under a verdict that blocks fire is refused, the job held");
+    CHECK(disarm_at == grace_end, "and the refusal leaves the running grace alone");
+    verdict_fire_ok_val = true;
+    CHECK(!gflaser_resume_gate(), "with the verdict clear it resumes");
     cur_state = STATE_IDLE;
     gc_state.modal.spindle[0].state.on = Off;
 

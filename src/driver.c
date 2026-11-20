@@ -54,7 +54,9 @@
 #include "fflog.h"
 
 #include "grbl/hal.h"
+#include "grbl/nuts_bolts.h"
 #include "grbl/protocol.h"
+#include "grbl/report.h"
 #include "grbl/state_machine.h"
 #include "grbl/system.h"
 
@@ -330,6 +332,55 @@ static void apply_machine_pins (settings_t *settings)
                   settings->axis[axis].steps_per_mm);
     }
 }
+
+/* A $110-$112 or $120-$122 write past its bound (gfio_motion_setting_refused)
+ * is refused here, before the core stores it, with the core's setting
+ * error and a line that names the bound; one inside it, and a read, are
+ * the core's. A value that reaches the settings another way is held at
+ * the bound by the dispatch above. */
+static status_code_t motion_setting (unsigned id, char *args)
+{
+    uint_fast8_t idx = 0;
+    float value;
+    char msg[64];
+
+    if(args == NULL)
+        return Status_Unhandled;
+    while(*args == ' ')
+        args++;
+    if(!read_float(args, &idx, &value) || !gfio_motion_setting_refused(id, value))
+        return Status_Unhandled;
+
+    if(id < 120)
+        snprintf(msg, sizeof(msg), "$%u takes %.0f mm/min or less", id,
+                 gfio_rate_cap((uint_fast8_t)(id - 110)));
+    else
+        snprintf(msg, sizeof(msg), "$%u takes %.0f mm/s^2 or more", id,
+                 gfio_accel_floor((uint_fast8_t)(id - 120)));
+    report_message(msg, Message_Warning);
+    return Status_SettingValueOutOfRange;
+}
+
+static status_code_t set_110 (sys_state_t state, char *args) { (void)state; return motion_setting(110, args); }
+static status_code_t set_111 (sys_state_t state, char *args) { (void)state; return motion_setting(111, args); }
+static status_code_t set_112 (sys_state_t state, char *args) { (void)state; return motion_setting(112, args); }
+static status_code_t set_120 (sys_state_t state, char *args) { (void)state; return motion_setting(120, args); }
+static status_code_t set_121 (sys_state_t state, char *args) { (void)state; return motion_setting(121, args); }
+static status_code_t set_122 (sys_state_t state, char *args) { (void)state; return motion_setting(122, args); }
+
+static const sys_command_t motion_setting_list[] = {
+    { "110", set_110, { .allow_blocking = On, .allow_redirect = On }, { .str = NULL } },
+    { "111", set_111, { .allow_blocking = On, .allow_redirect = On }, { .str = NULL } },
+    { "112", set_112, { .allow_blocking = On, .allow_redirect = On }, { .str = NULL } },
+    { "120", set_120, { .allow_blocking = On, .allow_redirect = On }, { .str = NULL } },
+    { "121", set_121, { .allow_blocking = On, .allow_redirect = On }, { .str = NULL } },
+    { "122", set_122, { .allow_blocking = On, .allow_redirect = On }, { .str = NULL } }
+};
+
+static sys_commands_t motion_setting_commands = {
+    .n_commands = sizeof(motion_setting_list) / sizeof(sys_command_t),
+    .commands = motion_setting_list
+};
 
 static void onSettingsChanged (settings_t *settings, settings_changed_flags_t changed)
 {
@@ -623,6 +674,7 @@ bool driver_init (void)
     gfhome_init();
     gfrelease_init();
     gfstartup_init();
+    system_register_commands(&motion_setting_commands);
     gflaser_init();
     gfmcode_init();             /* after gflaser_init: M102 stays the laser's */
     gftray_init();              /* M103, and the mode the marker persisted */

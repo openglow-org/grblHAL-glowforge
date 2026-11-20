@@ -167,6 +167,35 @@ static inline float gfio_xy_rate_ceiling (unsigned tick_hz, float steps_per_mm)
     return (float)tick_hz * 60.0f / steps_per_mm;
 }
 
+// The bounds on the motion settings: $110-$112 at most the board's
+// defaults (mm/min), $120-$122 at least half of them (mm/s^2). A stop
+// lasts the speed over the acceleration, and the cooling pause's first
+// hold decelerates lit (glowforge_cooling.c), so they hold the longest
+// stop to the largest of the axes' rate over its floor: Y, 200 mm/s over
+// 295 mm/s^2, 0.68 s.
+static inline float gfio_rate_cap (uint_fast8_t axis)
+{
+    return axis == X_AXIS ? DEFAULT_X_MAX_RATE : axis == Y_AXIS ? DEFAULT_Y_MAX_RATE : DEFAULT_Z_MAX_RATE;
+}
+
+static inline float gfio_accel_floor (uint_fast8_t axis)
+{
+    return 0.5f * (axis == X_AXIS ? DEFAULT_X_ACCELERATION :
+                   axis == Y_AXIS ? DEFAULT_Y_ACCELERATION : DEFAULT_Z_ACCELERATION);
+}
+
+// A typed $<id> past its bound, which the driver refuses before the core
+// stores it: a rate above its cap, an acceleration below its floor, or
+// either not a number. Every other setting is not this check's.
+static inline bool gfio_motion_setting_refused (unsigned id, float value)
+{
+    if(id >= 110 && id <= 112)
+        return !(value <= gfio_rate_cap((uint_fast8_t)(id - 110)));
+    if(id >= 120 && id <= 122)
+        return !(value >= gfio_accel_floor((uint_fast8_t)(id - 120)));
+    return false;
+}
+
 // The machine's pinned $-settings, re-asserted on every settings
 // dispatch, in RAM only (the stored values are never written from here,
 // and a typed one is overwritten on the spot): $100/$101 from the XY
@@ -207,8 +236,13 @@ static inline float gfio_xy_rate_ceiling (unsigned tick_hz, float steps_per_mm)
 // left Z out would drop the Z homed bit that the lens hold rests on
 // (gfhome_apply_z_limit), and the unreferenced lens would move. The
 // dispatch runs before that recomputation, so the pinned masks are what
-// it reads. Returns the axes whose max rate was held down, for the
-// caller to log.
+// it reads. $110-$112 and $120-$122 are held inside their bounds
+// (gfio_rate_cap, gfio_accel_floor): a write past one is refused before
+// it is stored (driver.c), and a value that reached the settings all the
+// same (stored by an earlier firmware, or written by a G65 P1 line) is
+// held at the bound here, at the controller's start and on every write.
+// The core keeps the acceleration in mm/min^2. Returns the axes whose
+// max rate was held down under the tick's ceiling, for the caller to log.
 static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, unsigned tick_hz)
 {
     float spm = gfio_xy_steps_per_mm_of(mode);
@@ -216,6 +250,13 @@ static inline uint8_t gfio_apply_machine_pins (settings_t *s, unsigned mode, uns
     uint8_t held = 0;
     const uint_fast8_t axes[] = { X_AXIS, Y_AXIS };
 
+    for(uint_fast8_t axis = 0; axis < N_AXIS; axis++) {
+        float floor_mm_min2 = gfio_accel_floor(axis) * 3600.0f;
+        if(!(s->axis[axis].max_rate <= gfio_rate_cap(axis)))
+            s->axis[axis].max_rate = gfio_rate_cap(axis);
+        if(!(s->axis[axis].acceleration >= floor_mm_min2))
+            s->axis[axis].acceleration = floor_mm_min2;
+    }
     for(uint_fast8_t i = 0; i < 2; i++) {
         s->axis[axes[i]].steps_per_mm = spm;
         if(s->axis[axes[i]].max_rate > ceiling) {

@@ -14,6 +14,10 @@
     - the feed ceiling the stream carries: one step per tick per axis,
       which is what holds $110/$111 down when the bench lowers the tick
 
+  And the bounds on $110-$112 (at most the board's defaults) and $120-$122
+  (at least half of them): a typed value past one is refused
+  (gfio_motion_setting_refused), and a stored one is held at it.
+
   And the pins the settings dispatch re-asserts (gfio_apply_machine_pins):
   $100/$101 from the mode, $110/$111 under the ceiling, $102 the lens
   screw's constant (a typed 0 or 999 is overwritten), $32 laser mode (a
@@ -81,7 +85,7 @@ static void expect_u (const char *what, unsigned got, unsigned want)
 
 static void expect_f (const char *what, float got, float want, float tol)
 {
-    if (fabsf(got - want) > tol) {
+    if (!(fabsf(got - want) <= tol)) {        /* a NaN fails */
         printf("FAIL %s: %.4f (want %.4f)\n", what, got, want);
         failures++;
     } else {
@@ -285,9 +289,49 @@ int main (void)
     uint8_t held = gfio_apply_machine_pins(&s, 8, 28160);
     expect_f("$100 pinned from the mode", s.axis[X_AXIS].steps_per_mm, 53.333f, 1e-4f);
     expect_f("$101 pinned from the mode", s.axis[Y_AXIS].steps_per_mm, 53.333f, 1e-4f);
-    expect_f("$110 held under the ceiling", s.axis[X_AXIS].max_rate, 31680.0f, 0.5f);
-    expect_f("$111 under the ceiling is left alone", s.axis[Y_AXIS].max_rate, 6000.0f, 1e-3f);
+    expect_f("$110 stored past its cap is held at it", s.axis[X_AXIS].max_rate, 12000.0f, 1e-3f);
+    expect_f("$111 under its cap is left alone", s.axis[Y_AXIS].max_rate, 6000.0f, 1e-3f);
+    expect_u("the cap is no ceiling hold", held, 0);
+    /* The accelerations, stored at 0 (memset): each raised to its floor,
+       half the board's value, in the core's mm/min^2. */
+    expect_f("$120 stored under its floor is raised to 350", s.axis[X_AXIS].acceleration, 350.0f * 3600.0f, 1.0f);
+    expect_f("$121 stored under its floor is raised to 295", s.axis[Y_AXIS].acceleration, 295.0f * 3600.0f, 1.0f);
+    expect_f("$122 stored under its floor is raised to 25", s.axis[Z_AXIS].acceleration, 25.0f * 3600.0f, 1.0f);
+    s.axis[Z_AXIS].max_rate = 301.0f;
+    s.axis[X_AXIS].acceleration = 700.0f * 3600.0f;
+    gfio_apply_machine_pins(&s, 8, 28160);
+    expect_f("$112 stored past its cap is held at 300", s.axis[Z_AXIS].max_rate, 300.0f, 1e-3f);
+    expect_f("$120 above its floor is left alone", s.axis[X_AXIS].acceleration, 700.0f * 3600.0f, 1.0f);
+    /* A stored NaN (a corrupt store) is held at the bound like any value
+       past it. */
+    s.axis[Z_AXIS].max_rate = NAN;
+    s.axis[Z_AXIS].acceleration = NAN;
+    gfio_apply_machine_pins(&s, 8, 28160);
+    expect_f("$112 stored as NaN is held at 300", s.axis[Z_AXIS].max_rate, 300.0f, 1e-3f);
+    expect_f("$122 stored as NaN is raised to 25", s.axis[Z_AXIS].acceleration, 25.0f * 3600.0f, 1.0f);
+    /* The tick's ceiling under the cap (the bench's lowered tick): held,
+       and reported. */
+    held = gfio_apply_machine_pins(&s, 8, 7040);
+    expect_f("$110 held under a lowered tick's ceiling", s.axis[X_AXIS].max_rate, 7920.0f, 0.5f);
+    expect_f("$111 under it is left alone", s.axis[Y_AXIS].max_rate, 6000.0f, 1e-3f);
     expect_u("the held axes are reported", held, 1u << X_AXIS);
+
+    /* A typed $110-$112 or $120-$122 past its bound is refused before it
+       is stored; at the bound it is taken. */
+    expect_u("$120=349.9 refused", gfio_motion_setting_refused(120, 349.9f), 1);
+    expect_u("$120=350 taken", gfio_motion_setting_refused(120, 350.0f), 0);
+    expect_u("$121=294.9 refused", gfio_motion_setting_refused(121, 294.9f), 1);
+    expect_u("$121=295 taken", gfio_motion_setting_refused(121, 295.0f), 0);
+    expect_u("$122=24.9 refused", gfio_motion_setting_refused(122, 24.9f), 1);
+    expect_u("$122=25 taken", gfio_motion_setting_refused(122, 25.0f), 0);
+    expect_u("$110=12000.1 refused", gfio_motion_setting_refused(110, 12000.1f), 1);
+    expect_u("$110=12000 taken", gfio_motion_setting_refused(110, 12000.0f), 0);
+    expect_u("$111=12000.1 refused", gfio_motion_setting_refused(111, 12000.1f), 1);
+    expect_u("$111=12000 taken", gfio_motion_setting_refused(111, 12000.0f), 0);
+    expect_u("$112=300.1 refused", gfio_motion_setting_refused(112, 300.1f), 1);
+    expect_u("$112=300 taken", gfio_motion_setting_refused(112, 300.0f), 0);
+    expect_u("$120=nan refused", gfio_motion_setting_refused(120, NAN), 1);
+    expect_u("$130 is not this check's", gfio_motion_setting_refused(130, 0.0f), 0);
     expect_f("$102 typed to 0 is re-asserted", s.axis[Z_AXIS].steps_per_mm, DEFAULT_Z_STEPS_PER_MM, 1e-5f);
     expect_u("$32 typed to 0 is re-asserted", (unsigned)s.mode, (unsigned)Mode_Laser);
     /* $63 at 3, the laser off in a hold and restored on resume: a typed

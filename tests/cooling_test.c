@@ -23,7 +23,12 @@
   - the freshness deadline never wraps: one 2^31 ms in the past is stale,
     and before the first verdict nothing is fresh at any uptime, one in
     [2^31, 2^32) ms included (the client's clock is moved on there);
-  - a clean verdict with resume_ok resumes the hold the client took;
+  - a clean verdict with resume_ok resumes the hold the client took, once
+    the hold has completed;
+  - the pause tier's lit deceleration is bounded: a hold the core did not
+    take ends it and stops the job with a reset, and a hold that has not
+    completed inside the longest stop the settings allow ends it too (at
+    the defaults, at the floors, and at the 60 s cap);
   - outside the window a blocking verdict is neither tier;
   - every change of the armed bit is reported at once, whatever the
     sender's M8/M9 state;
@@ -88,6 +93,7 @@ static int offset_clock_gettime (clockid_t id, struct timespec *ts)
 
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 system_t sys;
+settings_t settings;
 static sys_state_t cur_state = STATE_IDLE;
 sys_state_t state_get (void) { return cur_state; }
 void report_message (const char *msg, message_type_t type)
@@ -141,6 +147,15 @@ static void publish (bool fire_ok, const char *name, bool hold, bool resume_ok,
         atomic_store(&v_fresh_until_ms, mono_ms64() - 1);
 }
 
+/* A cut in progress: the job in its cycle, seen once under a clean
+   verdict, as every running cut has been before a verdict turns on it. */
+static void cut_in_progress (void)
+{
+    cur_state = STATE_CYCLE;
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();
+}
+
 static bool enqueued (uint8_t c)
 {
     for(int i = 0; i < ncmds && i < 32; i++)
@@ -167,7 +182,8 @@ static void reset_state (void)
     cur_state = STATE_IDLE;
     memset(&sys, 0, sizeof(sys));
     armed_val = false;
-    hold_ours = false;
+    hold_ours = hold_asked = hold_refused = cycle_ok = false;
+    hold_misses = 0;
     rehold_said = stale_warned = fallback_done = pause_said = false;
     atomic_store(&decel_lit, false);
     laser_on_window = false;
@@ -233,7 +249,7 @@ int main (void)
     reset_state();
     armed_val = true;
     laser_on_window = true;
-    cur_state = STATE_CYCLE;
+    cut_in_progress();
     publish(false, "OVERTEMP", true, false, true, 0.0);
     gfcool_poll();
     CHECK(fail_calls == 0, "OVERTEMP is not the fail tier");
@@ -267,6 +283,138 @@ int main (void)
     CHECK(fail_calls == 0 && !wrote("cnc/laser_latch=1") && !wrote("cnc/laser_latch=0"),
           "the whole pause episode wrote no latch");
     CHECK(!gfcool_decel_lit(), "the clean verdict leaves no lit-deceleration grace behind");
+
+    /* A cycle that starts under a verdict that already blocks fire (the
+     * job sat at Idle, in a dwell or between two lines, when the verdict
+     * turned): it is held, and no lit deceleration comes with the hold.
+     * There is no cut in progress to finish, and its first move is dark. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cur_state = STATE_IDLE;
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    cur_state = STATE_CYCLE;            /* the job's next cut starts */
+    gfcool_poll();
+    CHECK(enqueued(CMD_FEED_HOLD) && hold_ours, "a cycle that starts under the verdict is held");
+    CHECK(!gfcool_decel_lit(), "and its hold is dark: the gate stays closed");
+
+    /* A hold the core does not take (the sender's M53 P0 disables feed
+     * hold): two requests in a row have been executed and the job is
+     * still in its cycle. The lit deceleration ends there and the job is
+     * stopped. A request the core has not executed yet is waited for, and
+     * one executed request is not yet a refusal: the poll can run between
+     * the core's taking a request and its acting on it. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(enqueued(CMD_FEED_HOLD) && gfcool_decel_lit(), "the pause tier asks for its hold, lit");
+    sys.rt_exec_state = EXEC_FEED_HOLD; /* the request is still pending */
+    ncmds = 0;
+    gfcool_poll();
+    CHECK(gfcool_decel_lit() && !enqueued(CMD_RESET), "a hold the core has not executed yet is waited for");
+    sys.rt_exec_state = 0;              /* taken by the core, and the job is still in its cycle */
+    ncmds = 0;
+    gfcool_poll();
+    CHECK(gfcool_decel_lit() && !enqueued(CMD_RESET) && enqueued(CMD_FEED_HOLD),
+          "one request taken with the job still in its cycle is asked for again, not yet a refusal");
+    ncmds = 0;
+    gfcool_poll();                      /* the second one taken too, and still no hold */
+    CHECK(!gfcool_decel_lit(), "a hold the core did not take ends the lit deceleration");
+    CHECK(enqueued(CMD_RESET) && !enqueued(CMD_FEED_HOLD), "and the job is stopped with a reset");
+    ncmds = 0;
+    gfcool_poll();
+    CHECK(ncmds == 0, "the stop is asked for once");
+
+    /* The first request acted on between two polls: the job is in its
+     * hold, and nothing is stopped. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cur_state = STATE_CYCLE;
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    gfcool_poll();                      /* taken, not yet acted on: asked for again */
+    cur_state = STATE_HOLD;             /* the core acts on the first */
+    sys.holding_state = Hold_Pending;
+    ncmds = 0;
+    gfcool_poll();
+    cur_state = STATE_CYCLE;            /* a resume under the standing verdict */
+    gfcool_poll();
+    gfcool_poll();
+    CHECK(!enqueued(CMD_RESET), "a hold the core took between two polls is no refusal, and the count starts over at the next cycle");
+
+    /* The lit deceleration's time bound: the longest stop the settings
+     * allow, the largest of the axes' rate over acceleration, plus 0.5 s.
+     * A hold that has not completed by then no longer holds the gate
+     * open. At the board's defaults Y's stop is the longest (200 mm/s over
+     * 590 mm/s^2, 339 ms; X 286 ms, Z 100 ms): 839 ms. At the floors, half
+     * the defaults, Y again (200 over 295, 678 ms): 1178 ms. And a
+     * nonsense acceleration, which the settings dispatch never leaves in
+     * force, is held to the 60 s cap: 60.5 s. */
+    static const struct {
+        const char *what;
+        float ax, ay, az;               /* $120-$122, mm/s^2 */
+        long long bound_ms;
+    } bounds[] = {
+        { "the defaults", 700.0f, 590.0f, 50.0f, 839 },
+        { "the floors", 350.0f, 295.0f, 25.0f, 1178 },
+        { "a nonsense X acceleration", 1e-6f, 590.0f, 50.0f, 60500 },
+    };
+    for(int i = 0; i < 3; i++) {
+        reset_state();
+        memset(&settings, 0, sizeof(settings));
+        settings.axis[X_AXIS].max_rate = 12000.0f;
+        settings.axis[Y_AXIS].max_rate = 12000.0f;
+        settings.axis[Z_AXIS].max_rate = 300.0f;
+        settings.axis[X_AXIS].acceleration = bounds[i].ax * 3600.0f;
+        settings.axis[Y_AXIS].acceleration = bounds[i].ay * 3600.0f;
+        settings.axis[Z_AXIS].acceleration = bounds[i].az * 3600.0f;
+        armed_val = true;
+        laser_on_window = true;
+        cut_in_progress();
+        publish(false, "OVERTEMP", true, false, true, 0.0);
+        gfcool_poll();
+        cur_state = STATE_HOLD;
+        sys.holding_state = Hold_Pending;   /* decelerating, and it stays that way */
+        clock_offset_ms += bounds[i].bound_ms - 50;
+        publish(false, "OVERTEMP", true, false, true, 0.0);
+        gfcool_poll();
+        char msg[128];
+        snprintf(msg, sizeof(msg), "%s: the gate stays open 50 ms inside the %lld ms bound",
+                 bounds[i].what, bounds[i].bound_ms);
+        CHECK(gfcool_decel_lit(), msg);
+        clock_offset_ms += 100;
+        publish(false, "OVERTEMP", true, false, true, 0.0);
+        gfcool_poll();
+        snprintf(msg, sizeof(msg), "%s: 50 ms past it, a hold that has not completed no longer holds it open",
+                 bounds[i].what);
+        CHECK(!gfcool_decel_lit(), msg);
+    }
+
+    /* A verdict that clears while the hold still decelerates: the core
+     * drops a cycle start until the hold completes, so the client keeps
+     * the hold and resumes it once the head has stopped. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Pending;
+    ncmds = 0;
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();
+    CHECK(!enqueued(CMD_CYCLE_START) && hold_ours && !strstr(all_messages, "resuming"),
+          "a verdict that clears while the hold decelerates resumes nothing yet, the hold kept");
+    sys.holding_state = Hold_Complete;
+    gfcool_poll();
+    CHECK(enqueued(CMD_CYCLE_START) && !hold_ours && strstr(all_messages, "resuming"),
+          "once the hold completes, the client resumes it");
 
     /* A fault that waits for its Acknowledge: the cause gone, the verdict
      * ACK (fire blocked, no hold, resume_ok): the held job stays held, and
@@ -414,6 +562,7 @@ int main (void)
     CHECK(!wrote("cnc/laser_latch=1"), "a stale verdict writes no latch");
     /* The engine returns clean: the job resumes. */
     cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Complete;
     ncmds = 0;
     publish(true, "OK", false, true, true, 0.0);
     gfcool_poll();

@@ -45,7 +45,9 @@
   modal whenever the machine is at rest, which is Idle with nothing
   planned, a jog, or a hold - a window does not outlive its job, and a
   jog is not the job the press consented to; only a cycle, or a spindle
-  left on in a job parked in Door, keeps the window open, and no job
+  left on in a job parked in Door, keeps the window open, and neither
+  does while the cooling verdict blocks fire, so nothing inside the
+  verdict's hold starts the grace over; no job
   parks in Tool Change: $341 is pinned to ignore M6), on the cooling
   verdict's fail tier (FIRE, CRASH, AIRFLOW, CRITICAL: the latch locks,
   the job is reset with ALARM:3 and nothing resumes it), or immediately
@@ -59,7 +61,12 @@
   The verdict's pause tier (every other fire_ok=false,
   and a stale verdict) holds the job under the open window, lit through
   that first deceleration and masked from the stop on, and the clean
-  verdict's resume_ok resumes it with no new press. The pause never
+  verdict's resume_ok resumes it with no new press while the window is
+  still open: the grace counts from the verdict, and a verdict that
+  clears after it leaves the job held until the button is pressed. A ~
+  or a press under the standing verdict is refused, the job held
+  (gflaser_resume_gate). A job the pause cannot hold is stopped with a
+  reset instead (glowforge_cooling.c). The pause never
   writes the latch: a lock sets the hardware button latch, which only a
   physical press clears, so a lock is a new press by construction and
   belongs to the fail tier alone. The coolant fire gate is re-checked
@@ -538,8 +545,10 @@ static bool latch_lock (bool lock)
 
 /* The per-tick fire gate the stream engine masks FIRE with: the window
  * and the verdict's own fire_ok, held open through the pause tier's
- * first deceleration so a pause leaves no gap in the cut. Published on
- * every poll and on every arm and disarm. */
+ * first deceleration so a pause leaves no gap in the cut. The cooling
+ * client bounds that deceleration: it ends when the head has stopped,
+ * when the core did not take the hold, or after the longest stop the
+ * settings allow. Published on every poll and on every arm and disarm. */
 static void fire_gate_publish (void)
 {
     gf_stream_fire_gate(laser_ok && (gfcool_verdict_fire_ok() || gfcool_decel_lit()));
@@ -1247,9 +1256,14 @@ bool gflaser_resume_gate (void)
     if(rearm_pending)
         return true;                    /* the wait already running takes it */
     /* A held job whose window is open resumes with no new press, so a press
-     * made for a prompt on the control panel must not resume it. */
-    if(laser_ok && gfcool_button_reserved()) {
-        report_message((char *)BUTTON_HOLD_WORDS, Message_Warning);
+     * made for a prompt on the control panel must not resume it, and
+     * neither does a ~ or a press while the cooling verdict blocks fire (a
+     * pause tier, or a verdict gone stale): the job stays held where it
+     * stopped, as it does with the window closed. The verdict's own clear
+     * resumes it inside the grace (gfcool_poll); past the grace the
+     * window is closed and the resume asks for the button. */
+    if(laser_ok && (gfcool_button_reserved() || !gfcool_verdict_fire_ok())) {
+        report_message((char *)hold_refusal(), Message_Warning);
         return true;                    /* refused, the job held */
     }
     if(laser_ok || !gc_state.modal.spindle[0].state.on)
@@ -1821,11 +1835,20 @@ static void window_poll (void)
      * coolant on-delay that would put one there, is pinned to 0). Only a
      * cycle, or a spindle the core left on in a job parked in Door, keeps
      * the window open; no job parks in Tool Change ($341 is pinned to
-     * ignore M6). */
+     * ignore M6). And neither keeps it open while the cooling verdict
+     * blocks fire: nothing ships lit then, so the grace counts from the
+     * verdict whatever the machine does under it. The resume gate
+     * refuses a ~ or a press in the verdict's hold; a cycle that runs
+     * under the verdict all the same (a job's next cut, held as it
+     * starts) does not start the grace over. A verdict that clears after
+     * the grace and the close's wait for the kernel below finds the
+     * window closed, and the resume asks for the button; one that clears
+     * inside that wait (0.5 s steps until the kernel reads idle) finds it
+     * still open. */
     spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
     bool at_rest = st == STATE_JOG || (st & STATE_HOLD) ||
                    (st == STATE_IDLE && plan_get_current_block() == NULL);
-    if((st & STATE_CYCLE) || (cur.on && !at_rest)) {
+    if(gfcool_verdict_fire_ok() && ((st & STATE_CYCLE) || (cur.on && !at_rest))) {
         disarm_at = 0.0;
         return;
     }

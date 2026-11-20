@@ -30,9 +30,14 @@
     same tick the fire gate closes (jogs are canceled instead - grblHAL
     never holds a jog), and resume_ok auto-resumes a hold this client
     took.
-    A job resumed under a standing hold (the button, a ~, a sender) is
-    held again within the next poll: fire is blocked either way, and a
-    verdict with no resume is a reset, never a pause.
+    The resume gate refuses the button's and the sender's resume under a
+    verdict that blocks fire; a job that leaves the hold under the
+    standing verdict all the same is held again within the next poll:
+    fire is blocked either way, and a verdict with no resume is a reset,
+    never a pause.
+    A hold the core does not take stops the job with a reset: a job that
+    cannot be held does not run on under the verdict. (The core refuses
+    M53 P0, feed hold disabled, in laser mode; this is the backstop.)
     A missing or stale verdict (ts_mono older than 2 s) is treated as
     fire_ok=false, hold=true: the engine being gone must look exactly
     like a fault.
@@ -47,11 +52,15 @@
     deceleration runs lit, as a feed hold's does: the segments already
     planned at speed would otherwise play dark and leave a gap in the
     cut, while the kernel's queue plays its 200 ms of lit bytes either
-    way). A resume under the standing verdict moves dark and is held
-    again; resume_ok with fire_ok resumes the hold this client took,
-    lit from the first step, with no new button press. The pause never
-    writes the latch: a lock sets the hardware button latch, which only
-    a press clears.
+    way). That lit deceleration is bounded: it ends when the head has
+    stopped, when the core did not take the hold, or after the longest
+    stop the settings allow, whichever comes first. A ~ or a press under
+    the standing verdict is refused, the job held. resume_ok with fire_ok
+    resumes the hold this client took once the head has stopped, lit
+    from the first step, with no new button press while the armed window
+    is still open (its grace counts from the verdict; past it the resume
+    asks for the button). The pause never writes the latch: a lock sets
+    the hardware button latch, which only a press clears.
 
   - EMERGENCY FALLBACK: if the verdict goes stale while the laser is
     armed, the engine is provably absent and nobody else will move the
@@ -162,13 +171,26 @@ static bool v_ack_wait;
 static bool v_button_reserved;
 static bool pause_said;                 /* one message per pause-tier episode */
 /* The pause tier's first hold decelerates lit: set when this client
- * takes the hold on a fresh verdict flip, cleared once the head has
- * stopped (or the job left the hold another way). Read by the laser
+ * takes the hold on a fresh verdict flip under a cut in progress, cleared
+ * once the head has stopped (or the job left the hold another way, or the
+ * core did not take the hold, or the time bound passed). Read by the laser
  * module's fire gate on the protocol thread; atomic for the same
  * reason the other flags are. */
 static _Atomic bool decel_lit = false;
+/* The lit deceleration's time bound (CLOCK_MONOTONIC milliseconds), set
+ * with decel_lit. Protocol thread only. */
+static uint64_t decel_until_ms;
+/* The margin on that bound, over the longest stop the settings allow:
+ * the poll's pace and the segments already prepared at speed. */
+#define DECEL_MARGIN_MS 500
 
 static bool hold_ours = false;
+static bool cycle_ok = false;           /* this cycle has run under a verdict that allowed fire */
+static bool hold_asked = false;         /* a feed hold was asked for in this cycle */
+static uint8_t hold_misses = 0;         /* requests the core executed with the job still in its cycle */
+static bool hold_refused = false;       /* the core did not take the hold: the job is being stopped */
+/* How many such requests make a hold the core did not take (hold_take). */
+#define HOLD_MISSES_MAX 2
 static bool rehold_said = false;        /* one message per resume under a hold */
 static bool jog_warned = false;
 static bool fallback_done = false;
@@ -199,35 +221,104 @@ static void warn (const char *msg)
     fflog(LOG_WARNING, "gfcool: %s", msg);
 }
 
+/* The longest a feed hold can take to stop the head, from the settings in
+ * force, plus the margin: a hold decelerates along the path at the
+ * block's acceleration from at most the block's speed, and the planner
+ * keeps both inside each moving axis's limits, so the stop is never
+ * longer than the largest of the axes' own (highest rate over
+ * acceleration; $110-$112 in mm/min over $120-$122, which the core keeps
+ * in mm/min^2). The settings dispatch holds the rates at most and the
+ * accelerations at least their bounds (gfio_apply_machine_pins), so that
+ * is 0.68 s at most; the 60 s cap keeps a nonsense value a bound all the
+ * same. */
+static uint32_t decel_budget_ms (void)
+{
+    float worst_s = 0.0f;
+
+    for(uint_fast8_t axis = 0; axis < N_AXIS; axis++) {
+        float accel = settings.axis[axis].acceleration;
+        float stop_s = accel > 0.0f ? settings.axis[axis].max_rate * 60.0f / accel : 0.0f;
+        if(stop_s > worst_s)
+            worst_s = stop_s;
+    }
+    if(!(worst_s < 60.0f))
+        worst_s = 60.0f;                /* nan, inf, nonsense: a bound all the same */
+
+    return (uint32_t)(worst_s * 1000.0f) + DECEL_MARGIN_MS;
+}
+
 /* Take the feed hold, or take it again. hold_ours already set with the
- * core back in Cycle means the job was resumed under a standing verdict
- * (the button, a ~, a sender): fire is blocked either way, so the job
- * would run dark to its end. It is held again, and told why once per
- * resume. A verdict with no resume is a reset, never a pause. */
+ * core back in Cycle means the job left the hold under a standing verdict
+ * by a way the resume gate does not refuse: fire is blocked either way,
+ * so the job would run dark to its end. It is held again, and told why
+ * once per resume. A verdict with no resume is a reset, never a pause. */
 static void hold_take (bool stale)
 {
-    if(hold_ours && !rehold_said) {
+    /* Called only from a cycle. A request this client made in an earlier
+     * poll that the core has since executed, with the job still in its
+     * cycle, is a hold the core did not take: feed hold disabled (M53 P0,
+     * which the core refuses in laser mode) or a motion cancel in
+     * progress. One such request is not yet a refusal: this poll can run
+     * inside the core's realtime pass, between its taking the request and
+     * its acting on it (a status report written to a full transmit ring
+     * pumps the hook), and the request made below is then still pending
+     * when the first is acted on. Two are: the core takes the second only
+     * in a later pass, after it has acted on the first. A job that cannot
+     * be held is not left to run on: the lit deceleration ends here, and
+     * the job is stopped the way a ^X stops it (the reset closes the
+     * window and locks the latch, the kernel ramps the motion down,
+     * ALARM:3). */
+    if(hold_refused)
+        return;                         /* the reset is on its way */
+    if(hold_asked && !(sys.rt_exec_state & EXEC_FEED_HOLD) && ++hold_misses >= HOLD_MISSES_MAX) {
+        hold_refused = true;
+        decel_lit = false;
+        warn(stale ? "cooling service lost and the hold was not taken - job stopped"
+                   : "cooling hold: the hold was not taken - job stopped");
+        protocol_enqueue_realtime_command(CMD_RESET);
+        return;
+    }
+    hold_asked = true;
+
+    if(hold_ours && !rehold_said && hold_misses == 0) {
         rehold_said = true;
         warn(stale ? "cooling service lost - job held again"
                    : "cooling hold stands - job held again; reset the job");
     }
-    /* The first hold of the episode decelerates lit; a hold taken again
-     * under the standing verdict (after a ~ or a press) does not. */
-    if(!hold_ours)
+    /* The first hold of the episode decelerates lit, where the verdict
+     * met a cut in progress: this cycle has run under a verdict that
+     * allowed fire. A hold taken again under the standing verdict (after
+     * a ~ or a press) does not, and neither does the hold of a cycle that
+     * started under the verdict (the job sat at Idle, in a dwell or
+     * between two lines, or in the sender's own hold, when the verdict
+     * turned): there is no cut in progress to finish, and its first move
+     * stays dark. */
+    if(!hold_ours && cycle_ok) {
         decel_lit = true;
+        decel_until_ms = mono_ms64() + decel_budget_ms();
+    }
     hold_ours = true;
     protocol_enqueue_realtime_command(CMD_FEED_HOLD);
 }
 
-/* The lit deceleration ends when the head has stopped, or the job has
- * left the cycle and the hold by another way. */
+/* The lit deceleration ends when the head has stopped, when the job has
+ * left the cycle and the hold by another way, or when its time bound has
+ * passed, whichever comes first: the gate it holds open never waits on a
+ * hold that does not complete. A hold the core did not take ends it in
+ * hold_take. */
 static void decel_track (sys_state_t st)
 {
+    if(st != STATE_CYCLE) {
+        hold_asked = hold_refused = false;
+        hold_misses = 0;
+    }
     if(!decel_lit)
         return;
     if(st == STATE_HOLD && sys.holding_state == Hold_Complete)
         decel_lit = false;
     else if(!(st & (STATE_CYCLE | STATE_HOLD)))
+        decel_lit = false;
+    else if(mono_ms64() >= decel_until_ms)
         decel_lit = false;
 }
 
@@ -611,6 +702,13 @@ void gfcool_poll (void)
         bool blocked = !gfcool_verdict_fire_ok();
         bool armed = gflaser_armed();
 
+        /* Whether this cycle has run under a verdict that allowed fire
+         * (hold_take: only such a cycle's hold decelerates lit). */
+        if(st != STATE_CYCLE)
+            cycle_ok = false;
+        else if(!blocked)
+            cycle_ok = true;
+
         /* The tiers, inside an open window. The fail tier ends the job;
          * the pause tier (a named pause, or a stale verdict) is the hold
          * below with the stream's fire gate masking the beam, said once
@@ -690,14 +788,19 @@ void gfcool_poll (void)
                      * stays held until the panel's Acknowledge, then resumes
                      * through the re-arm's press, instead of a resume the
                      * resume gate would refuse, the hold no longer this
-                     * client's to resume. */
-                    else if(v_resume_ok && !gfcool_ack_waits()) {
+                     * client's to resume. Nor before the head has stopped:
+                     * the core drops a cycle start while the hold still
+                     * decelerates, so the hold stays this client's until
+                     * it completes, and is resumed then. */
+                    else if(v_resume_ok && !gfcool_ack_waits() &&
+                            sys.holding_state == Hold_Complete) {
                         hold_ours = false;
-                        report_message("cooling verdict clean - resuming",
-                                       Message_Info);
-                        fflog(LOG_INFO, "gfcool: resuming");
-                        if(!gflaser_resume_gate())
+                        if(!gflaser_resume_gate()) {
+                            report_message("cooling verdict clean - resuming",
+                                           Message_Info);
+                            fflog(LOG_INFO, "gfcool: resuming");
                             protocol_enqueue_realtime_command(CMD_CYCLE_START);
+                        }
                     }
                 }
             }
