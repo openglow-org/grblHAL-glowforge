@@ -180,6 +180,11 @@
 /* Shipper cadence. */
 #define SHIP_PERIOD_NS 10000000 /* 10 ms */
 
+/* The longest a reset's clear may wait for the kernel (a state that
+ * reads, and not running) before a stream with bytes behind it is the
+ * stream fault: the read-back's own bound (driver.c READBACK_WAIT_MS). */
+#define CLEAR_WAIT_S 1.0
+
 /* GFSINK_RATE / GFSINK_DEPTH_MS bounds. The machine tick is the XY
  * microstep mode's (glowforge_io.h: the factory travel tick at x8,
  * doubled at x16, quadrupled at x32, so the ticks per step and the top
@@ -239,8 +244,12 @@ static struct {
     bool kernel_running;      /* we believe a kernel run is active */
     bool run_pending;         /* bytes shipped while the kernel played: the
                                  run request waits, and dies with the stream */
+    bool live_flag;           /* cnc/streaming as this process last wrote it:
+                                 set where the shipper writes the 1, cleared
+                                 where a 0 is written */
     bool clear_pending;       /* a reset stopped the kernel mid-motion: drop
                                  its unplayed residue once it is idle */
+    double clear_at;          /* wall time the pending clear was ordered */
     bool hold_pending;        /* drop to hold currents once kernel idles */
     _Atomic bool hold_due;    /* the kernel idled: the protocol thread drops
                                  to the hold currents (gf_stream_hold_take) */
@@ -271,6 +280,10 @@ static struct {
     bool base_valid;
     uint32_t zeros;           /* counter zeros so far (gf_stream_clear_position) */
     int readback;             /* RB_*: the read-back a reset owes */
+    bool readback_at_rest;    /* owed by a reset at rest, for an ended stream's
+                                 tail: the core does not count its position
+                                 lost, so one that cannot be read back is a
+                                 stream fault (gf_stream_readback) */
     uint32_t unplayed[3];
     _Atomic bool failed;      /* unrecoverable; stop feeding (read lock-free
                                  by the entry points; written under gf.lock) */
@@ -350,6 +363,13 @@ static _Atomic bool fire_gate = false;
  * a latch the disarm just closed while FIRE bytes still sit in the
  * ring. Leaf lock: never held while taking gf.lock or the core lock. */
 static pthread_mutex_t latch_mx = PTHREAD_MUTEX_INITIALIZER;
+/* A reset has ordered the kernel stopped and the ring cleared, and the
+ * clear has not run yet. Set under gf.lock before the reset writes its
+ * stop; the stop and the shipper's run request are both written under
+ * latch_mx, and the request is made only with this clear, so no run is
+ * asked for behind a reset's stop. Cleared with the clear (pending_pass)
+ * and at a resume. */
+static _Atomic bool reset_stop = false;
 /* Which way this process last wrote the latch (under latch_mx). The
  * latch is locked by default and at init, so the record starts locked.
  * Nothing but this process ever unlocks the latch, so a record of
@@ -961,10 +981,14 @@ void gf_stream_wakeup (void)
         if(!gf.kernel_running) {
             /* Fresh stream after a completed one: restart the stream-
              * relative index space (produced/shipped/due must share an
-             * origin) and preload one depth of pad slots. Laser
-             * transitions carry indices from the OLD space - stale ones
-             * would clog the queue head forever; the previous stream
-             * shipped out completely, so dropping them loses nothing. */
+             * origin) and preload one depth of pad slots. The shipper
+             * ships only the part of them the kernel's queue is short of
+             * (ship_pass), so a kernel still playing the last stream's
+             * tail is topped up to one depth, never a depth behind the
+             * tail. Laser transitions carry indices from the OLD space -
+             * stale ones would clog the queue head forever; the previous
+             * stream shipped out completely, so dropping them loses
+             * nothing. */
             gf.shipped = 0;
             gf.produced = gf.depth;
             gf.lev_head = gf.lev_tail;
@@ -1009,15 +1033,17 @@ void gf_stream_wakeup (void)
             gf.lev_tail++;
         }
 
-        if(gf.active)
-            gfio_wr_attr("cnc/streaming", "1");
+        /* The live flag is the shipper's to write, once the run's first
+         * chunk is in the ring (ship_pass): until then the kernel's end
+         * of data is the last stream's own, a normal end. */
     }
     pthread_mutex_unlock(&gf.lock);
 
     /* Arm the producer. NOTE: st_wake_up calls go_idle(true) first, so a
      * back-to-back job disarms/re-arms; the shipper may slip into that gap
-     * and treat the stream as finished - benign (extra streaming toggle +
-     * one preload of added latency), see the design notes. */
+     * and treat the stream as finished - benign (an extra streaming
+     * toggle, and a preload that tops the queue up), see the design
+     * notes. */
     pthread_mutex_lock(&gf.wake_mx);
     armed = true;
     pthread_cond_signal(&gf.wake_cv);
@@ -1190,7 +1216,8 @@ static void *producer_thread (void *arg)
  * them. Returns 1 when the run is playing (or a stalled one was
  * recovered), 0 when the kernel is busy (the caller keeps the request
  * pending, and it ends with the stream), 2 when the kernel is idle with
- * nothing queued (everything was already consumed), and -1 on a fault
+ * nothing queued (everything was already consumed), 3 when a reset has
+ * ordered its stop (no request is made), and -1 on a fault
  * (flagged). Called without gf.lock. */
 static int issue_run (void)
 {
@@ -1210,6 +1237,14 @@ static int issue_run (void)
      * gf_stream_laser_latch). An unlock that fails refuses the run:
      * the hook disarms and alarms. */
     pthread_mutex_lock(&latch_mx);
+    /* A reset that has ordered its stop takes the bytes with it: no run
+     * is asked for over them. The reset writes its stop under this same
+     * lock, so a request made here is ahead of that stop, which then ends
+     * the run it started. */
+    if(atomic_load(&reset_stop)) {
+        pthread_mutex_unlock(&latch_mx);
+        return 3;
+    }
     bool relight = laser_armed && fire_gate && latch_locked_by_us;
     if(relight && !latch_write_locked(false)) {
         pthread_mutex_unlock(&latch_mx);
@@ -1386,6 +1421,26 @@ static void rebase_locked (const uint32_t counts[3])
     gf.base_valid = true;
 }
 
+/* A reset's clear that has waited past CLEAR_WAIT_S for the kernel (its
+ * state cannot be read, or it still runs) holds every byte a new stream
+ * produces behind it: they would ship at whatever later moment the clear
+ * runs, a job starting by itself. A stream with bytes waiting there is
+ * the stream fault instead, once: the hook alarms, and the next reset
+ * drops the bytes. Nothing of the stream has shipped. */
+static void clear_overdue (void)
+{
+    pthread_mutex_lock(&gf.lock);
+    bool report = gf.clear_pending && !gf.failed && (gf.streaming || gf.produced > gf.shipped) &&
+                  wall_s() - gf.clear_at >= CLEAR_WAIT_S;
+    if(report)
+        gf.failed = true;
+    pthread_mutex_unlock(&gf.lock);
+    if(report) {
+        rt_log("gfstream: the clear after a reset cannot reach the kernel - no motion, alarming\n");
+        fault_flag = true;
+    }
+}
+
 /* Kernel-side follow-ups on the shipper's cadence: a mid-motion reset's
  * unplayed residue is dropped once the stop has played out, which holds
  * shipping until it is done (a clear must not eat a new job's bytes), the
@@ -1426,10 +1481,12 @@ static bool pending_pass (void)
 
     char state[16] = "";
     if(active) {
-        if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+        /* No state, or still playing: the clear waits. */
+        if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0 || strcmp(state, "running") == 0) {
+            if(clear)
+                clear_overdue();
             return !clear;
-        if(strcmp(state, "running") == 0)
-            return !clear;              /* still playing: wait */
+        }
     }
 
     if(clear) {
@@ -1467,6 +1524,7 @@ static bool pending_pass (void)
         else if(!stale)
             gf.base_valid = false;
         gf.clear_pending = false;
+        atomic_store(&reset_stop, false);
         gf.run_pending = false;
         gf.kernel_running = false;
         gf.power_sent = false;
@@ -1557,6 +1615,10 @@ static void ship_pass (void)
 
     bool streaming = gf.streaming;
     uint64_t backlog = gf.produced > gf.shipped ? gf.produced - gf.shipped : 0;
+    /* What a fresh stream's preload found and shipped, for the log: 0 no
+     * count read this pass, 1 read, -1 the counts could not be read. */
+    int preload_read = 0;
+    uint32_t preload_held = 0, preload_pads = 0;
 
     if(!streaming && backlog == 0) {
         /* stream finished: tell the kernel the next end-of-data is normal */
@@ -1586,6 +1648,7 @@ static void ship_pass (void)
             }
             if(gf.active)
                 gfio_wr_attr("cnc/streaming", "0");
+            gf.live_flag = false;
             gf.kernel_running = false;   /* kernel drains the queue and idles */
             /* The run request dies with its stream. The kernel plays the
              * stream's bytes as a continuation of what it was playing, or
@@ -1626,6 +1689,39 @@ static void ship_pass (void)
         if(backlog < (streaming ? gf.depth : 1)) {  /* wait for the preload */
             pthread_mutex_unlock(&gf.lock);
             return;
+        }
+        /* A fresh stream's preload fills the kernel's queue to one depth,
+         * and no further. A kernel that still plays the last stream's
+         * tail holds part of that depth already (the bytes the ring took
+         * less the bytes the kernel has processed), so that many of the
+         * leading pad slots are skipped: they hold no step and no laser
+         * event, since every event of the stream maps at or past its
+         * base, one depth in. At least one pad ships, so the stream owns
+         * bytes in the kernel from this pass on. A count that cannot be
+         * read, or an empty queue, ships the whole depth; the run gate
+         * below still judges what the ring holds. The count is read with
+         * gf.lock released (the read is a transaction with the pulse
+         * engine, and the producer needs the lock); a reset, a fault or a
+         * handover that lands under it ends the pass, and the next one
+         * starts over. */
+        if(gf.shipped == 0 && gf.active && gf.depth > 1) {
+            uint32_t written = gf.written, processed = 0, took = 0;
+            pthread_mutex_unlock(&gf.lock);
+            bool counted = kernel_counts(&processed, &took);
+            pthread_mutex_lock(&gf.lock);
+            if(gf.failed || gf.suspended || gf.clear_pending || gf.shipped != 0 ||
+               gf.written != written || gf.produced < gf.depth) {
+                pthread_mutex_unlock(&gf.lock);
+                return;
+            }
+            if(counted) {
+                uint32_t held = written - processed;
+                gf.shipped = held < gf.depth ? held : gf.depth - 1;
+                preload_held = held;
+            }
+            preload_read = counted ? 1 : -1;
+            preload_pads = gf.depth - (uint32_t)gf.shipped;
+            streaming = gf.streaming;
         }
         gf.ship_t0 = wall_s();
     }
@@ -1733,12 +1829,46 @@ static void ship_pass (void)
             break;                      /* a fault or a reset landed under the write */
         if(first)
             start_run = true;
+        /* The live flag, once a chunk of a stream that has more to give
+         * is in the ring and the flag is not set: from here an end of
+         * data is this stream starved. For a run's first chunk that is
+         * this pass; a stream that takes over bytes shipped with no flag
+         * (the last stream ended with nothing more to give, and this one
+         * started before the shipper ended it) gets the flag at its own
+         * first chunk. Written before the chunk, the flag would turn the
+         * last stream's normal end, reached ahead of it, into an
+         * underrun. Under gf.lock, and only for a stream that has met no
+         * fault, reset or handover (the break above): a 1 written after
+         * a reset's 0 would stand at an idle kernel, and the next
+         * holder's run would end in an underrun. */
+        if(active && !gf.live_flag && (gf.streaming || gf.shipped < gf.produced)) {
+            gfio_wr_attr("cnc/streaming", "1");
+            gf.live_flag = true;
+        }
         streaming = gf.streaming;
     }
 
     uint32_t base = gf.run_base, written = gf.written;
     pthread_mutex_unlock(&gf.lock);
 
+    /* The preload's line goes out through the shipper's own path
+     * (rt_log), ahead of the run request: the count read at the debug
+     * level only (the level is read without a lock), a count that cannot
+     * be read always. */
+    if(preload_read < 0 || (preload_read > 0 && fflog_level() >= LOG_DEBUG)) {
+        char msg[128];
+        if(preload_read > 0)
+            snprintf(msg, sizeof(msg), "gfstream: preload: the kernel held %u bytes; %u pads "
+                     "shipped of a depth of %u\n", (unsigned)preload_held, (unsigned)preload_pads,
+                     (unsigned)gf.depth);
+        else
+            snprintf(msg, sizeof(msg), "gfstream: preload: the kernel's byte counts cannot be "
+                     "read; the whole depth shipped (%u pads)\n", (unsigned)preload_pads);
+        rt_log(msg);
+    }
+
+    /* A reset that landed since the chunk has ordered the kernel stopped
+     * and the ring cleared: issue_run makes no run request behind it. */
     if(start_run && gf.active && !gf.failed) {
         int rc = run_gate(base, written);
         if(rc > 0)
@@ -1874,10 +2004,28 @@ void gf_stream_reset (void)
      *   still be armed.
      * - the stream ended before the reset and no idle under the reset
      *   marked it (the core goes idle under a reset only in a motion
-     *   state, and a device handed to another process takes no mark), and
-     *   the kernel only drains its completed queue: leave it. That queue
-     *   is the tail of motion the core has counted, and the shipper's
-     *   end-of-stream logic finishes as it always does.
+     *   state). A kernel that still plays is playing that stream's tail,
+     *   up to one queue depth of motion the core has counted. The shipper
+     *   can still hold the last of it unshipped, or have shipped it with
+     *   the run request still to come. A reset stops whatever plays or
+     *   would play, so this reset gets the same backlog drop, stop, clear
+     *   and read-back as a reset during motion, with no step owed for a
+     *   pulse start. A kernel state that cannot be read is taken as
+     *   playing: the same stop, clear and read-back, and a read-back that
+     *   then cannot be made is the stream fault (gf_stream_readback). A
+     *   kernel that reads idle or disabled has nothing playing, and the
+     *   shipper's end-of-stream logic finishes as it always does. A
+     *   device handed to another process is not the engine's to stop.
+     * - the kernel reads underrun or fault while the engine still owns a
+     *   stream there (live, ended under the reset, unshipped, or shipped
+     *   and not yet ended by the shipper). The kernel stopped dead or
+     *   faulted under bytes the core counted, and the shipper has not
+     *   seen it yet. The counters are not to be trusted, and the stop
+     *   below would acknowledge an underrun: the reset raises the stream
+     *   fault itself (the hook alarms and drops the reference), reads
+     *   nothing back (the read-back answers that the position cannot be
+     *   read back, and the sender is told so), and stops and clears as
+     *   it does after any fault.
      * A stream fault (an underrun, a kernel fault, a refused run, a write
      * error, a ring overflow) ended the run and alarmed the core. The reset
      * is the operator's acknowledgment of the alarm: stop and re-arm the
@@ -1888,13 +2036,44 @@ void gf_stream_reset (void)
      * latch already.
      * The sysfs writes happen after the lock is dropped: the shipper needs
      * it every 10 ms. The null sink logs them (GFSINK_ATTR_LOG). */
-    bool stop_kernel = false, acknowledged = false, pad = false;
+    bool stop_kernel = false, acknowledged = false, pad = false, raised = false;
+
+    /* What the kernel does now, read before the lock: the shipper needs
+     * the lock, and a tail that ends between this read and the stop
+     * leaves a stop with no effect and a clear of an empty ring. A state
+     * that cannot be read is taken as playing. */
+    bool playing = false, broken = false;
+    char state[16] = "";
+    if(gf.active) {
+        if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0) {
+            state[0] = '\0';
+            playing = true;
+        } else {
+            playing = strcmp(state, "running") == 0;
+            broken = strcmp(state, "underrun") == 0 || strcmp(state, "fault") == 0;
+        }
+    }
 
     pthread_mutex_lock(&gf.lock);
     bool killed = gf.killed;
+    bool clear_was_pending = gf.clear_pending;
     gf.killed = false;
     gf.readback = RB_NONE;
-    if(gf.streaming || killed) {
+    gf.readback_at_rest = false;
+    /* An underrun or a fault under a stream the engine still owns, which
+     * the shipper has not seen: the stream fault, raised here. */
+    if(broken && !gf.suspended && !gf.failed &&
+       (gf.streaming || killed || gf.produced > gf.shipped || gf.kernel_running)) {
+        gf.failed = true;
+        raised = true;
+    }
+    /* An ended stream's tail: what the kernel still plays, what the
+     * shipper has not shipped yet, and bytes the engine still owns in the
+     * kernel (shipped, with the shipper's run request for them still to
+     * come: no request is made behind this reset's stop, issue_run). */
+    bool tail = !gf.suspended && !gf.streaming && !killed &&
+                (playing || gf.produced > gf.shipped || gf.kernel_running);
+    if(gf.streaming || killed || tail) {
         uint32_t dropped[3] = { 0, 0, 0 };
         if(killed)
             tick_steps(dropped, gf.kill_step);
@@ -1905,7 +2084,7 @@ void gf_stream_reset (void)
         gf.want_fire = false;        /* nothing re-asserts fire after an abort */
         gf.power_sent = false;
         dither_reset();
-        if(killed || gf.kernel_running) {
+        if(killed || tail || gf.kernel_running) {
             stop_kernel = true;
             gf.kernel_running = false;
             gf.run_pending = false;
@@ -1914,9 +2093,10 @@ void gf_stream_reset (void)
             gf.hold_poll_at = wall_s() + 0.2;
             pad = gf.last_lit;       /* the shipper ends the stream dark (pending_pass) */
         }
-        if(killed && !gf.failed) {
+        if((killed || tail) && !gf.failed) {
             memcpy(gf.unplayed, dropped, sizeof(dropped));
             gf.readback = gf.base_valid ? RB_WAIT : RB_LOST;
+            gf.readback_at_rest = tail;
         }
     }
     if(gf.failed) {
@@ -1936,14 +2116,36 @@ void gf_stream_reset (void)
         gf.power_sent = false;
         dither_reset();
     }
+    /* The stream fault this reset raised: the position the core holds is
+     * one that cannot be read back, and the protocol thread says so
+     * (gf_stream_readback answers -1). */
+    if(raised)
+        gf.readback = RB_LOST;
     gf.last_lit = pad;
+    if(stop_kernel)
+        gf.live_flag = false;
+    if(gf.clear_pending) {
+        if(!clear_was_pending)
+            gf.clear_at = wall_s();
+        atomic_store(&reset_stop, true);
+    }
     pthread_mutex_unlock(&gf.lock);
 
     if(stop_kernel) {
+        /* Under the lock the shipper's run request is made under: a
+         * request is ahead of this stop, or is not made (issue_run). */
+        pthread_mutex_lock(&latch_mx);
         gfio_wr_attr("cnc/stop", "1");
         gfio_wr_attr("cnc/streaming", "0");
+        pthread_mutex_unlock(&latch_mx);
     }
-    if(acknowledged) {
+    if(raised) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "gfstream: kernel %s at a reset - alarming, position untrusted\n",
+                 state);
+        rt_log(msg);
+        fault_flag = true;
+    } else if(acknowledged) {
         /* A latch write that failed is reported again after the
          * acknowledgment: the next failure is a new episode. */
         pthread_mutex_lock(&latch_mx);
@@ -1971,8 +2173,21 @@ int gf_stream_readback (int32_t steps[3], uint32_t wait_ms)
                 for(int a = 0; a < 3; a++)
                     steps[a] = (int32_t)gf.unplayed[a];
             gf.readback = RB_NONE;
+            bool at_rest = gf.readback_at_rest;
+            gf.readback_at_rest = false;
             pthread_mutex_unlock(&gf.lock);
-            return rb == RB_NONE ? 0 : rb == RB_DONE ? 1 : -1;
+            int rc = rb == RB_NONE ? 0 : rb == RB_DONE ? 1 : -1;
+            /* A reset during motion that cannot be read back is the
+             * core's to answer: it counts its position lost. A reset at
+             * rest left the core sure of a position that the stopped tail
+             * never reached, so a tail that cannot be read back is a
+             * stream fault: the hook alarms and drops the reference. */
+            if(rc < 0 && at_rest) {
+                rt_log("gfstream: the tail a reset stopped cannot be read back - "
+                       "alarming, position untrusted\n");
+                fault_flag = true;
+            }
+            return rc;
         }
         pthread_mutex_unlock(&gf.lock);
         sleep_ns(READBACK_POLL_NS);
@@ -2203,6 +2418,8 @@ bool gf_stream_resume (void)
     /* The clear above zeroed the ring's counts. A clear that did not take
      * shows at the next run start's gate. */
     gf.written = 0;
+    gf.live_flag = false;
+    atomic_store(&reset_stop, false);
     gf.streaming = false;
     gf.kernel_running = false;
     gf.hold_pending = false;

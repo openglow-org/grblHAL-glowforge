@@ -69,6 +69,17 @@
     added, fault the stream with no run asked for and no relight, and so
     does a count or a state that cannot be read; an underrun at a run
     start goes to the retry;
+  - the preload and the live flag: a stream that starts while the kernel
+    still plays the last one's tail preloads a depth less what the kernel
+    still holds, to the byte, so the queue stays near a depth over any
+    number of restarts, and never less than one pad; counts that cannot
+    be read ship the whole depth; the count is read with the stream's
+    lock released, and a fault or a reset that lands under the read ships
+    nothing; the live flag is the shipper's, written once a chunk of a
+    stream that has more to give is in the ring and before the run
+    request, never at the wakeup, never for a stream with no more bytes
+    to give or one that failed under that chunk's write, and once for a
+    stream that takes over bytes shipped with no flag;
   - the mid-run check: a kernel that stops running while it owns bytes
     of the live stream (an underrun, or a stop another writer made)
     faults the stream;
@@ -99,7 +110,24 @@
     that lands under the clear's read, loses the position; the null sink
     clears with no seek and owes the backlog alone; a failed stream's
     reset during motion owes no read-back, and its residue clear still
-    runs.
+    runs;
+  - the reset at rest: a kernel that still plays an ended stream's tail
+    gets the stop, the clear and the read-back, and so does what the
+    shipper had not shipped of it; a read-back that succeeds raises no
+    fault, and a tail that cannot be read back is a stream fault, where a
+    reset during motion raises none; a reset between a stream's first
+    chunk and its run request is followed by no run request; a kernel
+    state that cannot be read is taken as playing; a kernel that reads
+    underrun or fault under a stream the engine owns (a backlog, its run
+    alone, or a stream a reset during motion ended) is a stream fault,
+    with the stop and the live flag's 0 written and a read-back that
+    answers that the position cannot be read back; the reset that
+    acknowledges the shipper's own underrun alarm raises no second one; a
+    reset's stop is written after a run request that is in the kernel,
+    never inside it; a clear that has waited past the read-back's bound
+    for a state that reads faults a new stream before a byte of it ships;
+    a kernel with nothing playing and nothing owned, a device handed
+    over, a live stream and a failed stream get what the cases say.
 
   And the motor currents and the clamp: the shipper only finds the hold
   currents owed (the null sink too), and the protocol thread takes the
@@ -119,6 +147,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 /* --- controllable + observable stubs (defined before the include so the
@@ -134,6 +164,7 @@ static bool ring_empty;             /* the kernel's ring at a run request */
 static int  idle_refusal;           /* errno of a run refused at idle, 0 = none */
 static int  stops_ignored;          /* stop writes in underrun that do not take */
 static int  state_reads, state_fail_at;     /* the cnc/state read that fails, 0 = none */
+static bool state_gone;             /* every cnc/state read fails */
 static void (*on_state_read)(void); /* another thread's work, landing during a read */
 static int  ring_rd = -1;           /* the read end of the pipe that stands in for the ring */
 static uint32_t ring_took;          /* bytes that reached the stand-in */
@@ -143,6 +174,9 @@ static uint32_t k_foreign;          /* bytes another writer added to the ring */
 static int32_t k_pos[3];            /* the kernel's X, Y and Z step counters */
 static bool pos_fail;               /* the position record cannot be read */
 static void (*on_pos_read)(void);   /* another thread's work, landing after a position read */
+static uint32_t live_at;            /* bytes the ring had taken when the live flag was last set */
+static void (*on_run_write)(void);  /* another thread's work, landing while a run request is in the kernel */
+static void ring_drain (void);
 
 int gfio_wr_attr (const char *attr, const char *val)
 {
@@ -158,6 +192,10 @@ int gfio_wr_attr (const char *attr, const char *val)
         errno = EBUSY;
         return -1;
     }
+    if(!strcmp(attr, "cnc/streaming") && !strcmp(val, "1")) {
+        ring_drain();
+        live_at = ring_took;
+    }
     if(!strcmp(attr, "cnc/step_freq") && tick_fails) {
         errno = EINVAL;
         return -1;
@@ -169,6 +207,11 @@ int gfio_wr_attr (const char *attr, const char *val)
      * acknowledges an underrun; the first stops_ignored stop writes in
      * underrun do not take, and leave it in place. */
     if(!strcmp(attr, "cnc/run")) {
+        if(on_run_write) {
+            void (*work)(void) = on_run_write;
+            on_run_write = NULL;
+            work();
+        }
         if(!strcmp(rd_state, "running") || !strcmp(rd_state, "underrun") ||
            !strcmp(rd_state, "fault")) {
             errno = EPERM;
@@ -199,7 +242,7 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     if(!strcmp(attr, "cnc/state")) {
         /* A read that fails leaves the buffer as it was, as the real
          * reader does when the attribute does not open. */
-        if(++state_reads == state_fail_at)
+        if(++state_reads == state_fail_at || state_gone)
             return -1;
         snprintf(buf, len, "%s", rd_state);
         if(on_state_read)
@@ -290,6 +333,7 @@ void gfhome_invalidate (void) {}
 void gf_core_lock (void) {}
 void gf_core_unlock (void) {}
 void fflog (int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
+int  fflog_level (void) { return LOG_DEBUG; }
 
 /* --- driver source under test ---------------------------------------- */
 #include "../src/stepper_stream.c"
@@ -349,6 +393,61 @@ static void fault_lands (void)
     gf.failed = true;
 }
 
+/* A fault from another thread that lands while the shipper reads the
+ * kernel's byte counts for a preload. */
+static void fault_lands_under_read (void)
+{
+    on_pos_read = NULL;
+    gf.failed = true;
+}
+
+/* A soft reset from the protocol thread that lands while the shipper
+ * reads the kernel's byte counts for a preload. */
+static void reset_lands_under_read (void)
+{
+    on_pos_read = NULL;
+    gf_stream_reset();
+}
+
+/* A soft reset from the protocol thread that lands while the shipper
+ * reads the kernel state for its run gate: after its first chunk, before
+ * its run request. */
+static void reset_lands_at_the_gate (void)
+{
+    on_state_read = NULL;
+    gf_stream_reset();
+}
+
+/* A soft reset on the protocol thread that lands while the shipper's run
+ * request is in the kernel: the reset runs on a thread of its own, and
+ * the stub looks 10 ms later for a stop written inside the request. */
+static pthread_t reset_tid;
+static int stops_inside_the_run = -1;
+
+static void *reset_thread (void *arg)
+{
+    (void)arg;
+    gf_stream_reset();
+    return NULL;
+}
+
+static void reset_lands_in_the_run (void)
+{
+    pthread_create(&reset_tid, NULL, reset_thread, NULL);
+    struct timespec ts = { 0, 10000000L };
+    nanosleep(&ts, NULL);
+    stops_inside_the_run = count_write("cnc/stop=1");
+}
+
+/* A fault from another thread that lands while the shipper's write waits
+ * on a full ring; the ring then takes the write. */
+static void fault_lands_under_write (void)
+{
+    on_state_read = NULL;
+    gf.failed = true;
+    ring_drain();
+}
+
 /* A counter zero (a home, on the protocol thread) that lands right after
  * the shipper has read the kernel's step counters. */
 static void zero_lands (void)
@@ -372,7 +471,9 @@ static void reset_state (void)
     idle_refusal = 0;
     stops_ignored = 0;
     state_reads = state_fail_at = 0;
+    state_gone = false;
     on_state_read = NULL;
+    on_run_write = NULL;
     gf.run_pending = gf.kernel_running = gf.clear_pending = false;
     gf.streaming = false;
     gf.hold_pending = false;
@@ -383,6 +484,9 @@ static void reset_state (void)
     gf.written = gf.run_base = 0;
     gf.killed = false;
     gf.readback = RB_NONE;
+    gf.readback_at_rest = false;
+    gf.live_flag = false;
+    atomic_store(&reset_stop, false);
     memset(gf.steps, 0, sizeof(gf.steps));
     memset(gf.base_steps, 0, sizeof(gf.base_steps));
     memset(gf.base_counts, 0, sizeof(gf.base_counts));
@@ -572,7 +676,7 @@ int main (void)
     gf.fd = sink;
     gf.rate = 1000;
     gf.depth = 100;
-    gf_stream_wakeup();                 /* the live flag and one depth of pad slots */
+    gf_stream_wakeup();                 /* one depth of pad slots */
     rd_state = "underrun";
     ring_empty = true;
     ship_pass();
@@ -737,6 +841,8 @@ int main (void)
     ship_pass();
     CHECK(count_write("cnc/run=1") == 2 && gf.kernel_running && !gf.failed && !atomic_load(&fault_flag),
           "the next run start over exactly its own bytes starts: the dark pad is counted");
+    CHECK(count_write("cnc/streaming=1") == 2 && count_write("cnc/streaming=0") == 1,
+          "and each of the two streams wrote its own live flag, the first one's cleared at its end");
     ring_close();
 
     /* A stop another writer made after the previous stream ended leaves
@@ -784,8 +890,8 @@ int main (void)
         ring_close();
     }
 
-    /* An underrun at a run start is the retry's to answer: the previous
-     * stream's tail ran out under this stream's live flag. */
+    /* An underrun at a run start is the retry's to answer: the kernel
+     * still holds an underrun nothing has acknowledged. */
     reset_state();
     ring_open();
     rd_state = "underrun";
@@ -821,6 +927,183 @@ int main (void)
     ship_pass();
     CHECK(gf.failed && atomic_exchange(&fault_flag, false) && count_write("cnc/run=1") == 0,
           "and the next run start finds the residue: the stream faults, with no run");
+    ring_close();
+
+    printf("the preload and the live flag:\n");
+
+    /* Twelve short streams, each started while the kernel still plays
+     * the tail of the one before: the kernel plays 30 bytes between one
+     * stream's end and the next one's start. Each preload tops the
+     * kernel's queue up to one depth, so the queue stays near a depth
+     * however many restarts there are, and a stop has no more than that
+     * to play through. */
+    reset_state();
+    ring_open();
+    uint32_t deepest = 0;
+    for(int i = 0; i < 12; i++) {
+        gf_stream_wakeup();
+        ship_pass();                    /* the preload: what the queue is short of */
+        rd_state = "running";
+        gf.ship_t0 -= 0.02;             /* 20 more ticks are due */
+        ship_pass();
+        gf_stream_go_idle(false, 0, 0);
+        ship_pass();                    /* the stream's end */
+        uint32_t queued = ring_total() - k_processed;
+        if(queued > deepest)
+            deepest = queued;
+        k_processed += queued < 30 ? queued : 30;
+    }
+    CHECK(deepest < 2 * gf.depth && !gf.failed && count_write("cnc/run=1") == 1,
+          "a stream that starts while the kernel plays the last one's tail tops the queue up to "
+          "one depth: twelve restarts leave it no deeper");
+    ring_close();
+
+    /* The preload's size, for a kernel that still holds 0, 1, a depth
+     * less one, a depth, a depth and one, and five depths of the last
+     * stream: the pads shipped at the first pass bring the queue to one
+     * depth exactly, and a queue already a depth deep or more gets one
+     * pad, so the stream owns bytes in the kernel from its first pass. */
+    int pads = 0;
+    bool sized = true;
+    static const uint32_t tails[] = { 0, 1, 99, 100, 101, 500 };
+    for(unsigned i = 0; i < sizeof(tails) / sizeof(tails[0]); i++) {
+        reset_state();
+        ring_open();
+        gf.written = tails[i];          /* the ring took that many bytes, none played */
+        k_foreign = tails[i];
+        rd_state = tails[i] ? "running" : "idle";
+        gf_stream_wakeup();
+        ship_pass();
+        (void)lit_ticks(0, UINT32_MAX, &pads);
+        uint32_t want = tails[i] < gf.depth ? gf.depth - tails[i] : 1;
+        if((uint32_t)pads != want || !gf.kernel_running || gf.failed ||
+           gf.run_pending != (tails[i] != 0)) {
+            printf("  a tail of %u: %d pads shipped, %u wanted\n", (unsigned)tails[i], pads,
+                   (unsigned)want);
+            sized = false;
+        }
+        ring_close();
+    }
+    CHECK(sized, "a preload is a depth less what the kernel still holds, to the byte, and one pad "
+                 "for a queue a depth deep or more");
+
+    /* Byte counts that cannot be read ship the whole depth. */
+    reset_state();
+    ring_open();
+    gf.written = 40;
+    k_foreign = 40;
+    k_processed = 0;
+    rd_state = "running";
+    pos_fail = true;
+    gf_stream_wakeup();
+    ship_pass();
+    pos_fail = false;
+    (void)lit_ticks(0, UINT32_MAX, &pads);
+    CHECK(pads == (int)gf.depth && gf.kernel_running && !gf.failed,
+          "a preload whose byte counts cannot be read ships the whole depth");
+    ring_close();
+
+    /* The live flag is the shipper's, written once the run's first chunk
+     * is in the ring and before the run is asked for: a last stream's
+     * tail that ends between the wakeup and that chunk ends as a normal
+     * end, never as an underrun. */
+    reset_state();
+    ring_open();
+    live_at = 0;
+    gf_stream_wakeup();
+    bool early = find_write("cnc/streaming=1") >= 0;
+    ship_pass();
+    CHECK(!early && live_at > 0 && find_write("cnc/streaming=1") >= 0 &&
+          find_write("cnc/streaming=1") < find_write("cnc/run=1"),
+          "the live flag is written by the shipper once the run's first chunk is in the ring, "
+          "never at the wakeup");
+    ring_close();
+
+    /* A stream that ended with nothing more to ship writes no flag: its
+     * end of data is a normal end. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf_stream_go_idle(false, 0, 0);     /* ended before the shipper's first pass */
+    ship_pass();
+    CHECK(count_write("cnc/streaming=1") == 0 && count_write("cnc/run=1") == 1 && !gf.failed,
+          "a stream with no more bytes to give writes no live flag");
+    /* A second stream that starts before the shipper has ended that one
+     * takes its bytes over as a continuation, where no chunk is a run's
+     * first: it gets the flag at its own first chunk, once. */
+    gf_stream_wakeup();
+    bool taken_over = gf.kernel_running && gf.streaming;
+    rd_state = "running";
+    gf.ship_t0 -= 0.02;
+    ship_pass();
+    gf.ship_t0 -= 0.02;
+    ship_pass();
+    CHECK(taken_over && count_write("cnc/streaming=1") == 1 && !gf.failed,
+          "a stream that takes over bytes shipped with no live flag writes the flag at its own "
+          "first chunk, once");
+    ring_close();
+
+    /* A stream that ended before the shipper's first pass with a step
+     * still to ship past its preload is live until that step ships: the
+     * flag is written. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf.vticks = 5 * VTICKS_PER_BYTE;
+    gf_stream_pulse(0x01, 0x00);
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
+    CHECK(gf.shipped < gf.produced && count_write("cnc/streaming=1") == 1 && !gf.failed,
+          "an ended stream with bytes still to ship writes the live flag");
+    ring_close();
+
+    /* A reset that lands under the preload's count read, with a tail in
+     * the kernel: the pass ends there, and the stream the reset dropped
+     * keeps nothing of the count (no pad skipped, nothing shipped). */
+    reset_state();
+    ring_open();
+    gf.written = 40;
+    k_foreign = 40;
+    rd_state = "running";
+    gf_stream_wakeup();
+    on_pos_read = reset_lands_under_read;
+    ship_pass();
+    CHECK(on_pos_read == NULL && gf.shipped == 0 && gf.produced == 0 && ring_total() == 0 &&
+          !gf.kernel_running && count_write("cnc/run=1") == 0,
+          "a reset that lands under the preload's count read ends the pass with nothing shipped");
+    ring_close();
+
+    /* The preload's count is read with the stream's lock released: a
+     * fault that lands under the read ends the pass, and nothing of the
+     * failed stream ships. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    on_pos_read = fault_lands_under_read;
+    ship_pass();
+    CHECK(on_pos_read == NULL && gf.failed && ring_total() == 0 && !gf.kernel_running &&
+          count_write("cnc/run=1") == 0,
+          "a fault that lands under the preload's count read ships nothing of the stream");
+    ring_close();
+
+    /* A stream that fails under its first chunk's write (as one a reset
+     * ends there) gets no live flag: the reset that follows writes a 0,
+     * and a 1 behind it would stand at an idle kernel. The ring stand-in
+     * is full, so the write waits, and the fault lands at its state
+     * read. */
+    reset_state();
+    ring_open();
+    if(fcntl(gf.fd, F_SETFL, O_NONBLOCK) == 0) {
+        static const unsigned char fill[4096];
+        while(write(gf.fd, fill, sizeof(fill)) > 0) { /* fill the ring */ }
+    }
+    pos_fail = true;                    /* the count read would empty the stand-in */
+    gf_stream_wakeup();
+    on_state_read = fault_lands_under_write;
+    ship_pass();
+    CHECK(on_state_read == NULL && gf.failed && gf.kernel_running &&
+          count_write("cnc/streaming=1") == 0 && count_write("cnc/run=1") == 0,
+          "a stream that fails under its first chunk's write gets no live flag and no run");
     ring_close();
 
     printf("the mid-run check:\n");
@@ -1261,6 +1544,493 @@ int main (void)
     gf.fd = open("/dev/null", O_WRONLY);
     CHECK(pending_pass() && !gf.clear_pending && gf_stream_readback(owed, 0) == 0,
           "a failed stream's reset owes no read-back, and the residue clear still runs");
+    ring_close();
+
+    printf("the reset at rest:\n");
+
+    /* A reset after the stream ended, with the kernel still playing its
+     * tail: the stream shipped 6 steps of +X and ended, and the core
+     * went idle with all of them counted. The reset stops the kernel
+     * with its ramp, which plays 2 of them, and clears the rest: the
+     * core is owed the 4 that never played. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    for(int i = 0; i < 6; i++) {
+        gf.vticks = (uint64_t)i * VTICKS_PER_BYTE;
+        gf_stream_pulse(0x01, 0x00);
+    }
+    ship_pass();                        /* the preload, and the run start */
+    gf.ship_t0 -= 0.05;                 /* 50 more ticks are due: the steps */
+    ship_pass();
+    gf_stream_go_idle(false, 0, 0);     /* the core's own idle: the buffer ran dry */
+    ship_pass();                        /* the stream's end */
+    rd_state = "running";               /* the kernel plays the tail */
+    before = wr_n;
+    ended = !gf.kernel_running && !gf.streaming;
+    gf_stream_reset();
+    CHECK(ended && count_write_from("cnc/stop=1", before) == 1 && gf.clear_pending &&
+          gf.readback == RB_WAIT,
+          "a reset at rest stops a kernel that still plays the ended stream's tail");
+    rd_state = "idle";                  /* the ramp has ended */
+    k_pos[0] = 2;
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    cleared = pending_pass() && !gf.clear_pending;
+    rb = gf_stream_readback(owed, 0);
+    CHECK(cleared && rb == 1 && owed[0] == 4 && owed[1] == 0 && owed[2] == 0 &&
+          !atomic_load(&fault_flag) && !gf.failed,
+          "and the core is owed the steps of the tail that never played, with no fault raised");
+    ring_close();
+
+    /* The core was at rest and holds its position for true: a stopped
+     * tail whose steps cannot be read back is a stream fault, so the hook
+     * alarms and drops the reference. A reset during motion that cannot
+     * be read back raises none: the core counts that position lost
+     * itself. */
+    for(int i = 0; i < 2; i++) {
+        reset_state();
+        ring_open();
+        gf_stream_wakeup();
+        ship_pass();                    /* the preload, and the run start */
+        rd_state = "running";
+        if(i == 0) {
+            gf_stream_go_idle(false, 0, 0);
+            ship_pass();                /* the stream's end; the kernel plays the tail */
+        } else
+            gf_stream_go_idle(true, 0, 0);
+        gf_stream_reset();
+        rd_state = "idle";
+        pos_fail = true;
+        close(gf.fd);
+        gf.fd = open("/dev/null", O_WRONLY);
+        rb = pending_pass() ? gf_stream_readback(owed, 0) : 0;
+        CHECK(rb == -1 && atomic_exchange(&fault_flag, false) == (i == 0),
+              i == 0 ? "a tail stopped at rest that cannot be read back is a stream fault"
+                     : "and a reset during motion that cannot be read back raises none");
+        ring_close();
+    }
+
+    /* The same for the last of an ended stream that the shipper has not
+     * shipped yet: the reset drops it, and nothing of it plays after the
+     * reset. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf.vticks = 150 * VTICKS_PER_BYTE;
+    gf_stream_pulse(0x01, 0x00);        /* one X step */
+    slot = gf.produced - 1;
+    gf_stream_go_idle(false, 0, 0);     /* the stream ends before the shipper's first pass */
+    gf_stream_reset();
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    cleared = pending_pass() && !gf.clear_pending;
+    rb = gf_stream_readback(owed, 0);
+    CHECK(gf.ring[slot & RING_MASK] == 0 && gf.produced == gf.shipped && cleared && rb == 1 &&
+          owed[0] == 1,
+          "a reset at rest drops what an ended stream had not shipped, and the core is owed it");
+    ring_close();
+
+    /* And for an ended stream whose bytes are in the ring with the
+     * shipper's run request still to come: the kernel reads idle and
+     * nothing is unshipped, but the engine still owns bytes there, which
+     * a run would play after the reset. The reset lands in the run gate's
+     * state read, between the stream's first chunk and its run request:
+     * it stops and clears, and the shipper asks for no run behind the
+     * stop. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf_stream_go_idle(false, 0, 0);     /* ended before the shipper's first pass */
+    on_state_read = reset_lands_at_the_gate;
+    ship_pass();
+    CHECK(on_state_read == NULL && find_write("cnc/stop=1") >= 0 && gf.clear_pending &&
+          !gf.kernel_running && count_write("cnc/run=1") == 0 && !gf.run_pending && !gf.failed &&
+          !atomic_load(&fault_flag),
+          "a reset at rest between a stream's first chunk and its run request stops and clears, "
+          "and no run is asked for behind the stop");
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    cleared = pending_pass() && !gf.clear_pending && !atomic_load(&reset_stop);
+    CHECK(cleared, "and the clear lifts the order, so the next stream's run is asked for");
+    ring_close();
+
+    /* A kernel state that cannot be read is taken as playing: the stop,
+     * the clear and the read-back, which is made once the state reads
+     * again and is a stream fault while it does not. */
+    for(int i = 0; i < 2; i++) {
+        reset_state();
+        ring_open();
+        gf_stream_wakeup();
+        for(int s = 0; s < 6; s++) {
+            gf.vticks = (uint64_t)s * VTICKS_PER_BYTE;
+            gf_stream_pulse(0x01, 0x00);
+        }
+        ship_pass();                    /* the preload, and the run start */
+        gf.ship_t0 -= 0.05;
+        ship_pass();                    /* the steps */
+        gf_stream_go_idle(false, 0, 0);
+        ship_pass();                    /* the stream's end */
+        rd_state = "running";
+        state_fail_at = state_reads + 1;    /* the reset's read fails */
+        before = wr_n;
+        gf_stream_reset();
+        bool taken = count_write_from("cnc/stop=1", before) == 1 && gf.clear_pending &&
+                     gf.readback == RB_WAIT;
+        close(gf.fd);
+        gf.fd = open("/dev/null", O_WRONLY);
+        if(i == 0) {
+            rd_state = "idle";          /* the state reads again: the ramp has ended */
+            k_pos[0] = 2;
+            rb = pending_pass() ? gf_stream_readback(owed, 0) : 0;
+            CHECK(taken && rb == 1 && owed[0] == 4 && !atomic_load(&fault_flag),
+                  "a reset at rest that cannot read the kernel state stops, clears and reads back "
+                  "as for a kernel that plays");
+        } else {
+            state_fail_at = state_reads + 1;    /* and the clear's read fails too */
+            bool held = !pending_pass();
+            rb = gf_stream_readback(owed, 0);
+            CHECK(taken && held && rb == -1 && atomic_exchange(&fault_flag, false),
+                  "and a state that stays unreadable ends in the stream fault at the reset");
+        }
+        gf.clear_pending = false;
+        ring_close();
+    }
+
+    /* A kernel that reads underrun or fault under a stream the engine
+     * still owns stopped dead or faulted under bytes the core counted,
+     * and the shipper has not seen it. The reset raises the stream fault
+     * itself and reads nothing back from counters that are not to be
+     * trusted (the read-back answers that the position cannot be read
+     * back, so the sender is told): its stop, which would acknowledge the
+     * underrun, never passes for a stop of a kernel that played. Here the
+     * engine owns the stream by its backlog. */
+    static const char *const broken[] = { "underrun", "fault" };
+    for(int i = 0; i < 2; i++) {
+        reset_state();
+        ring_open();
+        gf_stream_wakeup();
+        for(int s = 0; s < 6; s++) {
+            gf.vticks = (uint64_t)s * VTICKS_PER_BYTE;
+            gf_stream_pulse(0x01, 0x00);
+        }
+        ship_pass();                    /* the preload, the live flag and the run */
+        rd_state = "running";
+        gf.ship_t0 -= 0.003;
+        ship_pass();                    /* three of the six steps ship */
+        rd_state = broken[i];           /* the kernel ran dry, or faulted, unseen */
+        k_pos[0] = 3;
+        gf_stream_go_idle(false, 0, 0); /* the core's move ends */
+        gf_stream_reset();              /* the soft reset, at rest */
+        bool cleared_after = gf.clear_pending && !gf.kernel_running && !gf.failed;
+        close(gf.fd);
+        gf.fd = open("/dev/null", O_WRONLY);
+        rd_state = "idle";
+        (void)pending_pass();
+        rb = gf_stream_readback(owed, 0);
+        CHECK(cleared_after && rb == -1 && atomic_exchange(&fault_flag, false),
+              i == 0 ? "a reset at rest over an underrun the shipper has not seen raises the stream "
+                       "fault and reads nothing back"
+                     : "and the same over a kernel fault");
+        ring_close();
+    }
+
+    /* The same for a stream the engine owns by its backlog alone: it
+     * ended before the shipper's first pass, under an underrun no stream
+     * of the engine's has seen. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf.vticks = 150 * VTICKS_PER_BYTE;
+    gf_stream_pulse(0x01, 0x00);        /* one X step */
+    gf_stream_go_idle(false, 0, 0);
+    ended = !gf.kernel_running && gf.produced > gf.shipped && !gf.streaming;
+    rd_state = "underrun";
+    gf_stream_reset();
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    rd_state = "idle";
+    (void)pending_pass();
+    rb = gf_stream_readback(owed, 0);
+    CHECK(ended && rb == -1 && atomic_exchange(&fault_flag, false),
+          "and the same for a stream owned by its backlog alone");
+    ring_close();
+
+    /* The same for a stream the engine owns by its run alone: it ended,
+     * every byte of it shipped, and the shipper's end pass has not run.
+     * The reset writes the stop and the live flag's 0. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    for(int s = 0; s < 6; s++) {
+        gf.vticks = (uint64_t)s * VTICKS_PER_BYTE;
+        gf_stream_pulse(0x01, 0x00);
+    }
+    ship_pass();                        /* the preload, the live flag and the run */
+    rd_state = "running";
+    gf.ship_t0 -= 0.2;                  /* everything is due */
+    ship_pass();
+    gf_stream_go_idle(false, 0, 0);     /* ended, before the shipper's end pass */
+    ended = gf.kernel_running && gf.produced <= gf.shipped && !gf.streaming;
+    rd_state = "underrun";
+    k_pos[0] = 3;
+    before = wr_n;
+    gf_stream_reset();
+    bool stop_and_flag = count_write_from("cnc/stop=1", before) == 1 &&
+                   count_write_from("cnc/streaming=0", before) == 1;
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    rd_state = "idle";
+    (void)pending_pass();
+    rb = gf_stream_readback(owed, 0);
+    CHECK(ended && stop_and_flag && rb == -1 && atomic_exchange(&fault_flag, false),
+          "and the same for a stream owned by its run alone, with the stop and the live flag's 0 "
+          "written");
+    ring_close();
+
+    /* And for a stream a reset during motion ended after the shipper's
+     * end pass, which wrote the flag's 0 and let the run go without
+     * reading the state, passed over an underrun on its last bytes. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf.vticks = 0;
+    gf_stream_pulse(0x01, 0x00);
+    ship_pass();
+    rd_state = "running";
+    gf.ship_t0 -= 0.2;
+    ship_pass();
+    gf_stream_go_idle(false, 0, 0);
+    rd_state = "underrun";              /* it ran dry before the end pass */
+    ship_pass();                        /* the end pass */
+    ended = !gf.kernel_running;
+    gf_stream_go_idle(true, 0, 0);      /* mc_reset: the core still counted a cycle */
+    gf_stream_reset();
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    rd_state = "idle";
+    (void)pending_pass();
+    rb = gf_stream_readback(owed, 0);
+    CHECK(ended && rb == -1 && atomic_exchange(&fault_flag, false),
+          "and the same for a stream a reset during motion ended");
+    ring_close();
+
+    /* The reset that acknowledges the shipper's own underrun alarm, with
+     * the kernel still in the underrun, raises no second alarm. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    rd_state = "underrun";
+    check_kernel_state();               /* the shipper's own alarm */
+    bool alarmed = gf.failed && atomic_exchange(&fault_flag, false);
+    gf_stream_go_idle(true, 0, 0);
+    gf_stream_reset();
+    CHECK(alarmed && !atomic_load(&fault_flag) && !gf.failed,
+          "the reset that acknowledges an underrun alarm raises no second one");
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    rd_state = "idle";
+    (void)pending_pass();
+    ring_close();
+
+    /* A reset that lands while the shipper's run request is in the
+     * kernel: its stop waits for the request (both are written under
+     * latch_mx), so it ends the run the request started and never lands
+     * inside the run start. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    gf_stream_go_idle(false, 0, 0);
+    on_run_write = reset_lands_in_the_run;
+    ship_pass();
+    pthread_join(reset_tid, NULL);
+    CHECK(stops_inside_the_run == 0 && count_write("cnc/run=1") == 1 &&
+          find_write("cnc/stop=1") > find_write("cnc/run=1"),
+          "a reset that lands while a run request is in the kernel writes its stop after it");
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    (void)pending_pass();
+    ring_close();
+
+    /* A clear that cannot run (the state cannot be read since the reset)
+     * holds a new stream's bytes. Inside the read-back's bound they wait;
+     * past it the stream is the stream fault, and nothing of it ships at
+     * whatever later moment the state reads again. With no stream behind
+     * it, the clear just waits. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    rd_state = "running";
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();                        /* the stream's end; the kernel plays the tail */
+    state_gone = true;                  /* no state from here on */
+    gf_stream_reset();                  /* taken as playing: the stop and the clear */
+    uint32_t took = ring_total();
+    gf.clear_at -= CLEAR_WAIT_S;
+    ship_pass();                        /* past the bound, no stream */
+    bool no_fault = !gf.failed && !atomic_load(&fault_flag);
+    gf.clear_at += CLEAR_WAIT_S;        /* back inside the bound */
+    gf_stream_wakeup();                 /* a new job */
+    ship_pass();
+    bool waited = gf.clear_pending && !gf.failed && !atomic_load(&fault_flag);
+    gf.clear_at -= CLEAR_WAIT_S;        /* the bound passes */
+    ship_pass();
+    CHECK(no_fault && waited && gf.failed && atomic_exchange(&fault_flag, false) &&
+          ring_total() == took && gf.shipped == 0,
+          "a clear that cannot run past the read-back's bound faults a new stream before a byte "
+          "of it ships");
+    state_gone = false;
+    gf.clear_pending = false;
+    ring_close();
+
+    /* The same for a kernel that still reads running past the bound: the
+     * new stream is the stream fault, and nothing of it ships. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    rd_state = "running";
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();                        /* the stream's end; the kernel plays the tail */
+    gf_stream_reset();                  /* the stop and the clear; the kernel keeps running */
+    uint32_t took_running = ring_total();
+    gf_stream_wakeup();                 /* a new job */
+    ship_pass();
+    bool waited_running = gf.clear_pending && !gf.failed && !atomic_load(&fault_flag);
+    gf.clear_at -= CLEAR_WAIT_S;        /* the bound passes */
+    ship_pass();
+    CHECK(waited_running && gf.failed && atomic_exchange(&fault_flag, false) &&
+          ring_total() == took_running && gf.shipped == 0,
+          "a kernel still running past the read-back's bound faults a new stream before a byte "
+          "of it ships");
+    gf.clear_pending = false;
+    rd_state = "idle";
+    ring_close();
+
+    /* A job whose producer ended inside the bound (its bytes all made,
+     * none shipped) is the stream fault past it. The fault is raised once,
+     * and a later reset keeps the clear's first time, so the next job in
+     * the same state faults on its first pass. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    rd_state = "running";
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();                        /* the stream's end; the kernel plays the tail */
+    state_gone = true;                  /* no state from here on */
+    gf_stream_reset();                  /* taken as playing: the stop and the clear */
+    uint32_t took_ended = ring_total();
+    gf_stream_wakeup();                 /* a short job, ended inside the bound */
+    gf.vticks = 0;
+    gf_stream_pulse(0x01, 0x00);
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
+    bool held_ended = !gf.streaming && gf.produced > gf.shipped && !gf.failed &&
+                      !atomic_load(&fault_flag);
+    gf.clear_at -= CLEAR_WAIT_S;        /* the bound passes */
+    ship_pass();
+    bool faulted_ended = gf.failed && atomic_exchange(&fault_flag, false);
+    CHECK(held_ended && faulted_ended && ring_total() == took_ended,
+          "a job whose producer ended inside the bound is the stream fault past it");
+    ship_pass();                        /* the next pass reports nothing */
+    CHECK(!atomic_load(&fault_flag), "the overdue clear raises the stream fault once");
+    double first_at = gf.clear_at;
+    gf_stream_reset();                  /* the reset that acknowledges the fault */
+    bool kept_first = gf.clear_at == first_at && gf.clear_pending;
+    gf_stream_wakeup();                 /* the next job */
+    ship_pass();
+    CHECK(kept_first && gf.failed && atomic_exchange(&fault_flag, false),
+          "a later reset keeps the clear's first time, so the next job faults on its first pass");
+    state_gone = false;
+    gf.clear_pending = false;
+    ring_close();
+
+    /* The states with nothing playing and nothing owned get nothing: an
+     * idle kernel, a disabled one, and an underrun or a fault that no
+     * stream of the engine's stands under (the next run start answers
+     * those). */
+    static const char *const quiet[] = { "idle", "disabled", "underrun", "fault" };
+    bool nothing = true;
+    for(int i = 0; i < 4; i++) {
+        reset_state();
+        rd_state = quiet[i];
+        gf_stream_reset();
+        if(wr_n != 0 || gf.clear_pending || gf.readback != RB_NONE || atomic_load(&fault_flag))
+            nothing = false;
+    }
+    CHECK(nothing, "a reset at rest with nothing playing and nothing owned writes nothing, in "
+                   "every kernel state that reads");
+
+    /* A device handed to another process is not the engine's to stop:
+     * with that process's run playing, or with a state that cannot be
+     * read, the reset writes nothing and orders no clear. */
+    for(int i = 0; i < 3; i++) {
+        reset_state();
+        gf.suspended = true;
+        gf.kernel_running = true;       /* whatever the engine's own record says */
+        rd_state = i == 2 ? "underrun" : "running";
+        if(i == 1)
+            state_fail_at = 1;
+        gf_stream_reset();
+        CHECK(wr_n == 0 && !gf.clear_pending && gf.readback == RB_NONE && !gf.failed &&
+              !atomic_load(&fault_flag),
+              i == 0 ? "a reset with the device handed over and its kernel running writes nothing"
+              : i == 1 ? "and the same when the kernel state cannot be read"
+                       : "and the same when it reads underrun");
+        gf.suspended = false;
+        gf.kernel_running = false;
+    }
+
+    /* A stream still live with no idle under the reset gets the stop
+     * while its run is the kernel's, and no read-back: its producer can
+     * still be armed. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    rd_state = "running";
+    before = wr_n;
+    gf_stream_reset();
+    CHECK(count_write_from("cnc/stop=1", before) == 1 && gf.clear_pending &&
+          gf.readback == RB_NONE,
+          "a reset over a live stream with no idle under it stops the kernel and owes no read-back");
+    /* The reset wrote the flag's 0: the next stream writes its own 1. */
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    rd_state = "idle";
+    cleared = pending_pass() && !gf.clear_pending;
+    before = wr_n;
+    gf_stream_wakeup();
+    ship_pass();
+    CHECK(cleared && count_write_from("cnc/streaming=1", before) == 1,
+          "and the stream after that reset writes its live flag again");
+    ring_close();
+
+    /* A failed stream that stopped shipping has a backlog, so the reset
+     * that acknowledges it is a reset at rest over a tail: it owes no
+     * read-back (the fault can have dropped steps the read-back cannot
+     * see) and raises no second alarm. */
+    reset_state();
+    ring_open();
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload, and the run start */
+    gf.vticks = 150 * VTICKS_PER_BYTE;
+    gf_stream_pulse(0x01, 0x00);        /* one X step, not yet due */
+    gf.failed = true;                   /* a stream fault, its alarm taken by the hook */
+    gf_stream_go_idle(false, 0, 0);
+    rd_state = "running";
+    gf_stream_reset();
+    close(gf.fd);
+    gf.fd = open("/dev/null", O_WRONLY);
+    rd_state = "idle";
+    pos_fail = true;                    /* a read-back, were one owed, would fail and alarm */
+    (void)pending_pass();
+    rb = gf_stream_readback(owed, 0);
+    CHECK(rb == 0 && !atomic_load(&fault_flag) && !gf.failed && !gf.clear_pending,
+          "a failed stream's reset at rest owes no read-back and raises no second alarm");
     ring_close();
 
     printf("the motor currents:\n");

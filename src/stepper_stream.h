@@ -130,8 +130,14 @@ bool gf_stream_latch_refused (void);
 // hal.driver_reset hook body. A reset that ends a live stream (a reset
 // during motion) drops the unshipped backlog and stops the kernel with
 // its ramp (cnc/stop); the residue that the ramp does not reach is
-// cleared once the kernel is idle. A reset after a stream fault
-// acknowledges the fault the same way. Call only when sys.reset_pending.
+// cleared once the kernel is idle. A reset at rest does the same for an
+// ended stream's tail that the kernel still plays or the shipper still
+// holds: a reset stops whatever plays, and a kernel state it cannot read
+// is taken as playing. A kernel that reads underrun or fault under a
+// stream the engine still owns is the stream fault, raised by the reset,
+// with nothing read back: the read-back answers -1. A reset after a
+// stream fault acknowledges the fault the same way. Call only when
+// sys.reset_pending.
 void gf_stream_reset (void);
 
 // The position read-back that gf_stream_reset owes the core after it
@@ -142,8 +148,11 @@ void gf_stream_reset (void);
 // residue, which the kernel's step counters (cnc/position) give. 1 with
 // steps filled in, 0 when nothing is owed, -1 when the position cannot be
 // read back (the counters or their base cannot be read, the clear did not
-// take or did not land in time, or a write failed under the reset). Call
-// on the protocol thread, after gf_stream_reset.
+// take or did not land in time, a write failed under the reset, or the
+// reset raised the stream fault over an underrun or a fault). A
+// read-back owed by a reset at rest that ends -1 also raises the stream
+// fault: the core was not in motion and does not count its position
+// lost. Call on the protocol thread, after gf_stream_reset.
 int gf_stream_readback (int32_t steps[3], uint32_t wait_ms);
 
 // Nonzero when the shipper hit an unrecoverable stream fault (underrun /

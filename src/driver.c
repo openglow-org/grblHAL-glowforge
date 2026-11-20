@@ -353,7 +353,8 @@ static void onSettingsChanged (settings_t *settings, settings_changed_flags_t ch
  * shipper clears on its 10 ms cadence. */
 #define READBACK_WAIT_MS 1000
 
-/* A reset during motion: the core counted steps that never played (the
+/* A reset during motion, or one at rest that stopped the tail of an
+ * ended stream: the core counted steps that never played (the
  * step of the pulse start that never came, the backlog that the reset
  * dropped, and the residue that the kernel's ramp did not reach). The
  * stream engine reads them back, the residue from the kernel's step
@@ -376,9 +377,21 @@ static void readback_position (void)
         fflog(LOG_INFO, "soft reset: the kernel ramped the motion down; the position drops "
               "%d %d %d steps that never played", (int)unplayed[X_AXIS],
               (int)unplayed[Y_AXIS], (int)unplayed[Z_AXIS]);
+    } else if(rc < 0 && sys.position_lost) {
+        /* A reset during motion: driverReset drops the reference and
+         * tells the sender. */
+        fflog(LOG_WARNING, "soft reset: the position cannot be read back from the kernel");
     } else if(rc < 0) {
-        fflog(LOG_WARNING, "soft reset: the position cannot be read back from the kernel; "
-              "the reference is dropped");
+        /* A reset at rest that stopped a tail it cannot read back, or
+         * that found the kernel in an underrun or a fault under a stream
+         * the engine still owned: the core does not count its position
+         * lost, and the stream engine has raised the stream fault, whose
+         * alarm drops the reference on the next pass. The sender gets the
+         * words here, as it does after a reset during motion. */
+        fflog(LOG_WARNING, "soft reset at rest: the position cannot be read back from the "
+              "kernel; the stream fault follows");
+        report_message("Soft reset: the position cannot be read back. Home before the "
+                       "coordinates are trusted.", Message_Warning);
     }
 }
 
