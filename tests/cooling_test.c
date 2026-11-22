@@ -28,7 +28,9 @@
   - the pause tier's lit deceleration is bounded: a hold the core did not
     take ends it and stops the job with a reset, and a hold that has not
     completed inside the longest stop the settings allow ends it too (at
-    the defaults, at the floors, and at the 60 s cap);
+    the defaults, at the floors, and at the 60 s cap), and it runs only
+    under a fresh verdict: a stale one's hold is dark, and a verdict gone
+    stale ends a lit deceleration for good;
   - outside the window a blocking verdict is neither tier;
   - every change of the armed bit is reported at once, whatever the
     sender's M8/M9 state;
@@ -88,8 +90,29 @@ static int offset_clock_gettime (clockid_t id, struct timespec *ts)
 }
 #define clock_gettime offset_clock_gettime
 
+/* A read of the verdict file that takes its time: when a case sets
+   slow_read, the next fopen moves the clock on 20 ms and records what the
+   stepper producer would see from gfcool_decel_lit() while the read is
+   under way. */
+#include <stdio.h>
+static int slow_read;
+static int seen_during_read = -1;
+static FILE *slow_fopen (const char *path, const char *mode);
+#define fopen slow_fopen
+
 /* --- driver source under test ---------------------------------------- */
 #include "../src/glowforge_cooling.c"
+
+#undef fopen
+static FILE *slow_fopen (const char *path, const char *mode)
+{
+    if(slow_read) {
+        slow_read = 0;
+        clock_offset_ms += 20;
+        seen_during_read = gfcool_decel_lit();
+    }
+    return fopen(path, mode);
+}
 
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 system_t sys;
@@ -380,9 +403,13 @@ int main (void)
         gfcool_poll();
         cur_state = STATE_HOLD;
         sys.holding_state = Hold_Pending;   /* decelerating, and it stays that way */
-        clock_offset_ms += bounds[i].bound_ms - 50;
-        publish(false, "OVERTEMP", true, false, true, 0.0);
-        gfcool_poll();
+        /* The engine publishes every second and the client polls far more
+           often, so the verdict stays fresh all the way to the bound. */
+        for(long long left = bounds[i].bound_ms - 50; left > 0; left -= 1000) {
+            clock_offset_ms += left < 1000 ? left : 1000;
+            publish(false, "OVERTEMP", true, false, true, 0.0);
+            gfcool_poll();
+        }
         char msg[128];
         snprintf(msg, sizeof(msg), "%s: the gate stays open 50 ms inside the %lld ms bound",
                  bounds[i].what, bounds[i].bound_ms);
@@ -567,6 +594,59 @@ int main (void)
     publish(true, "OK", false, true, true, 0.0);
     gfcool_poll();
     CHECK(enqueued(CMD_CYCLE_START) && !hold_ours && !pause_said, "the restored engine resumes");
+
+    /* A stale verdict vouches for nothing: its hold over a cut in
+       progress runs dark, and a verdict that comes back fresh but
+       blocking while the head still slows down does not relight it. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(true, "OK", false, true, true, 3.0);
+    gfcool_poll();
+    CHECK(enqueued(CMD_FEED_HOLD) && !gfcool_decel_lit(), "a stale verdict's hold over a cut runs dark");
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Pending;
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(!gfcool_decel_lit(), "a fresh pause verdict after it does not relight the deceleration");
+    /* A lit deceleration whose verdict expired between two polls, with no
+       reader in between (an M3 cut, whose segments send no update), stays
+       dark when the next poll is the read that brings back a fresh, still
+       blocking verdict: the poll ends it before it reads. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(gfcool_decel_lit(), "a fresh pause verdict over a cut decelerates lit");
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Pending;
+    atomic_store(&v_fresh_until_ms, mono_ms64() - 1);  /* expired, and nothing reads it before the poll */
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(!gfcool_decel_lit(), "and the read poll that brings a blocking verdict back fresh does not relight it");
+    /* The cache expires inside the read poll itself, after its freshness
+       check and before the read stores the new deadline: the producer sees
+       the deceleration dark during the read, and the read that brings the
+       blocking verdict back fresh does not relight it. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(gfcool_decel_lit(), "a fresh pause verdict over a cut decelerates lit again");
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Pending;
+    atomic_store(&v_fresh_until_ms, mono_ms64() + 10);     /* fresh for 10 ms more */
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    slow_read = 1;
+    gfcool_poll();
+    CHECK(seen_during_read == 0, "the verdict gone stale ends the lit deceleration at once, mid-read");
+    CHECK(!gfcool_decel_lit(), "a deceleration the producer saw dark during the read is not relit by that read");
+    clock_offset_ms = 0;
 
     /* A verdict stamped ahead of the reader's clock is no verdict, as a
        stale one is: fire stays blocked and the job is held. The cache

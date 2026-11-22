@@ -840,8 +840,8 @@ int main(void)
     spindleUpdatePWM(NULL, 60);
     CHECK(rpm_unknown == 1, "a segment's update on the producer leaves the cache as the core recorded it");
 
-    /* Case I3 - the per-segment gate reads the verdict alone, as the
-       per-tick gate does: inside the open window a fresh verdict with
+    /* Case I3 - the per-segment gate reads the verdict, not the
+       acknowledgment, as the per-tick gate does: inside the open window a fresh verdict with
        fire_ok and the engine's acknowledgment withdrawn (one low fan
        tick) lets a segment fire, and a verdict that blocks fire strips
        it. The acknowledgment gated the window's opening only. */
@@ -857,6 +857,14 @@ int main(void)
     spindleUpdatePWM(NULL, 60);
     CHECK(!stream_fire_last && atomic_load(&suppressed) == Suppress_Coolant,
           "a verdict that blocks fire strips the segment's fire");
+    /* The pause tier's lit deceleration holds the per-segment gate open
+       as it holds the per-tick gate: an M4 ramp cuts to the stop. */
+    decel_lit_val = true;
+    atomic_store(&suppressed, Suppress_None);
+    spindleUpdatePWM(NULL, 60);
+    CHECK(stream_fire_last && atomic_load(&suppressed) == Suppress_None,
+          "the lit deceleration lets a segment fire under the pause tier");
+    decel_lit_val = false;
     verdict_fire_ok_val = true;
     atomic_store(&suppressed, Suppress_None);
     on_producer = false;

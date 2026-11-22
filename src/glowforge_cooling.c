@@ -47,12 +47,14 @@
     the window closes, the latch locks, the job is reset with ALARM:3,
     and nothing resumes it. Every other fire_ok=false verdict, and a
     stale one, is a pause: this client holds the job and keeps the
-    window, and the stream engine masks FIRE on every tick from the
-    same verdict from the moment the head has stopped (the first
-    deceleration runs lit, as a feed hold's does: the segments already
-    planned at speed would otherwise play dark and leave a gap in the
-    cut, while the kernel's queue plays its 200 ms of lit bytes either
-    way). That lit deceleration is bounded: it ends when the head has
+    window, and the stream engine masks FIRE on every tick and every
+    segment from the same verdict from the moment the head has stopped
+    (under a fresh verdict the first deceleration runs lit, in M3 and M4
+    alike, as a feed hold's does: the segments already planned at speed
+    would otherwise play dark and leave a gap in the cut, while the
+    kernel's queue plays its 200 ms of lit bytes either way). A stale
+    verdict vouches for nothing: fire is stripped at once and its
+    deceleration runs dark. That lit deceleration is bounded: it ends when the head has
     stopped, when the core did not take the hold, or after the longest
     stop the settings allow, whichever comes first. A ~ or a press under
     the standing verdict is refused, the job held. resume_ok with fire_ok
@@ -196,6 +198,8 @@ static bool jog_warned = false;
 static bool fallback_done = false;
 static bool stale_warned = false;
 
+static bool verdict_fresh (void);
+
 static uint32_t next_report_ms = 0;
 static uint32_t next_verdict_ms = 0;
 static int http_port = 80;
@@ -285,15 +289,17 @@ static void hold_take (bool stale)
         warn(stale ? "cooling service lost - job held again"
                    : "cooling hold stands - job held again; reset the job");
     }
-    /* The first hold of the episode decelerates lit, where the verdict
-     * met a cut in progress: this cycle has run under a verdict that
-     * allowed fire. A hold taken again under the standing verdict (after
-     * a ~ or a press) does not, and neither does the hold of a cycle that
-     * started under the verdict (the job sat at Idle, in a dwell or
-     * between two lines, or in the sender's own hold, when the verdict
-     * turned): there is no cut in progress to finish, and its first move
-     * stays dark. */
-    if(!hold_ours && cycle_ok) {
+    /* The first hold of the episode decelerates lit, where a fresh
+     * verdict met a cut in progress: this cycle has run under a verdict
+     * that allowed fire. A hold taken again under the standing verdict
+     * (after a ~ or a press) does not, and neither does the hold of a
+     * cycle that started under the verdict (the job sat at Idle, in a
+     * dwell or between two lines, or in the sender's own hold, when the
+     * verdict turned): there is no cut in progress to finish, and its
+     * first move stays dark. Nor does the hold of a stale verdict: with
+     * the engine gone nothing vouches for the airflow, so fire is
+     * stripped at once and the deceleration runs dark. */
+    if(!hold_ours && cycle_ok && !stale) {
         decel_lit = true;
         decel_until_ms = mono_ms64() + decel_budget_ms();
     }
@@ -322,9 +328,21 @@ static void decel_track (sys_state_t st)
         decel_lit = false;
 }
 
+/* Read on the stepper producer thread too, between two polls: a verdict
+ * that goes stale there ends the lit deceleration on its own clock, as
+ * it closes gfcool_verdict_fire_ok(), and for good: a reader that finds
+ * the verdict stale clears the flag, and so does every poll that finds the
+ * cache expired before it reads the file (gfcool_poll), so no verdict read
+ * after the expiry relights it, even one the producer saw stale while the
+ * read was under way. A new lit deceleration is begun only by hold_take,
+ * under a fresh verdict. */
 bool gfcool_decel_lit (void)
 {
-    return decel_lit;
+    if(!verdict_fresh()) {
+        atomic_store_explicit(&decel_lit, false, memory_order_relaxed);
+        return false;
+    }
+    return atomic_load_explicit(&decel_lit, memory_order_relaxed);
 }
 
 /* ------------------------------------------------------- job reports */
@@ -690,7 +708,12 @@ void gfcool_poll (void)
      * between reads. The verdict is enforced on EVERY poll from the
      * cached flags: a cache that expires between two reads closes the
      * fire gate on its own clock, and the hold must land in that same
-     * tick, or the head cuts dark until the next read. */
+     * tick, or the head cuts dark until the next read. A cache that
+     * expired since the last poll ends a lit deceleration before the read,
+     * so the read that brings back a fresh, still blocking verdict does
+     * not relight it. */
+    if(!verdict_fresh())
+        decel_lit = false;
     if(read_now) {
         next_verdict_ms = now + 500;
         verdict_read();
@@ -728,7 +751,8 @@ void gfcool_poll (void)
 
         if(!fresh) {
             /* No verdict: fire is blocked (freshness), motion holds,
-             * and an armed window gets the fallback airflow. */
+             * and an armed window gets the fallback airflow (a lit
+             * deceleration ended at the top of this poll). */
             if(laser_on_window || coolant_reported.flood) {
                 if(!stale_warned) {
                     stale_warned = true;

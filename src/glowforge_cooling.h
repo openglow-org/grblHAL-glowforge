@@ -49,9 +49,11 @@ bool gfcool_verdict_fire_ok (void);
 
 // True while the pause tier's first hold is still decelerating: the
 // fire gate stays open through it, so the pause leaves no dark gap in
-// the cut (the kernel's queue plays its lit bytes either way). False
-// once the head has stopped, and for every hold taken again under the
-// standing verdict.
+// the cut (the kernel's queue plays its lit bytes either way). The
+// per-tick fire gate and the per-segment laser update both read it,
+// so M3 and M4 cut alike to the stop. False once the head has stopped,
+// for every hold taken again under the standing verdict, and whenever
+// the verdict is stale: a stale verdict's hold runs dark.
 bool gfcool_decel_lit (void);
 
 // True once the engine has answered the armed window this client

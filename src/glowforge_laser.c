@@ -545,7 +545,8 @@ static bool latch_lock (bool lock)
 
 /* The per-tick fire gate the stream engine masks FIRE with: the window
  * and the verdict's own fire_ok, held open through the pause tier's
- * first deceleration so a pause leaves no gap in the cut. The cooling
+ * first deceleration under a fresh verdict so a pause leaves no gap in
+ * the cut (the per-segment update reads the same input). The cooling
  * client bounds that deceleration: it ends when the head has stopped,
  * when the core did not take the hold, or after the longest stop the
  * settings allow. Published on every poll and on every arm and disarm. */
@@ -1642,10 +1643,12 @@ static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
         fire = false;
         pwm = spindle_pwm.off_value;
         suppressed = Suppress_Unarmed;
-    } else if(fire && !gfcool_verdict_fire_ok()) {
-        /* The verdict alone, as the per-tick gate: the acknowledgment
-         * gated the window's opening, and inside the window it gates
-         * nothing (glowforge_cooling.h). */
+    } else if(fire && !(gfcool_verdict_fire_ok() || gfcool_decel_lit())) {
+        /* The per-tick gate's own verdict input: the verdict alone, held
+         * open through the pause tier's lit deceleration under a fresh
+         * verdict, so an M4 ramp's per-segment updates cut to the stop as
+         * an M3 cut does. The acknowledgment gated the window's opening,
+         * and inside the window it gates nothing (glowforge_cooling.h). */
         fire = false;
         pwm = spindle_pwm.off_value;
         suppressed = Suppress_Coolant;
