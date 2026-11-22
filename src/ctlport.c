@@ -14,7 +14,12 @@
                       "sender_out":false,"tray":"in"}
                      mcode is the M-code a job waits at, while one does:
                      {"seq":n,"code":160,"words":{"P":1}} (glowforge_mcode.c)
-    jog <words>      ok | error:<n> | busy:<why>     <words> is the tail of a $J= line
+    jog <words>      ok | error:<n> | busy:<why>     <words> is the tail of a $J= line;
+                                                     busy:armed while the laser's window is
+                                                     open or an arm waits (a job's next cut
+                                                     would start where the jog left the head),
+                                                     busy:sender while a line of the sender's
+                                                     waits or runs, or for 0.3 s after its last
     cancel           ok
 
   and, for the machine daemon's own panel only (no package capability maps
@@ -29,11 +34,15 @@
                                                      for, and answers once the head has
                                                      stopped. Every other $H is a session
                                                      that belongs to the sender.
+                     The three take the jog's sender checks (busy:sender), and
+                     busy:mcode while a job waits at a package's M-code.
     envelope open|apply
                      ok | error:homed | busy:state   the bed check's: X's and Y's far edges
                                                      opened to the travel plus 30 mm, or set
                                                      from envelope_x_mm and _y again. An open
-                                                     envelope is the port's jogs' alone: the
+                                                     envelope is the port's jogs' alone: it is
+                                                     opened under the jog's sender checks
+                                                     (busy:sender), the
                                                      sender's lines wait while it is open, as
                                                      during a port jog, and the first one
                                                      closes it before the core reads it
@@ -78,6 +87,10 @@
   characters a jog needs.
   The one g-code line it forms besides is the tray op's M103 P0 or P1,
   which moves nothing and carries no laser word.
+
+  Each reply goes to the client that asked: a client that hangs up with a
+  line outstanding gets none, a client that connects meanwhile gets none
+  of it, and a jog the gone client asked for is canceled as it starts.
 
   The sender always wins, but for "sender out", which the daemon asks for
   only on an idle machine and only for an extension package the operator
@@ -156,6 +169,8 @@ static char deferred[sizeof(req) + 4];  /* a line waiting for the ring to empty,
 static bool deferred_jog;
 static double deferred_until;
 static int tray_want = -1;          /* the injected line is a tray switch to this mode (1 out), else -1 */
+static bool asker_gone = false;     /* the client that asked for the outstanding line has gone */
+static bool orphan_jog = false;     /* the port jog in progress is a gone client's: canceled */
 
 static double now_s (void)
 {
@@ -179,9 +194,18 @@ static void drop_port_client (void)
         port_fd = -1;
         req_len = 0;
         deferred[0] = '\0';
+        /* A line still outstanding was this client's: its reply goes to
+         * no one, and a jog it asked for is canceled once it starts
+         * (line_done), whoever connects meanwhile. */
+        asker_gone = awaiting;
         cancel_port_jog();          /* the client is the dead-man */
         gfhome_envelope_close();    /* and the bed check's envelope is its own */
     }
+}
+
+bool ctlport_port_jog (void)
+{
+    return port_jog;
 }
 
 static void reply (const char *line)
@@ -201,6 +225,18 @@ static void line_done (int status)
 
     awaiting = false;
     tray_want = -1;
+    if(asker_gone) {
+        /* The asker has gone: no reply, to it or to a client that came
+         * since, and a jog it asked for is canceled, its dead-man gone. */
+        asker_gone = false;
+        if(status == Status_OK && awaiting_jog) {
+            port_jog = orphan_jog = true;
+            cancel_sent = false;
+            serial_hold_sender(true);
+            cancel_port_jog();
+        }
+        return;
+    }
     if(status == Status_OK && tray >= 0)
         reply(gftray_out() == (tray == 1) ? "ok\n" : "error:saved\n");
     else if(status == Status_OK && !awaiting_jog)
@@ -303,6 +339,19 @@ static void op_mcode_result (const char *args)
     reply(gfmcode_answer((unsigned)seq, ok, text) == 0 ? "ok\n" : "error:stale\n");
 }
 
+/* The sender has the machine: a byte of its own waiting, a line of its
+ * running (a dwell, a button wait, an M-code wait, a camera home), or its
+ * last line less than SENDER_QUIET_S ago. Replies busy:sender then. */
+static bool sender_busy (void)
+{
+    if(serial_sender_pending() || serial_sender_line_open() ||
+       (serial_sender_last_line() > 0 && now_s() - serial_sender_last_line() < SENDER_QUIET_S)) {
+        reply("busy:sender\n");
+        return true;
+    }
+    return false;
+}
+
 static void op_jog (const char *words)
 {
     char line[sizeof(req) + 4];
@@ -333,30 +382,40 @@ static void op_jog (const char *words)
         reply("busy:state\n");      /* a program, a hold, an alarm, or the sender's own jog */
         return;
     }
-    if(serial_sender_pending() || (serial_sender_last_line() > 0 &&
-                                   now_s() - serial_sender_last_line() < SENDER_QUIET_S)) {
-        reply("busy:sender\n");
+    /* A laser job can sit at Idle with its window open (a dwell, a stalled
+     * sender, the grace after its last move), or wait for its press or its
+     * acknowledgment: a jog there would move the head under the job's
+     * next cut. */
+    if(gflaser_armed() || gflaser_arming()) {
+        reply("busy:armed\n");
         return;
     }
+    if(sender_busy())
+        return;
 
     snprintf(line, sizeof(line), "$J=%s", words);
     inject(line, true);
 }
 
 /* The panel-only operations: a $ command that moves nothing, but for a
- * manual home's jog to the origin, which ends before the command answers. */
+ * manual home's jog to the origin, which ends before the command answers.
+ * They take the jog's sender checks, and never run inside a job waiting
+ * at a package's M-code: the injected line would wait out the job's hold
+ * and run inside it. */
 static void op_command (const char *line)
 {
     sys_state_t state = state_get();
 
+    if(gfmcode_waiting()) {
+        reply("busy:mcode\n");
+        return;
+    }
     if(!(state == STATE_IDLE || state == STATE_ALARM)) {
         reply("busy:state\n");
         return;
     }
-    if(serial_sender_pending()) {
-        reply("busy:sender\n");
+    if(sender_busy())
         return;
-    }
     inject(line, false);
 }
 
@@ -401,10 +460,8 @@ static void op_tray (const char *mode)
         reply("busy:state\n");
         return;
     }
-    if(serial_sender_pending()) {
-        reply("busy:sender\n");
+    if(sender_busy())
         return;
-    }
     tray_want = want;
     inject(want ? "M103 P1" : "M103 P0", false);
 }
@@ -436,7 +493,13 @@ static void handle_request (char *line)
     else if(!strcmp(line, "home"))
         op_home();
     else if(!strcmp(line, "envelope open") || !strcmp(line, "envelope apply")) {
-        int rc = gfhome_envelope(line[9] == 'o');
+        bool open = line[9] == 'o';
+        /* An open envelope is the port's jogs' alone: it takes the jog's
+         * sender checks (the poll then holds the sender's lines while it
+         * is open). */
+        if(open && sender_busy())
+            return;
+        int rc = gfhome_envelope(open);
         reply(rc == 0 ? "ok\n" : rc == -1 ? "error:homed\n" : "busy:state\n");
     } else if(!strncmp(line, "tray ", 5))
         op_tray(line + 5);
@@ -463,9 +526,9 @@ void ctlport_poll (void)
      * before that cancels the jog: the sender always wins. */
     if(port_jog && !awaiting) {
         if(state_get() != STATE_JOG) {
-            port_jog = false;
+            port_jog = orphan_jog = false;
             serial_hold_sender(false);
-        } else if(serial_sender_pending())
+        } else if(serial_sender_pending() || orphan_jog)
             cancel_port_jog();
     }
 

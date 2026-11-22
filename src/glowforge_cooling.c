@@ -187,6 +187,7 @@ static uint64_t decel_until_ms;
 #define DECEL_MARGIN_MS 500
 
 static bool hold_ours = false;
+static bool op_held = false;            /* the operator held this cycle: the client claims no hold while it stands */
 static bool cycle_ok = false;           /* this cycle has run under a verdict that allowed fire */
 static bool hold_asked = false;         /* a feed hold was asked for in this cycle */
 static uint8_t hold_misses = 0;         /* requests the core executed with the job still in its cycle */
@@ -204,6 +205,29 @@ static uint32_t next_report_ms = 0;
 static uint32_t next_verdict_ms = 0;
 static int http_port = 80;
 static char report_secret[33];      /* from the supervisor, at the spawn; empty when there is none */
+
+/* The window's own acknowledgment. Every change of the reported armed bit
+ * is a new window, numbered by win_gen (protocol thread), and the change
+ * clears the cached acknowledgment. The reporter records the number of the
+ * newest report the engine answered (rep_answered_gen). The engine takes
+ * the acknowledgment off its file before it answers a report that closes
+ * a window or opens one, so a verdict read that begins after the window's
+ * own report was answered can carry that window's acknowledgment, and one
+ * that began before cannot: verdict_read stores armed as false for it. */
+static unsigned win_gen;
+static _Atomic unsigned rep_answered_gen;
+/* When the engine last answered a report (CLOCK_MONOTONIC ms): a window
+ * whose reports go unanswered for REPORT_STALE_MS is ended by the laser
+ * module (gfcool_report_stale), before the engine's own silence bound
+ * (5 s) lets the extension host read the window closed. */
+static _Atomic uint64_t rep_answered_ms;
+#define REPORT_STALE_MS 3000
+/* A host harness that publishes its own verdicts (the GF_VERDICT_FILE test
+ * hook, honored only in a null-sink run) stands in for the engine, and
+ * runs no listener for the reports unless a case needs one: there a
+ * refused report counts as answered. With GFSINK set, as on a machine,
+ * only the engine's 200 answers a report. */
+static bool harness_engine;
 
 static uint64_t mono_ms64 (void)
 {
@@ -299,12 +323,33 @@ static void hold_take (bool stale)
      * first move stays dark. Nor does the hold of a stale verdict: with
      * the engine gone nothing vouches for the airflow, so fire is
      * stripped at once and the deceleration runs dark. */
+    /* The operator held this cycle (gfcool_operator_hold): the hold is
+     * theirs. The client asks for it all the same, and claims nothing: no
+     * lit deceleration of its own, no resume at the clear. A poll that runs
+     * before the core has acted on either hold (a write to a full transmit
+     * ring runs the real-time hook inside the core's own pass) cannot take
+     * the hold back. */
+    if(op_held) {
+        protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+        return;
+    }
     if(!hold_ours && cycle_ok && !stale) {
         decel_lit = true;
         decel_until_ms = mono_ms64() + decel_budget_ms();
     }
     hold_ours = true;
     protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+}
+
+void gfcool_operator_hold (void)
+{
+    op_held = true;
+    if(!hold_ours)
+        return;
+    hold_ours = false;
+    report_message("feed hold - the job stays held when the cooling verdict clears; resume with ~",
+                   Message_Info);
+    fflog(LOG_INFO, "gfcool: the operator's feed hold - the clean verdict resumes nothing");
 }
 
 /* The lit deceleration ends when the head has stopped, when the job has
@@ -317,6 +362,7 @@ static void decel_track (sys_state_t st)
     if(st != STATE_CYCLE) {
         hold_asked = hold_refused = false;
         hold_misses = 0;
+        op_held = false;            /* held now, or a cycle no longer: the next cycle is a new episode */
     }
     if(!decel_lit)
         return;
@@ -347,16 +393,28 @@ bool gfcool_decel_lit (void)
 
 /* ------------------------------------------------------- job reports */
 
-/* One fire-and-forget POST, on the reporter thread only. localhost:
+/* Whether a report was answered: the engine's status line says 200 (it
+ * answers only once it has taken the report, its withdrawal of the
+ * acknowledgment included). A refused connection is an answer only to a
+ * harness that stands in for the engine with no listener (harness_engine). */
+static bool report_answered (bool refused, const char *resp, ssize_t n)
+{
+    if(refused)
+        return harness_engine;
+    return n >= 12 && !strncmp(resp, "HTTP/1.", 7) && !strncmp(resp + 8, " 200", 4);
+}
+
+/* One POST, on the reporter thread only. localhost:
  * connection refused returns immediately when forgectrl is down. The
  * connect is non-blocking and bounded by poll - SO_SNDTIMEO does not
  * cover connect(), and a wedged listener (full accept backlog) blocks
- * a plain connect through minutes of SYN retries. */
-static void report_send (const char *mode, bool armed, bool density)
+ * a plain connect through minutes of SYN retries. True when the engine
+ * answered it (report_answered). */
+static bool report_send (const char *mode, bool armed, bool density)
 {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if(fd < 0)
-        return;
+        return false;
 
     struct timeval tv = { 0, REPORT_TIMEOUT_MS * 1000 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -368,13 +426,18 @@ static void report_send (const char *mode, bool armed, bool density)
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     bool up = connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+    bool refused = !up && errno == ECONNREFUSED;
+    bool answered = false;
     if(!up && errno == EINPROGRESS) {
         struct pollfd pfd = { .fd = fd, .events = POLLOUT };
         int err = 0;
         socklen_t el = sizeof(err);
         up = poll(&pfd, 1, REPORT_TIMEOUT_MS) == 1 &&
               getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0;
+        refused = !up && err == ECONNREFUSED;
     }
+    if(refused)
+        answered = report_answered(true, NULL, 0);
     if(up) {
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
         char req[288], who[64] = "";
@@ -387,10 +450,12 @@ static void report_send (const char *mode, bool armed, bool density)
             density ? "density" : "analog", who);
         if(n > 0 && n < (int)sizeof(req) && write(fd, req, (size_t)n) == n) {
             char resp[128];
-            (void)!read(fd, resp, sizeof(resp));    /* let the ack land */
+            ssize_t got = read(fd, resp, sizeof(resp));     /* the engine's answer */
+            answered = report_answered(false, resp, got);
         }
     }
     close(fd);
+    return answered;
 }
 
 /* Reporter thread: report_send can still block for the socket timeouts,
@@ -404,13 +469,14 @@ static pthread_cond_t rep_cv = PTHREAD_COND_INITIALIZER;
 static char rep_mode[12] = "idle";
 static bool rep_armed = false;
 static bool rep_density = true;     /* the dose model in force at the report */
+static unsigned rep_gen = 0;        /* the window the report speaks for (win_gen) */
 static unsigned rep_seq = 0;
 
 static void *reporter_thread (void *arg)
 {
     (void)arg;
 
-    unsigned seen = 0;
+    unsigned seen = 0, gen;
     char mode[12];
     bool armed, density;
 
@@ -422,9 +488,13 @@ static void *reporter_thread (void *arg)
         strcpy(mode, rep_mode);
         armed = rep_armed;
         density = rep_density;
+        gen = rep_gen;
         pthread_mutex_unlock(&rep_mx);
 
-        report_send(mode, armed, density);
+        if(report_send(mode, armed, density)) {
+            atomic_store(&rep_answered_gen, gen);
+            atomic_store(&rep_answered_ms, mono_ms64());
+        }
 
         pthread_mutex_lock(&rep_mx);
     }
@@ -455,6 +525,7 @@ static void report_now (void)
     rep_mode[sizeof(rep_mode) - 1] = '\0';
     rep_armed = laser_on_window;
     rep_density = gflaser_density();
+    rep_gen = win_gen;
     rep_seq++;
     pthread_cond_signal(&rep_cv);
     pthread_mutex_unlock(&rep_mx);
@@ -517,6 +588,11 @@ static void json_str (const char *body, const char *key, char *out, size_t len)
 static void verdict_read (void)
 {
     char body[1024];
+    /* Taken before the file is opened: a read that began before the
+     * window's own report was answered carries no acknowledgment for it.
+     * The window changes on this thread only, so it cannot change under
+     * the read. */
+    bool own_window = atomic_load(&rep_answered_gen) == win_gen;
     FILE *f = fopen(verdict_file, "r");
     if(!f)
         return;
@@ -544,7 +620,7 @@ static void verdict_read (void)
     atomic_store_explicit(&v_hold, json_bool(body, "hold", true), memory_order_relaxed);
     atomic_store_explicit(&v_resume_ok, json_bool(body, "resume_ok", false), memory_order_relaxed);
     atomic_store_explicit(&v_fire_ok, json_bool(body, "fire_ok", false), memory_order_relaxed);
-    atomic_store_explicit(&v_armed, json_bool(body, "armed", false), memory_order_relaxed);
+    atomic_store_explicit(&v_armed, own_window && json_bool(body, "armed", false), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
     json_str(body, "verdict", v_name, sizeof(v_name));
     /* Absent reads as false, as ack_wait does: fire_ok carries the block. */
@@ -588,8 +664,10 @@ void gfcool_init (void)
     if(v && atoi(v) > 0 && atoi(v) < 65536)
         http_port = atoi(v);
     const char *vf = gfio_test_hook("GF_VERDICT_FILE");
-    if(vf && *vf)
+    harness_engine = vf && *vf;
+    if(harness_engine)
         verdict_file = vf;
+    atomic_store(&rep_answered_ms, mono_ms64());
     /* The report secret: 32 hex digits or nothing (it goes into a header
      * as it is). Out of the environment once read: nothing this process
      * starts inherits it, and the homing runner, which reports in this
@@ -641,6 +719,11 @@ void gfcool_laser_armed (bool armed)
         return;
     bool was = coolant_reported.flood || laser_on_window;
     laser_on_window = armed;
+    /* A new window: the acknowledgment read for the last one is not its
+     * own, and only a verdict read begun after this window's report was
+     * answered can give it one (verdict_read). */
+    win_gen++;
+    atomic_store_explicit(&v_armed, false, memory_order_relaxed);
     if(!was && (coolant_reported.flood || armed))
         was_run = true;
     /* Every change of the armed bit is reported at once, whatever the
@@ -691,6 +774,11 @@ bool gfcool_run_ack (void)
 {
     return verdict_fresh() &&
             atomic_load_explicit(&v_armed, memory_order_relaxed);
+}
+
+bool gfcool_report_stale (void)
+{
+    return mono_ms64() - atomic_load(&rep_answered_ms) > REPORT_STALE_MS;
 }
 
 bool gfcool_hold_stands (void)

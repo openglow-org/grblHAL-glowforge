@@ -62,6 +62,17 @@ bool gfcool_decel_lit (void);
 // the verdict on file answers the idle session that preceded the arm -
 // so the arm waits on this before it lets the gate above decide.
 bool gfcool_run_ack (void);
+// The acknowledgment is the window's own: every change of the reported
+// armed bit clears it, and it is taken again only from a verdict read
+// begun after the engine answered that window's report (the engine takes
+// the acknowledgment off its file before it answers a report that closes
+// a window or opens one).
+
+// True when the engine has answered no report for 3 s: the reporter is
+// stalled, or the engine is not taking reports. The laser module ends an
+// open window on it (glowforge_laser.c), before the engine's own silence
+// bound (5 s) lets the extension host read the window closed.
+bool gfcool_report_stale (void);
 
 // A failure waits for the operator's Acknowledge on the control panel: a
 // fresh verdict whose ack_wait field is true, or whose name is ACK (the
@@ -92,3 +103,10 @@ void gfcool_laser_armed (bool armed);
 // CRITICAL) and a stale verdict end the job. False for both of those,
 // and for a verdict that lets the laser fire.
 bool gfcool_hold_stands (void);
+
+// The operator's feed hold (the sender's ! or 0x82, the button's pause):
+// a hold this client took becomes the operator's, and for the rest of the
+// cycle the client claims none (a poll that runs before the core acts on
+// the hold included), so the verdict that clears resumes nothing (the job
+// stays held until the operator's ~ or press).
+void gfcool_operator_hold (void);

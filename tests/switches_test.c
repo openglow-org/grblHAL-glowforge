@@ -26,6 +26,9 @@
   null-sink run: with GFSINK set and no switch device, there is no
   switch source, and the laser arm has no button to read.
 
+  A lid or loop that opens while the laser's window is open closes the
+  window, at Idle too; a cancel is pending until its reset has landed.
+
   And a press in a hold that the laser module's resume gate takes: it
   says the job re-arms before it resumes only when the gate started a
   re-arm.
@@ -70,7 +73,9 @@ static int  disarms;
 static int  log_errs;               /* lines logged at LOG_ERR */
 
 bool gf_stream_kernel_idle (void) { return kernel_idle_val; }
-void gflaser_disarm (void) { disarms++; }
+static bool armed_val;                  /* gflaser_armed(): the laser's window is open */
+void gflaser_disarm (void) { disarms++; armed_val = false; }
+bool gflaser_armed (void) { return armed_val; }
 
 /* The switch device, faked for the reopen case: open() of FAKE_DEV gives a
    descriptor, EVIOCGNAME answers dev_name, and EVIOCGSW answers dev_word or
@@ -123,6 +128,8 @@ static int test_ioctl (int fd, unsigned long req, ...)
 static bool gate_takes, gate_rearms, arming_val;
 bool gflaser_arming (void) { return arming_val; }
 bool gflaser_resume_gate (void) { arming_val = gate_takes && gate_rearms; return gate_takes; }
+static int operator_holds;              /* gfcool_operator_hold(): the operator's pause */
+void gfcool_operator_hold (void) { operator_holds++; }
 int  gfio_conf_read (const char *k, char *v, size_t n) { (void)k; (void)v; (void)n; return -1; }
 void fflog (int prio, const char *fmt, ...) { if(prio == LOG_ERR) log_errs++; (void)fmt; }
 
@@ -197,6 +204,17 @@ int main (void)
     gfsw_init();
     CHECK(gfsw_available(), "the file-backed switch source is available");
 
+    printf("a press in a cycle is the operator's pause:\n");
+
+    /* A press in a cycle is a pause, and the operator's: a cooling hold
+       asked for in the same pass becomes theirs, and the verdict that
+       clears resumes nothing. */
+    feed_holds = operator_holds = 0;
+    button_edge(STATE_CYCLE);
+    CHECK(feed_holds == 1 && operator_holds == 1,
+          "a press in a cycle holds the job, and the hold is the operator's");
+    feed_holds = 0;
+
     printf("a press in a hold that the laser module's resume gate takes:\n");
 
     /* The gate took the resume and refused it (its own words say why):
@@ -205,15 +223,46 @@ int main (void)
     gate_takes = true;
     gate_rearms = false;
     last_message[0] = '\0';
+    operator_holds = 0;
     button_edge(STATE_HOLD);
     CHECK(last_message[0] == '\0' && cycle_starts == 0,
           "a resume the gate refused gets no re-arm notice and no cycle start");
+    CHECK(operator_holds == 0, "a press in a hold is a resume, never the operator's pause: the cooling hold stays the client's");
     gate_rearms = true;
     arming_val = false;
     button_edge(STATE_HOLD);
     CHECK(strstr(last_message, "re-arms before it resumes") != NULL && cycle_starts == 0,
           "a resume the gate re-arms says the job re-arms before it resumes");
     gate_takes = gate_rearms = arming_val = false;
+
+    printf("a lid or loop that opens closes an open laser window, at Idle too:\n");
+
+    /* The lid sets the hardware button latch, which only a press clears;
+       the loop is the lockout engaged. Either closes the window, once; with
+       the window closed an opening closes nothing. */
+    cur_state = STATE_IDLE;
+    {
+        int d0 = disarms;
+        armed_val = true;
+        write_word(path, 0);                        /* the lid open */
+        gfsw_poll();
+        CHECK(disarms == d0 + 1 && strstr(last_message, "lid opened - the laser window closed") != NULL,
+              "the lid opening closes the open window");
+        write_word(path, 1u << SW_BIT_DOORS);
+        gfsw_poll();
+        armed_val = true;
+        write_word(path, (1u << SW_BIT_DOORS) | (1u << SW_BIT_INTERLOCK));     /* the loop open, the lid closed */
+        gfsw_poll();
+        CHECK(disarms == d0 + 2 && strstr(last_message, "interlock open - the laser window closed") != NULL,
+              "the loop opening closes the open window");
+        armed_val = false;
+        write_word(path, 0);
+        gfsw_poll();
+        CHECK(disarms == d0 + 2, "with the window closed an opening closes nothing");
+        write_word(path, 1u << SW_BIT_DOORS);
+        gfsw_poll();
+        disarms = d0;                               /* the cases below count from here */
+    }
 
     printf("a cancel in flight under a failed switch read:\n");
 
@@ -231,6 +280,7 @@ int main (void)
     gfsw_poll();
     CHECK(resets_requested == 1, "the cancel sent its reset on the poll whose switch read failed");
     CHECK(cancel_state == Cancel_ResetSent, "the cancel moved on to waiting for the reset");
+    CHECK(gfsw_cancel_pending(), "a cancel waiting for its reset is still pending (a resume is dropped)");
 
     /* The reset lands, the core is idle, and the park is enqueued: the
        cancel keeps running without a single successful read. */
@@ -240,6 +290,7 @@ int main (void)
     gfsw_poll();
     CHECK(parks_enqueued == 1 && cancel_state == Cancel_ParkQueued,
           "the return to the job start is enqueued on a poll whose switch read failed");
+    CHECK(!gfsw_cancel_pending(), "the return to the job start is no pending cancel");
 
     printf("a switch device that stops answering:\n");
 

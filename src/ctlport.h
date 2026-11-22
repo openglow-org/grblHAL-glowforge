@@ -9,6 +9,7 @@
 #pragma once
 
 #include <poll.h>
+#include <stdbool.h>
 
 // Creates the port's socket and hooks the stream's line multiplexer. From
 // driver setup, after the core's report handlers are in place.
@@ -19,3 +20,5 @@ void ctlport_poll (void);
 
 // Adds the port's fds (at most two) to the stream's poll set. Returns how many.
 unsigned ctlport_pollfds (struct pollfd *fds);
+// True while the jog in progress is the port's (its client is its dead-man).
+bool ctlport_port_jog (void);

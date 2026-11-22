@@ -107,18 +107,41 @@ void serial_set_listen_fd (int fd)
 }
 
 static void serialRxFlush (void);
+static void serialRxCancel (void);
 
-/* A displaced or dropped sender takes its partial line with it: the next
- * sender's first line must never be glued to a fragment of the last. */
+/* The status of a line the displaced sender was running is that sender's,
+ * not the next one's: swallowed when it comes (inject_status_message).
+ * Cleared by the core's own flush at a reset, which ends the line with no
+ * status. */
+static bool orphan_status = false;
+
+/* A displaced or dropped sender takes what it had under way with it. Its
+ * partial line: the core may hold a fragment of it in its own line buffer,
+ * which an end of line from the next sender would run, so the core is
+ * handed a cancel (ASCII_CAN, which clears that buffer and cancels a jog
+ * in progress, the sender's jog with it; a port jog is the port client's,
+ * and is left to it) instead of a plain flush. Its
+ * motion: a running cycle is held, so no job runs on without its sender
+ * (a cycle start resumes it). The status of a line it was running is
+ * swallowed. Only flags and the ring are touched here: this can run
+ * inside a blocked write. The transmit ring is the next sender's from its
+ * welcome on (rx_poll). */
 static void drop_client (void)
 {
     if(client_fd >= 0) {
+        bool line_open = sender_line_open;
         close(client_fd);
         client_fd = -1;
         client_loopback = false;
         client_peer[0] = '\0';
         client_generation++;
-        serialRxFlush();
+        if(read_midline || (state_get() == STATE_JOG && !ctlport_port_jog()))
+            serialRxCancel();
+        else
+            serialRxFlush();
+        orphan_status = line_open;
+        if(state_get() == STATE_CYCLE)
+            enqueue_realtime_command(CMD_FEED_HOLD);
     }
 }
 
@@ -174,7 +197,7 @@ static int32_t serialGetC (void)
     bool injected = inj_left > 0;
     data = (int32_t)rxbuffer.data[bptr++];          // Get next character, increment tmp pointer
     rxbuffer.tail = bptr & (RX_BUFFER_SIZE - 1);    // and update pointer
-    read_midline = !is_eol((uint8_t)data);
+    read_midline = !is_eol((uint8_t)data) && data != ASCII_CAN;    // the core clears its line at a cancel
     if(!injected && read_midline)
         sender_line_open = true;                    // its status clears it
 
@@ -214,6 +237,7 @@ static void serialRxFlush (void)
     sender_midline = false;
     read_midline = false;               // the core flushes its line buffer on the same occasions
     sender_line_open = false;           // and a line whose run was aborted gets no status
+    orphan_status = false;
 
     /* An injected line goes with the rest, and its source is told. A line
      * whose run was aborted gets no status from the core, and the core
@@ -355,8 +379,19 @@ static void rx_byte (uint8_t data)
     if((data == CMD_CYCLE_START_LEGACY || data == CMD_CYCLE_START) && gflaser_resume_gate())
         return;                             // a held laser job re-arms first; the gate issues the start
 
-    if(enqueue_realtime_command(data))
+    if((data == CMD_FEED_HOLD_LEGACY || data == CMD_FEED_HOLD) && gflaser_feed_hold_cancels_arm())
+        return;                             // a feed hold during an arm's wait is the arm's
+
+    if(enqueue_realtime_command(data)) {
+        /* The operator's pause, only for a hold byte the core took as one
+         * (a '!' it keeps as text, in a comment or a $ line with $39 off,
+         * is no pause): in a held job the hold wins over a pending cycle
+         * start, and a cooling hold asked for in the same pass is the
+         * operator's. Both are flags the core reads at its next pass. */
+        if(data == CMD_FEED_HOLD_LEGACY || data == CMD_FEED_HOLD)
+            gflaser_operator_hold();
         return;                             // real-time: never queued, never dropped
+    }
 
     /* A sender that ignores flow control (Bf: is the contract) has
      * overrun the ring. The line that overran is dropped WHOLE: what
@@ -422,6 +457,16 @@ static status_code_t inject_status_message (status_code_t status)
     }
 
     sender_line_open = false;
+    /* The line the displaced sender was running ends: its status is not
+     * the newcomer's, which would pair it with its own first line and run
+     * one line early from then on, and neither is its error, which the
+     * core would hold against the newcomer's next line. Its message lines
+     * still go out. */
+    if(orphan_status) {
+        orphan_status = false;
+        gc_state.last_error = Status_OK;
+        return status;
+    }
     return status_message_chain(status);
 }
 
@@ -572,11 +617,12 @@ bool serial_drop_sender (void)
 bool serial_sender_pending (void)
 {
     /* The sender's bytes are the ones behind an injected line. End-of-line
-     * bytes alone are empty lines, and no claim on the machine. */
+     * bytes alone are empty lines, and no claim on the machine; neither is
+     * the cancel a dropped sender left (drop_client). */
     uint_fast16_t p = (rxbuffer.tail + inj_left) & (RX_BUFFER_SIZE - 1);
 
     while(p != rxbuffer.head) {
-        if(!is_eol(rxbuffer.data[p]))
+        if(!is_eol(rxbuffer.data[p]) && rxbuffer.data[p] != ASCII_CAN)
             return true;
         p = (p + 1) & (RX_BUFFER_SIZE - 1);
     }

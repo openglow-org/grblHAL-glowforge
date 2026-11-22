@@ -38,7 +38,12 @@
     engine's acknowledgment of the window, which gfcool_fire_ok() still
     waits on;
   - GF_VERDICT_FILE moves the verdict file only in a null-sink run: with
-    GFSINK set the client reads the engine's file.
+    GFSINK set the client reads the engine's file;
+  - the acknowledgment is the window's own: a change of the window clears
+    it at once, and a verdict read gives it again only when it began after
+    the engine answered that window's report (its 200; a refused report
+    answers only a harness that publishes its own verdicts);
+  - no report answered for 3 s reads as a stale reporter.
 */
 #include <stdbool.h>
 #include <stddef.h>
@@ -77,12 +82,18 @@ void fflog (int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
 
 /* The client's clock, and the test's: CLOCK_MONOTONIC moved on by
    clock_offset_ms, so a case can stand at an uptime the host does not
-   have. Zero for every case but the one that sets it. */
+   have. Zero for every case but the one that sets it. A case that sets
+   clock_frozen stands the monotonic clock at clock_base: only the case's
+   own steps move it, however long the host takes between them. */
 #include <time.h>
 static long long clock_offset_ms;
+static int clock_frozen;
+static struct timespec clock_base;
 static int offset_clock_gettime (clockid_t id, struct timespec *ts)
 {
     int r = clock_gettime(id, ts);
+    if(clock_frozen && id == CLOCK_MONOTONIC)
+        *ts = clock_base;
     long long ns = (long long)ts->tv_sec * 1000000000LL + ts->tv_nsec + clock_offset_ms * 1000000LL;
     ts->tv_sec = (time_t)(ns / 1000000000LL);
     ts->tv_nsec = (long)(ns % 1000000000LL);
@@ -205,7 +216,7 @@ static void reset_state (void)
     cur_state = STATE_IDLE;
     memset(&sys, 0, sizeof(sys));
     armed_val = false;
-    hold_ours = hold_asked = hold_refused = cycle_ok = false;
+    hold_ours = hold_asked = hold_refused = cycle_ok = op_held = false;
     hold_misses = 0;
     rehold_said = stale_warned = fallback_done = pause_said = false;
     atomic_store(&decel_lit, false);
@@ -235,6 +246,8 @@ int main (void)
     setenv("GFSINK", "/dev/glowforge", 1);
     gfcool_init();
     CHECK(!strcmp(verdict_file, VERDICT_FILE), "with GFSINK set, the client reads the engine's verdict file");
+    CHECK(!harness_engine && !report_answered(true, NULL, 0),
+          "with GFSINK set, a refused report answers nothing");
     unsetenv("GFSINK");
     gfcool_init();                      /* a null-sink run: the cases below publish to verdict_path */
 
@@ -389,6 +402,8 @@ int main (void)
     };
     for(int i = 0; i < 3; i++) {
         reset_state();
+        clock_gettime(CLOCK_MONOTONIC, &clock_base);
+        clock_frozen = 1;               /* the bound is judged on the case's clock alone */
         memset(&settings, 0, sizeof(settings));
         settings.axis[X_AXIS].max_rate = 12000.0f;
         settings.axis[Y_AXIS].max_rate = 12000.0f;
@@ -420,6 +435,7 @@ int main (void)
         snprintf(msg, sizeof(msg), "%s: 50 ms past it, a hold that has not completed no longer holds it open",
                  bounds[i].what);
         CHECK(!gfcool_decel_lit(), msg);
+        clock_frozen = 0;
     }
 
     /* A verdict that clears while the hold still decelerates: the core
@@ -442,6 +458,136 @@ int main (void)
     gfcool_poll();
     CHECK(enqueued(CMD_CYCLE_START) && !hold_ours && strstr(all_messages, "resuming"),
           "once the hold completes, the client resumes it");
+    /* The operator's own feed hold inside the client's hold: the hold is
+     * the operator's, and the verdict that clears resumes nothing. */
+    hold_ours = true;
+    ncmds = 0;
+    all_messages[0] = '\0';
+    gfcool_operator_hold();
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();
+    CHECK(!enqueued(CMD_CYCLE_START) && !hold_ours && !strstr(all_messages, "resuming") &&
+          strstr(all_messages, "resume with ~"),
+          "after the operator's own feed hold the clean verdict resumes nothing");
+    /* The same while the client's hold still decelerates, and in the pass
+     * where the client asked for its hold and the core has not taken it
+     * yet (the job still in its cycle). */
+    for (int when = 0; when < 2; when++) {
+        cur_state = when ? STATE_CYCLE : STATE_HOLD;
+        sys.holding_state = when ? Hold_NotHolding : Hold_Pending;
+        hold_ours = true;
+        sys.rt_exec_state = when ? EXEC_FEED_HOLD : 0;     /* the client's request, not yet taken */
+        gfcool_operator_hold();
+        sys.rt_exec_state = 0;
+        cur_state = STATE_HOLD;
+        sys.holding_state = Hold_Complete;
+        ncmds = 0;
+        publish(true, "OK", false, true, true, 0.0);
+        gfcool_poll();
+        CHECK(!enqueued(CMD_CYCLE_START) && !hold_ours,
+              when ? "a feed hold before the core took the client's hold is the operator's: no resume"
+                   : "a feed hold during the client's lit deceleration is the operator's: no resume");
+    }
+
+    /* The operator's ! in the client's pass, then a poll that runs again
+     * before the core acts on the hold (a status report written to a full
+     * transmit ring runs the hook between the core's take and its act): the
+     * hold stays the operator's, and the clear resumes nothing. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();                      /* the client's pass: hold_take, the claim */
+    gfcool_operator_hold();             /* the operator's ! in the same pass */
+    sys.rt_exec_state = 0;              /* the core took the request, the job still in its cycle */
+    gfcool_poll();                      /* the pass run inside the core's status write */
+    int reclaimed = hold_ours;
+    cur_state = STATE_HOLD;             /* the core acts on the hold */
+    sys.holding_state = Hold_Complete;
+    ncmds = 0;
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();
+    CHECK(!reclaimed && !enqueued(CMD_CYCLE_START),
+          "a poll before the core acts on the hold takes no claim back from the operator's !: no resume");
+    /* The operator's hold ends with that hold: the cycle the operator
+     * resumes is a new one, and a verdict's hold in it is the client's. */
+    cur_state = STATE_CYCLE;
+    sys.holding_state = Hold_NotHolding;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(hold_ours, "in the cycle the operator resumed, a verdict's hold is the client's again");
+    /* The operator's ! first (the job in its cycle, no claim yet), then,
+     * before the core has acted on it, a poll that reads a pause-tier
+     * verdict (a hook pass run by a blocked write): no claim. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    gfcool_operator_hold();             /* the operator's !, the core not yet in its hold */
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();                      /* still Cycle: hold_take claims it */
+    int claimed2 = hold_ours;
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Complete;
+    ncmds = 0;
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();
+    CHECK(!claimed2 && !enqueued(CMD_CYCLE_START),
+          "an operator's ! the core has not acted on, then the verdict: the client claims nothing, no resume");
+
+    /* The same after a cut run clean (a lit deceleration would be due):
+     * the client asks for the hold all the same, claims none, and starts
+     * no lit deceleration of its own. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();                      /* a cut in progress under a clean verdict */
+    gfcool_operator_hold();             /* the operator's !, the core not yet in its hold */
+    ncmds = 0;
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(enqueued(CMD_FEED_HOLD) && !hold_ours && !gfcool_decel_lit(),
+          "after the operator's !, the client asks for the hold, claims none, and lights no deceleration");
+
+    /* Under the operator's hold too, a hold the core does not take ends
+     * at the second miss with the reset. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    gfcool_operator_hold();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    ncmds = 0;
+    gfcool_poll();                      /* asks */
+    sys.rt_exec_state = 0;
+    gfcool_poll();                      /* the core executed it, the job still in its cycle: a miss */
+    sys.rt_exec_state = 0;
+    gfcool_poll();                      /* the second: the reset */
+    CHECK(enqueued(CMD_RESET), "a hold the core does not take ends with the reset under the operator's hold too");
+
+    /* A fail-tier verdict (EMISSION) inside a cooling hold the operator
+     * made theirs ends the job, as in a cycle, and nothing resumes it. */
+    reset_state();
+    armed_val = true;
+    laser_on_window = true;
+    cut_in_progress();
+    publish(false, "OVERTEMP", true, false, true, 0.0);
+    gfcool_poll();
+    cur_state = STATE_HOLD;
+    sys.holding_state = Hold_Complete;
+    gfcool_operator_hold();
+    publish(false, "EMISSION", true, false, true, 0.0);
+    gfcool_poll();
+    CHECK(fail_calls == 1 && !strcmp(fail_name, "EMISSION"),
+          "EMISSION inside the operator's cooling hold is the fail tier");
+    ncmds = 0;
+    publish(true, "OK", false, true, true, 0.0);
+    gfcool_poll();
+    CHECK(!enqueued(CMD_CYCLE_START), "and nothing resumes it after");
 
     /* A fault that waits for its Acknowledge: the cause gone, the verdict
      * ACK (fire blocked, no hold, resume_ok): the held job stays held, and
@@ -737,6 +883,48 @@ int main (void)
     clock_offset_ms += 5000;
     CHECK(!verdict_fresh() && !gfcool_verdict_fire_ok(), "past 2^32 ms, 5 s on, it is stale");
     clock_offset_ms = 0;
+
+    printf("the acknowledgment is the window's own, and an unanswered reporter is seen:\n");
+
+    /* The engine's answer is its 200; a refused connection answers only a
+       harness that stands in for the engine. Off for the cases below, so
+       the reporter thread's own sends (to a port that refuses) answer
+       nothing while they run. */
+    CHECK(report_answered(false, "HTTP/1.1 200 OK\r\n", 17) &&
+          !report_answered(false, "HTTP/1.1 403 Forbidden\r\n", 24) &&
+          !report_answered(false, "", -1), "only the engine's 200 answers a report");
+    CHECK(report_answered(true, NULL, 0) == harness_engine && harness_engine,
+          "a refused report answers the harness that publishes its own verdicts");
+    harness_engine = false;
+    CHECK(!report_answered(true, NULL, 0), "and nothing else");
+    {
+        struct timespec settle = { 0, 100 * 1000000L };
+        nanosleep(&settle, NULL);       /* a send already under way ends */
+    }
+
+    /* A window's change clears the acknowledgment read for the last one at
+       once, and a read gives it again only once it began after the engine
+       answered this window's report. */
+    reset_state();
+    publish(true, "OK", false, true, true, 0.0);
+    atomic_store(&rep_answered_gen, win_gen);
+    verdict_read();
+    gfcool_laser_armed(true);
+    CHECK(!gfcool_run_ack(), "a window that opens has no acknowledgment of the last");
+    verdict_read();
+    CHECK(!gfcool_run_ack(), "a read begun before its report was answered gives none");
+    atomic_store(&rep_answered_gen, win_gen);
+    verdict_read();
+    CHECK(gfcool_run_ack() && gfcool_fire_ok(), "a read begun after it was answered gives it");
+    gfcool_laser_armed(false);
+    CHECK(!gfcool_run_ack(), "the close takes it off at once");
+
+    /* No report answered for 3 s: the reporter reads stale. */
+    atomic_store(&rep_answered_ms, mono_ms64() - REPORT_STALE_MS - 1);
+    CHECK(gfcool_report_stale(), "no report answered for 3 s reads stale");
+    atomic_store(&rep_answered_ms, mono_ms64());
+    CHECK(!gfcool_report_stale(), "an answered report reads fresh");
+    harness_engine = true;
 
     unlink(verdict_path);
     printf(failures ? "FAIL: %d check(s) failed\n"

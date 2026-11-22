@@ -108,6 +108,7 @@
 #include "glowforge_switch_map.h"
 #include "glowforge_io.h"
 #include "glowforge_laser.h"
+#include "glowforge_cooling.h"
 #include "stepper_stream.h"
 
 #include "grbl/hal.h"
@@ -183,6 +184,11 @@ static double wall_s (void)
 bool gfsw_available (void)
 {
     return sw_fd >= 0 || fake_path != NULL;
+}
+
+bool gfsw_cancel_pending (void)
+{
+    return cancel_state == Cancel_WaitDrain || cancel_state == Cancel_ResetSent;
 }
 
 /* Reads the raw EV_SW word (EVIOCGSW layout, SW_BYTES bytes). Returns
@@ -368,6 +374,7 @@ static void button_edge (sys_state_t st)
         return;                     /* that press is the arm's consent */
 
     if(st == STATE_CYCLE) {
+        gfcool_operator_hold();     /* the operator's pause: a cooling hold asked in this pass is theirs */
         protocol_enqueue_realtime_command(CMD_FEED_HOLD);
         report_message("button pressed - job paused", Message_Info);
     } else if(st == STATE_HOLD) {
@@ -574,6 +581,24 @@ void gfsw_poll (void)
         if(button && !button_prev)
             button_edge(st);
         button_prev = button;
+
+        /* A lid or loop that opens while the laser's window is open
+         * closes the window, in every state, the ones the door is hidden
+         * in included: the lid sets the hardware button latch, which only
+         * a press clears, so a window left open over it would let the
+         * next job, or the rest of this one, run dark with no word; an
+         * open loop is the lockout engaged, which ends a job as the lid
+         * does. The closed window asks for the press at the next laser-on
+         * or resume. */
+        bool lid_open = !gfsw_bit_set(raw, SW_BIT_DOORS);
+        if(gflaser_armed() && (lid_open || gfsw_bit_set(raw, SW_BIT_INTERLOCK))) {
+            report_message(lid_open ? "lid opened - the laser window closed; the next fire asks for the button"
+                                    : "interlock open - the laser window closed; the next fire asks for the button",
+                           Message_Warning);
+            fflog(LOG_NOTICE, "gfswitch: %s open with the laser window open - window closed",
+                  lid_open ? "lid" : "interlock loop");
+            gflaser_disarm();
+        }
     }
 
     /* What the core should currently see as asserted, given its state

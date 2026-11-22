@@ -38,6 +38,12 @@
   waiting in the ring, a job at an M-code, the arm waiting for the press)
   the newcomer is refused with a message line and the session stands;
   and a sender that closed and reconnects at once is no second sender.
+  A sender that goes takes what it had under way: a fragment the core
+  read is canceled (ASCII_CAN ahead of the next sender's bytes, no claim
+  on the machine), its own jog is canceled and a port jog left alone, a
+  running cycle is held, and the status of a line it was running is
+  swallowed with its error (a reset in between ends that line with no
+  status). A feed hold byte during the arm's wait goes to the arm.
 
   Keeping senders out: a peer on this host is told from one on the
   network by its address, the dual-stack socket's mapped IPv4 included;
@@ -86,9 +92,17 @@
 
 static int realtime_seen;           /* bytes taken by the real-time path */
 static int door_seen;               /* door bytes that reached the core */
+static int holds_enqueued;          /* CMD_FEED_HOLD (0x82) */
+static bool bang_is_text;           /* the core keeps a '!' as text ($39 off, in a comment) */
 
 bool protocol_enqueue_realtime_command(uint8_t c)
 {
+    if(c == '!' && bang_is_text)
+        return false;
+    if(c == 0x82) {
+        holds_enqueued++;
+        return true;
+    }
     if(c == '?' || c == '!' || c == '~' || c == 0x18) {
         realtime_seen++;
         return true;
@@ -114,6 +128,13 @@ void gflaser_input_poll(void)
 struct pollfd;
 void ctlport_poll(void) {}                          /* no controller port here */
 unsigned ctlport_pollfds(struct pollfd *fds) { (void)fds; return 0; }
+static bool port_jog_val;                           /* ctlport_port_jog(): the jog is the port's */
+bool ctlport_port_jog(void) { return port_jog_val; }
+static int hold_cancels;                            /* gflaser_feed_hold_cancels_arm() took the byte */
+static bool arm_waiting;                            /* the first arm waits */
+bool gflaser_feed_hold_cancels_arm(void) { if(arm_waiting) hold_cancels++; return arm_waiting; }
+static int operator_holds;                          /* gflaser_operator_hold(): a hold byte the core took, before its next pass */
+void gflaser_operator_hold(void) { operator_holds++; }
 
 /* --- driver source under test ---------------------------------------- */
 #include "../src/serial.c"
@@ -270,6 +291,8 @@ static bool loopback_text(const char *text)
 }
 
 static status_code_t fake_status(status_code_t status) { return status; }
+static int status_seen;                 /* statuses that went on to the sender */
+static status_code_t count_status(status_code_t status) { status_seen++; return status; }
 
 /* Bytes serialPutC accepted; a drop ends the count. */
 static int put_bytes(int n)
@@ -730,6 +753,123 @@ int main(void)
     CHECK(serial_sender_line_open(), "a line the core began is open");
     serialRxFlush();
     CHECK(!serial_sender_line_open(), "a flush closes a line that will get no status");
+
+    /* --- a sender that goes takes what it had under way ----------------- */
+    printf("A sender that goes takes its partial line, its jog, its cycle and its line's status:\n");
+    {
+        int pair[2];
+        /* A fragment the core has read into its own line buffer: the core
+           is handed a cancel ahead of anything the next sender sends, and
+           the cancel is no claim on the machine. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        stub_state = STATE_IDLE;
+        serialRxFlush();
+        push("G0 X3");
+        while(serialGetC() != SERIAL_NO_DATA)
+            ;
+        unsigned gen = serial_client_generation();
+        drop_client();
+        CHECK(serial_client_generation() == gen + 1 && !serial_sender_pending(),
+              "the drop is a new generation, and the cancel it leaves claims nothing");
+        push("\n");
+        CHECK(serialGetC() == ASCII_CAN && serialGetC() == '\n', "the core reads the cancel before the next sender's bytes");
+        close(pair[1]);
+        /* No fragment, at rest: a plain flush. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        serialRxFlush();
+        drop_client();
+        CHECK(serialGetC() == SERIAL_NO_DATA, "with nothing under way the core is handed nothing");
+        close(pair[1]);
+        /* The sender's own jog: canceled; a port jog is the port client's. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        stub_state = STATE_JOG;
+        drop_client();
+        CHECK(serialGetC() == ASCII_CAN, "the sender's jog is canceled");
+        close(pair[1]);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        port_jog_val = true;
+        drop_client();
+        CHECK(serialGetC() == SERIAL_NO_DATA, "a port jog is left to the port");
+        port_jog_val = false;
+        close(pair[1]);
+        /* A running cycle is held. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        stub_state = STATE_CYCLE;
+        int h0 = holds_enqueued;
+        drop_client();
+        CHECK(holds_enqueued == h0 + 1, "a running cycle is held");
+        close(pair[1]);
+        /* The line the sender was running ends after it has gone: its
+           status, and its error, are not the next sender's; the next line's
+           status is. A reset in between ends the line with no status. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        stub_state = STATE_IDLE;
+        status_message_chain = fake_status;
+        serialRxFlush();
+        push("G4 P2\n");
+        while(serialGetC() != SERIAL_NO_DATA)
+            ;
+        drop_client();
+        status_message_chain = count_status;
+        status_seen = 0;
+        gc_state.last_error = Status_GcodeUnsupportedCommand;  /* the core records it, then reports it */
+        inject_status_message(Status_GcodeUnsupportedCommand);
+        CHECK(status_seen == 0 && gc_state.last_error == Status_OK,
+              "the gone sender's line status is swallowed, its error not held");
+        push("$G\n");
+        while(serialGetC() != SERIAL_NO_DATA)
+            ;
+        inject_status_message(Status_OK);
+        CHECK(status_seen == 1, "the next line's status goes out");
+        close(pair[1]);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+        client_fd = pair[0];
+        push("G4 P2\n");
+        while(serialGetC() != SERIAL_NO_DATA)
+            ;
+        drop_client();
+        serialRxFlush();                            /* the core's reset */
+        push("$G\n");
+        while(serialGetC() != SERIAL_NO_DATA)
+            ;
+        status_seen = 0;
+        inject_status_message(Status_OK);
+        CHECK(status_seen == 1, "after a reset the next line's status goes out");
+        close(pair[1]);
+        status_message_chain = fake_status;
+        stub_state = STATE_IDLE;
+    }
+
+    /* --- a feed hold during the arm's wait ------------------------------ */
+    printf("A feed hold during the arm's wait is the arm's:\n");
+    {
+        int rt0 = realtime_seen, c0 = hold_cancels;
+        arm_waiting = true;
+        rx_byte('!');
+        rx_byte(0x82);
+        CHECK(hold_cancels == c0 + 2 && realtime_seen == rt0 && operator_holds == 0,
+              "both feed hold bytes go to the arm, not the core");
+        arm_waiting = false;
+        rx_byte('!');
+        CHECK(realtime_seen == rt0 + 1 && operator_holds == 1,
+              "outside the arm's wait the core takes it, then the operator's hold");
+        int h0 = holds_enqueued;
+        rx_byte(0x82);
+        CHECK(holds_enqueued == h0 + 1 && operator_holds == 2,
+              "so does 0x82: the core takes it, then the operator's hold");
+        bang_is_text = true;
+        rx_byte('!');
+        CHECK(operator_holds == 2, "a '!' the core keeps as text is no operator's hold");
+        bang_is_text = false;
+        while(serialGetC() != SERIAL_NO_DATA)
+            ;
+    }
 
     /* --- the TX ring and its stall bound --------------------------------- */
     printf("The TX ring under a sender that stops reading:\n");

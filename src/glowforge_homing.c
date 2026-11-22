@@ -462,6 +462,10 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
               (double)timeout_key, (double)timeout_s);
     uint32_t timeout_ms = (uint32_t)(timeout_s * 1000.0f);
 
+    /* The window closes before anything of the session runs: the poll
+     * would close it only at its first pass in the homing state, which can
+     * come after the runner has started. */
+    gflaser_disarm();
     state_set(STATE_HOMING);
     gfhome_invalidate();   /* the session moves the machine */
 

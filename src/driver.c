@@ -450,11 +450,14 @@ static void driverReset (void)
 {
     /* Called for both EXEC_STOP and EXEC_RESET; only a real reset may kill
      * the stream (EXEC_STOP's controlled decel must play out normally).
-     * The latch relock comes first: FIRE is severed before the stream
-     * teardown even begins. A reset during motion stops the kernel with
-     * its ramp, and the position is read back when the ramp has ended. */
+     * Both close the armed window and relock the latch first: FIRE is
+     * severed before the stop's deceleration or the stream teardown
+     * begins, so a stop's deceleration and the kernel's queue play dark,
+     * and the next job asks for its own press. A reset during motion
+     * stops the kernel with its ramp, and the position is read back when
+     * the ramp has ended. */
+    gflaser_disarm();
     if(sys.reset_pending) {
-        gflaser_disarm();
         gf_stream_reset();
         gfhome_envelope_close();
         readback_position();

@@ -37,6 +37,15 @@
   stretches it past COOL_ACK_S, so an engine that takes the job inside
   the grace still arms, and an out-of-range grace falls back to 15 s.
 
+  And the arm's waits' edges: a feed hold in the wait for the press or
+  for the acknowledgment is the arm's and refuses it; the wait for the
+  acknowledgment reads the lid, the loop and an alarm; the module's own
+  alarm-3 raises are counted; a reset's on_reset hook drops the armed
+  flag and the fire gate and locks the latch before any poll, and no poll
+  opens the gate again before the disarm; a resume while a lid cancel is
+  in flight is dropped; and a window whose reports the engine has not
+  answered for 3 s is closed with its job held.
+
   And the gates the audit added: on hardware a missing switch device
   refuses the arm; the head is checked again after the wait; a press
   counts only after the button has been seen up; three unreadable
@@ -185,9 +194,32 @@ static double mono_now(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* A feed hold byte from the sender, keyed to a switch read or to an ask
+   of the engine (< 0 = off): what serial.c's rx_byte does with it. */
+bool gflaser_feed_hold_cancels_arm(void);
+static int  hold_at_read = -1, hold_at_ack = -1;
+static bool hold_taken;
+/* A feed hold byte read inside a report whose words hold this text: on
+   the controller a write to a full transmit ring waits by pumping the
+   real-time bytes, so the byte can arrive inside the write (NULL = off). */
+static const char *hold_at_msg;
+/* grblHAL's stop in an arm's pump, keyed to a switch read or to an ask of
+   the engine (< 0 = off): the core's stop sets sys.cancel, so the pump
+   returns false with no reset asked for. */
+static int  stop_at_read = -1, stop_at_ack = -1;
+static bool stop_landed;
+/* A report whose words hold this text drops the sender (a full transmit
+   ring stalled past its bound): the sender generation moves on (NULL =
+   off). */
+static const char *gen_bump_at_msg;
+
 static bool button_reserved_val;        /* gfcool_button_reserved(), below */
 bool gfcool_run_ack(void)
 {
+    if (hold_at_ack >= 0 && ack_calls == hold_at_ack)
+        hold_taken = gflaser_feed_hold_cancels_arm();
+    if (stop_at_ack >= 0 && ack_calls == stop_at_ack)
+        stop_landed = true;
     if (latch_set_at_ack >= 0 && ack_calls >= latch_set_at_ack)
         rd_button_latch = "1";
     if (reserve_at_ack >= 0 && ack_calls >= reserve_at_ack)
@@ -203,16 +235,25 @@ bool gfcool_run_ack(void)
 
 bool gfsw_available(void) { return sw_present; }
 void gfsw_button_consumed(void) {}
+static bool cancel_pending_val;         /* gfsw_cancel_pending(): a lid cancel in flight */
+bool gfsw_cancel_pending(void) { return cancel_pending_val; }
+static bool report_stale_val;           /* gfcool_report_stale(): no report answered for 3 s */
+bool gfcool_report_stale(void) { return report_stale_val; }
+static int operator_holds;              /* gfcool_operator_hold() calls */
+void gfcool_operator_hold(void) { operator_holds++; }
 /* Events under the button wait, keyed to the switch reads (< 0 = off):
    past this many reads the sender generation moves on, or the core
    reports an alarm. */
 static int serial_gen_bump_after = -1;
 static int alarm_after_reads = -1;
-
 bool gfsw_read_raw(uint8_t *sw)
 {
     int i = sw_calls < sw_n ? sw_calls : sw_n - 1;
     bool ok = sw_calls < sw_fail_from;
+    if (hold_at_read >= 0 && sw_calls == hold_at_read)
+        hold_taken = gflaser_feed_hold_cancels_arm();
+    if (stop_at_read >= 0 && sw_calls == stop_at_read)
+        stop_landed = true;
     sw_calls++;
     if (sw_script[i] & (1u << 2))       /* the button's bit (SW_BIT_BUTTON, defined below) */
         lamp_at_press = lamp_now;
@@ -310,12 +351,15 @@ unsigned serial_client_generation(void)
 }
 static int resets_requested;
 static int cycle_starts;                /* CMD_CYCLE_START (0x81) enqueued */
+static int feed_holds;                  /* CMD_FEED_HOLD (0x82) enqueued */
 bool protocol_enqueue_realtime_command(uint8_t c)
 {
     if (c == 0x18)
         resets_requested++;
     if (c == 0x81)
         cycle_starts++;
+    if (c == 0x82)
+        feed_holds++;
     return true;
 }
 /* The kernel's tail under a pump: with tail_pumps > 0, cnc/state reads as
@@ -355,7 +399,7 @@ bool protocol_execute_realtime(void)
             gflaser_poll();
         suspend_depth--;
     }
-    return resets_requested == 0;
+    return resets_requested == 0 && !stop_landed;
 }
 
 /* The driver's clock: wall_s() reads CLOCK_MONOTONIC through this, so a
@@ -376,11 +420,27 @@ static void clock_skip(double s) { clock_skew_ns += (long long)(s * 1e9); }
 #define clock_gettime skewed_clock_gettime
 #include "../src/glowforge_laser.c"
 #undef clock_gettime
+/* The published state file (grbl.state) carries the module's alarm-3 count:
+   the publisher is included as well, with the stubs it reads below. */
+#include "../src/glowforge_status.c"
 #include <sys/stat.h>              /* after the core headers: its macros clash with vfs.h */
 
 /* --- grbl core stubs (declared by the headers the source pulled in) --- */
 settings_t settings;
 grbl_t grbl;
+grbl_hal_t hal;
+static uint_fast16_t test_clear_bits(volatile uint_fast16_t *value, uint_fast16_t bits)
+{
+    uint_fast16_t was = *value;
+    *value &= ~bits;
+    return was;
+}
+/* What the state publisher reads besides the laser module. */
+bool serial_client_connected(void) { return false; }
+double serial_client_since(void) { return 0.0; }
+const char *serial_client_peer(void) { return ""; }
+void report_gcode_modes(stream_write_ptr write) { write("[GC:G0 M5]\r\n"); }
+void report_grbl_settings(bool all, void *data) { (void)all; (void)data; }
 parser_state_t gc_state;
 system_t sys;
 static spindle_ptrs_t test_spindle;
@@ -390,6 +450,10 @@ static sys_state_t cur_state = STATE_IDLE;  /* what state_get() reports */
 void report_message(const char *msg, message_type_t type)
 {
     (void)type;
+    if (hold_at_msg && msg && strstr(msg, hold_at_msg))
+        hold_taken = gflaser_feed_hold_cancels_arm();
+    if (gen_bump_at_msg && msg && strstr(msg, gen_bump_at_msg))
+        client_gen++;
     snprintf(last_message, sizeof(last_message), "%s", msg ? msg : "");
     size_t n = strlen(all_messages);
     snprintf(all_messages + n, sizeof(all_messages) - n, "%s\n", msg ? msg : "");
@@ -596,6 +660,21 @@ static void reset_state(void)
     serial_gen_bump_after = -1;
     gen_bump_after_ack_calls = -1;
     alarm_after_reads = -1;
+    hold_at_read = hold_at_ack = -1;
+    hold_at_msg = NULL;
+    gen_bump_at_msg = NULL;
+    hold_taken = false;
+    stop_at_read = stop_at_ack = -1;
+    stop_landed = false;
+    operator_holds = 0;
+    hal.clear_bits_atomic = test_clear_bits;
+    sys.rt_exec_state = 0;
+    atomic_store(&rearm_hold, false);
+    feed_holds = 0;
+    cancel_pending_val = false;
+    report_stale_val = false;
+    atomic_store(&arm_hold_cancel, false);
+    atomic_store(&reset_closing, false);
     conf_model_val = NULL;
     conf_curve_val = NULL;
     conf_gamma = -1.0f;
@@ -1515,6 +1594,259 @@ int main(void)
     CHECK(alarms_raised == 0 && resets_requested == 1, "the standing alarm is not raised again, and the job is reset");
     alarm_after_reads = -1;
 
+    printf("the arm's waits end on a feed hold, and the wait for the acknowledgment reads the switches:\n");
+
+    /* Case FH1 - a feed hold in the button wait: taken by the arm, which
+       ends refused (relocked, never armed, an alarm and a reset). Taken
+       by the core instead, it would park the arm's pump in the suspend
+       loop, where no bound of the wait runs, the latch unlocked. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_CLOSED, 3);
+    hold_at_read = 2;
+    CHECK(!gflaser_arm() && hold_taken, "a feed hold in the button wait is taken by the arm");
+    CHECK(!laser_ok && latch_locked_last && !cool_armed_last && alarms_raised == 1 && resets_requested == 1,
+          "the arm ends refused: relocked, never armed, an alarm and a reset");
+    CHECK(said("feed hold during arm - job canceled") == 1, "the refusal says why");
+    CHECK(!gflaser_feed_hold_cancels_arm() && !arming, "outside an arm a feed hold is the core's");
+
+    /* Case FH2 - the same in the wait for the engine's acknowledgment
+       (no switch source: no button wait). */
+    reset_state();
+    script(true, true, 2);
+    ack_hold = 1 << 30;
+    hold_at_ack = 2;
+    conf_fan_grace = 0.0f;              /* a wait that ran out would take 5 s, not end at the hold */
+    CHECK(!gflaser_arm() && hold_taken, "a feed hold in the acknowledgment's wait is taken by the arm");
+    CHECK(!laser_ok && latch_locked_last && !cool_armed_last && alarms_raised == 1 && resets_requested == 1 &&
+          said("feed hold during arm - job canceled") == 1 && ack_calls <= 4,
+          "the arm ends refused there too, at the hold");
+
+    /* Case FH3 - the hold arrives in the pump after which the
+       acknowledgment reads true (modeled at the same ask): the byte is the
+       arm's, so no window opens over it. */
+    reset_state();
+    script(true, true, 2);
+    ack_hold = 2;
+    hold_at_ack = 2;
+    conf_fan_grace = 0.0f;
+    CHECK(!gflaser_arm() && hold_taken && !laser_ok && !stream_armed && latch_locked_last &&
+          said("feed hold during arm - job canceled") == 1 && said("laser armed") == 0,
+          "a hold in the acknowledgment's last pump refuses the arm: no window opens over it");
+
+    /* Case FH4 - the hold read inside the window's own report ("laser
+       armed"), after the waits' last read: the window it found open
+       closes, and the job is refused as a hold refuses it. */
+    reset_state();
+    script(true, true, 2);
+    hold_at_msg = "laser armed";
+    CHECK(!gflaser_arm() && hold_taken && !laser_ok && !stream_armed && latch_locked_last &&
+          !cool_armed_last && alarms_raised == 1 && resets_requested == 1 &&
+          said("feed hold during arm - job canceled") == 1,
+          "a hold read inside the window's report closes the window and refuses the job");
+
+    /* Case SP1 - grblHAL's stop in either wait: the core's stop makes the
+       pump return false, and the wait ends on its abort path, dark: no
+       alarm, no reset of the arm's, the latch relocked, the engine told.
+       That the core's stop aborts the pump is laser_lifecycle_test's
+       test_a_stop_in_the_button_wait. */
+    for (int ack = 0; ack < 2; ack++) {
+        reset_state();
+        script(true, true, 2);
+        if (ack) {
+            ack_hold = 1 << 30;
+            conf_fan_grace = 0.0f;      /* a wait that ran on would take 5 s, not end at the stop */
+            stop_at_ack = 1;
+        } else {
+            switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+            stop_at_read = 1;
+        }
+        CHECK(!gflaser_arm() && !laser_ok && !stream_armed && latch_locked_last && !cool_armed_last &&
+              alarms_raised == 0 && resets_requested == 0,
+              ack ? "a stop in the acknowledgment's wait ends the arm dark, no alarm"
+                  : "a stop in the button wait ends the arm dark, no alarm");
+    }
+
+    /* Case OH1 - a feed hold byte that goes on to the core: in a held job
+       it withdraws a cycle start still pending (the core would take the
+       start and drop the hold that comes with it), and a hold the cooling
+       client took becomes the operator's; outside a hold it changes
+       nothing. */
+    reset_state();
+    cur_state = STATE_HOLD;
+    sys.rt_exec_state = EXEC_CYCLE_START | EXEC_STATUS_REPORT;
+    gflaser_operator_hold();
+    CHECK(sys.rt_exec_state == EXEC_STATUS_REPORT && operator_holds == 1,
+          "in a held job the hold withdraws a pending cycle start, and the cooling hold is the operator's");
+    cur_state = STATE_SAFETY_DOOR;
+    sys.rt_exec_state = EXEC_CYCLE_START;
+    gflaser_operator_hold();
+    CHECK(sys.rt_exec_state == 0 && operator_holds == 2,
+          "in a job parked in Door the hold withdraws a pending cycle start too");
+    cur_state = STATE_CYCLE;
+    sys.rt_exec_state = EXEC_CYCLE_START;
+    gflaser_operator_hold();
+    CHECK(sys.rt_exec_state == EXEC_CYCLE_START && operator_holds == 3,
+          "in a cycle the start is the core's, and a hold the cooling client asked for in this pass is the operator's");
+    cur_state = STATE_IDLE;
+
+    /* Case AW1 - the lid opens after the press, while the engine's
+       acknowledgment is waited for: the job is canceled as in the button
+       wait (a reset, no alarm), and no window opens. Then the loop, and an
+       alarm raised under that wait. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_PRESSED, W_LID_OPEN, 3);
+    ack_hold = 1 << 30;
+    CHECK(!gflaser_arm(), "a lid opened in the acknowledgment's wait refuses the arm");
+    CHECK(!laser_ok && latch_locked_last && !cool_armed_last && alarms_raised == 0 && resets_requested == 1,
+          "the job is canceled with a reset and no alarm, the latch relocked");
+    CHECK(said("lid opened during arm - job canceled") == 1, "the cancel says the lid");
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_PRESSED, W_LOOP_OPEN, 3);
+    ack_hold = 1 << 30;
+    CHECK(!gflaser_arm() && !laser_ok && resets_requested == 1 &&
+          said("interlock open during arm - job canceled") == 1, "so does an open loop");
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_PRESSED, W_CLOSED, 3);
+    ack_hold = 1 << 30;
+    alarm_after_reads = 3;
+    CHECK(!gflaser_arm() && !laser_ok && latch_locked_last && !cool_armed_last && resets_requested == 1 &&
+          said("alarm during arm - job canceled") == 1, "and an alarm raised under it");
+    alarm_after_reads = -1;
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_PRESSED, W_CLOSED, 3);
+    sw_fail_from = 2;                   /* every read after the press fails */
+    ack_hold = 1 << 30;
+    conf_fan_grace = 0.0f;
+    CHECK(!gflaser_arm() && !laser_ok && latch_locked_last && !cool_armed_last && alarms_raised == 1 &&
+          ack_calls <= 4 && said("laser arm canceled: the switches cannot be read") == 1,
+          "three unreadable reads in the acknowledgment's wait refuse the arm");
+
+    printf("the alarm-3 raises of the laser module are counted:\n");
+
+    /* Case AC1 - a refused arm raises alarm 3 and counts it; the emission
+       witness's raise counts as well. */
+    reset_state();
+    {
+        unsigned k0 = gflaser_alarm3_count();
+        script(false, false, 2);
+        CHECK(!gflaser_arm() && alarms_raised == 1 && gflaser_alarm3_count() == k0 + 1,
+              "a refused arm's alarm 3 is counted");
+        reset_state();
+        hw_active = true;
+        rd_emission = "4";
+        gflaser_poll();
+        CHECK(alarms_raised == 1 && gflaser_alarm3_count() == k0 + 2,
+              "the emission witness's alarm 3 is counted");
+    }
+
+    /* Case AC2 - the count reaches grbl.state under the key forgectrl
+       reads, also when nothing else of the state changes: an alarm 3
+       standing, the witness raises its own, and the next publish carries
+       the new count. */
+    {
+        char dir[] = "/tmp/laser_arm_test.XXXXXX", path[64], body[1024];
+        reset_state();
+        CHECK(mkdtemp(dir) != NULL, "a state folder");
+        snprintf(state_dir, sizeof(state_dir), "%s", dir);
+        snprintf(path, sizeof(path), "%s/grbl.state", dir);
+        active = true;
+        cur_state = STATE_ALARM;
+        sys.alarm = Alarm_AbortCycle;
+        publish_state(false);
+        unsigned k1 = gflaser_alarm3_count();
+        hw_active = true;
+        rd_emission = "4";
+        gflaser_poll();                 /* the witness: the state and the alarm code stay as they were */
+        publish_state(false);
+        FILE *f = fopen(path, "r");
+        size_t n = f ? fread(body, 1, sizeof(body) - 1, f) : 0;
+        if (f)
+            fclose(f);
+        body[n] = '\0';
+        char want[48];
+        snprintf(want, sizeof(want), "\"alarm3_raised\":%u,", k1 + 1);
+        CHECK(gflaser_alarm3_count() == k1 + 1 && strstr(body, want) != NULL,
+              "a raise under a standing alarm 3 is published at once, as alarm3_raised");
+        active = false;
+        unlink(path);
+        rmdir(dir);
+    }
+
+    printf("a reset severs FIRE at once, and a lid cancel takes no resume:\n");
+
+    /* Case RS1 - the core's on_reset, with the window open: the stream's
+       armed flag and the fire gate drop and the latch locks before any
+       poll, and a poll before driverReset's disarm keeps the gate shut. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm() && fire_gate_last && !latch_locked_last, "armed: the gate open, the latch unlocked");
+    laser_on_reset();
+    CHECK(!stream_armed && !fire_gate_last && latch_locked_last, "on_reset drops the armed flag and the gate, and locks");
+    gflaser_poll();
+    CHECK(!fire_gate_last, "a poll before the disarm does not open the gate again");
+    gflaser_disarm();
+    CHECK(!laser_ok && said("laser disarmed - latch locked") == 1, "driverReset's disarm closes the window and says so");
+    fire_ok_calls = 0;
+    script(true, true, 2);
+    CHECK(gflaser_arm() && fire_gate_last, "the next window after the reset opens its gate again");
+
+    /* Case WC1 - every close of an open window reports the window's change
+       to the cooling client, which clears the acknowledgment it read there
+       (the next window's is taken only from a read begun after its own
+       report was answered: cooling_test). The lid's and the loop's closes
+       are switches_test's. */
+    {
+        static const char *const path[] = {
+            "a stop or a fault (the disarm)", "a reset (on_reset, then the disarm)", "the grace at rest",
+            "an unlit M5", "a sender change", "a stale reporter", "the verdict's fail tier" };
+        for (int k = 0; k < 7; k++) {
+            reset_state();
+            script(true, true, 2);
+            bool armed_k = gflaser_arm();
+            int c0 = cool_armed_calls;
+            switch (k) {
+                case 0: gflaser_disarm(); break;
+                case 1: laser_on_reset(); gflaser_disarm(); break;
+                case 2: gflaser_poll(); clock_skip(61.0); gflaser_poll(); break;
+                case 3: unlit_check = true; gflaser_poll(); break;
+                case 4: client_gen++; gflaser_poll(); break;
+                case 5: report_stale_val = true; gflaser_poll(); break;
+                default: gflaser_verdict_fail("AIRFLOW"); break;
+            }
+            CHECK(armed_k && !laser_ok && cool_armed_calls == c0 + 1 && !cool_armed_last, path[k]);
+        }
+    }
+
+    /* Case LC1 - a resume while the lid policy cancels the job: dropped,
+       with no unlock and no prompt. */
+    reset_state();
+    cur_state = STATE_SAFETY_DOOR;
+    gc_state.modal.spindle[0].state.on = On;
+    cancel_pending_val = true;
+    CHECK(gflaser_resume_gate(), "a resume during a lid cancel is taken");
+    CHECK(!rearm_pending && !arming && latch_locked_last && cool_armed_calls == 0,
+          "and nothing unlocks or prompts");
+
+    printf("a window whose reports go unanswered closes:\n");
+
+    /* Case UR1 - the engine has answered no report for 3 s with the window
+       open and the job cutting: the job is held and the window closed,
+       before the engine's 5 s bound lets the extension host read it
+       closed. */
+    reset_state();
+    script(true, true, 2);
+    CHECK(gflaser_arm(), "armed");
+    cur_state = STATE_CYCLE;
+    report_stale_val = true;
+    gflaser_poll();
+    CHECK(!laser_ok && latch_locked_last && !fire_gate_last && feed_holds == 1,
+          "the job is held, the window closed and the latch locked");
+
     printf("a press made under a reservation of the button, or one the latch did not take:\n");
 
     /* Case P1 - the machine's button is reserved for a prompt (the
@@ -2057,6 +2389,60 @@ int main(void)
     gc_state.modal.spindle[0].state.on = Off;
 
     printf("the re-arm waits for the acknowledgment from the poll, never from a pump:\n");
+
+    /* Case RH1 - a feed hold during a held job's re-arm: the core is in
+       its hold already and would take no second one, so the re-arm takes
+       the byte and ends there, the job held, the latch locked, no alarm,
+       no cycle start. Before the press the button stops breathing at once;
+       after the press no window opens when the acknowledgment comes; read
+       inside the window's own report, the window closes before the cycle
+       start. */
+    for (int when = 0; when < 3; when++) {
+        static const char *const what[] = {
+            "a hold before the re-arm's press ends the re-arm at once: the job stays held",
+            "a hold after the re-arm's press keeps the job held: no window, no cycle start",
+            "a sender lost inside the re-arm's window report: no cycle start, the job held",
+        };
+        reset_state();
+        suspend_model = true;
+        script(true, true, 2);
+        switches(W_CLOSED, W_CLOSED, W_CLOSED, 3);
+        cur_state = STATE_HOLD;
+        gc_state.modal.spindle[0].state.on = On;
+        CHECK(gflaser_resume_gate() && rearm_pending, "the resume gate starts the re-arm");
+        gflaser_poll();                 /* the button is up */
+        ack_hold = when == 2 ? 1 : 3;
+        ack_calls = 0;
+        all_messages[0] = '\0';
+        sw_calls = 0;
+        if (when == 0) {
+            hold_taken = gflaser_feed_hold_cancels_arm();   /* the pause, before the press */
+            gflaser_poll();
+            CHECK(!rearm_pending && lamp_now == Lamp_Off, "the re-arm ends on the poll after the hold");
+        }
+        switches(W_PRESSED, W_CLOSED, W_CLOSED, 2);
+        gflaser_poll();                 /* the press */
+        if (when == 1)
+            hold_taken = gflaser_feed_hold_cancels_arm();   /* the pause, after the press */
+        if (when == 2)
+            gen_bump_at_msg = "laser armed";
+        for (int i = 0; i < 5; i++)
+            gflaser_poll();
+        CHECK((hold_taken || when == 2) && !laser_ok && !stream_armed && !rearm_pending &&
+              !gflaser_arming() && latch_locked_last && !cool_armed_last && cycle_starts == 0 &&
+              alarms_raised == 0 && resets_requested == 0 &&
+              said(when == 2 ? "sender changed - the resume is canceled; the job stays held"
+                             : "feed hold - the resume is canceled; the job stays held") == 1 &&
+              said("laser armed") == (when == 2), what[when]);
+        gen_bump_at_msg = NULL;
+        rearm_client_gen = serial_client_generation();
+        switches(W_CLOSED, W_CLOSED, W_CLOSED, 3);
+        CHECK(gflaser_resume_gate() && rearm_pending, "the next resume starts a re-arm");
+        gflaser_poll();
+        CHECK(rearm_pending, "and that re-arm waits for its press: the hold ended the last one only");
+        rearm_end(false);
+        gc_state.modal.spindle[0].state.on = Off;
+    }
 
     /* Case S21 - the press is recorded on the poll that reads it, and the
        window opens on a later poll, once the engine has acknowledged the

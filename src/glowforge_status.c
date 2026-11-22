@@ -15,7 +15,11 @@
                     the floor key into $35 in RAM without a settings
                     write, so the poll watches the value).
     grbl.state      one JSON object: ts_mono (CLOCK_MONOTONIC, for age),
-                    the machine state and alarm code, the sender session
+                    the machine state and alarm code, the count of the
+                    alarm-3 raises the laser module made itself
+                    (alarm3_raised: a refused or canceled arm, the alarm
+                    owed after a standstill reset, the emission witness;
+                    the daemon tells them from a soft reset's), the sender session
                     (connected, generation, seconds connected, peer
                     address), the laser (armed window, arming wait, dose
                     model, its floor, the curve and the corner gamma), the
@@ -67,7 +71,7 @@
 static char state_dir[128];
 static bool active = false;
 static bool settings_dirty = true;
-static char last_state[640];        /* the state JSON minus ts_mono */
+static char last_state[704];        /* the state JSON minus ts_mono */
 static double next_heartbeat;
 static on_settings_changed_ptr settings_changed_chain;
 
@@ -153,6 +157,7 @@ static void publish_state (bool force)
     static struct {
         sys_state_t state;
         uint8_t alarm;
+        unsigned alarm3;
         bool connected, armed, arming;
         unsigned generation;
         int feed, rapid;
@@ -160,6 +165,7 @@ static void publish_state (bool force)
     } seen;
     sys_state_t st_now = state_get();
     bool changed = force || st_now != seen.state || (uint8_t)sys.alarm != seen.alarm ||
+                   gflaser_alarm3_count() != seen.alarm3 ||
                    serial_client_connected() != seen.connected ||
                    serial_client_generation() != seen.generation ||
                    gflaser_armed() != seen.armed || gflaser_arming() != seen.arming ||
@@ -170,6 +176,7 @@ static void publish_state (bool force)
         return;
     seen.state = st_now;
     seen.alarm = (uint8_t)sys.alarm;
+    seen.alarm3 = gflaser_alarm3_count();
     seen.connected = serial_client_connected();
     seen.generation = serial_client_generation();
     seen.armed = gflaser_armed();
@@ -192,14 +199,14 @@ static void publish_state (bool force)
     sys_state_t st = state_get();
     char body[sizeof(last_state)];
     snprintf(body, sizeof(body),
-        "\"state\":\"%s\",\"alarm\":%d,"
+        "\"state\":\"%s\",\"alarm\":%d,\"alarm3_raised\":%u,"
         "\"sender\":{\"connected\":%s,\"generation\":%u,\"for_s\":%.0f,\"peer\":\"%s\"},"
         "\"laser\":{\"armed\":%s,\"arming\":%s,\"model\":\"%s\",\"floor_pct\":%g,\"curve\":\"%s\","
         "\"gamma\":%.2f},"
         "\"modals\":\"%s\","
         "\"overrides\":{\"feed\":%d,\"rapid\":%d},"
         "\"driver\":\"%s\"}",
-        state_name(st), (int)sys.alarm,
+        state_name(st), (int)sys.alarm, seen.alarm3,
         serial_client_connected() ? "true" : "false",
         serial_client_generation(),
         serial_client_connected() ? mono_s() - serial_client_since() : 0.0,

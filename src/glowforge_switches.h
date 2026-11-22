@@ -39,6 +39,11 @@ void gfsw_init (void);
    test source. Without one the laser arm flow has no button to wait for. */
 bool gfsw_available (void);
 
+/* True while the lid policy cancels a job: from the cancel until its
+   soft reset has landed (the return to the job start that follows is not
+   counted). A resume there is dropped (gflaser_resume_gate). */
+bool gfsw_cancel_pending (void);
+
 /* Raw EV_SW word (SW_BYTES bytes, EVIOCGSW layout); false = no source or
    unreadable right now (keep the previous state). */
 bool gfsw_read_raw (uint8_t *sw);

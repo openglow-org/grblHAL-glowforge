@@ -57,10 +57,27 @@ float gflaser_gamma (void);
 // file reports it beside the arming wait).
 bool gflaser_armed (void);
 
-// True while the arm flow is blocked waiting for the operator's button
-// press: that press is the arm's, and the button toggle must not act on
-// it (glowforge_switches.c).
+// True while an arm waits: the first arm from its unlock to its window
+// (the press, then the engine's acknowledgment), and a held job's re-arm.
+// A press is the arm's, and the button toggle must not act on it
+// (glowforge_switches.c); a second sender is refused (serial.c).
 bool gflaser_arming (void);
+
+// A feed hold byte from the sender while an arm waits: the first arm is
+// canceled (the alarm and the reset, the latch relocked), a held job's
+// re-arm ends with the job held, and the byte is taken here. False, and
+// nothing changes, outside an arm.
+bool gflaser_feed_hold_cancels_arm (void);
+
+// A feed hold byte from the sender that goes on to the core: in a held
+// job it withdraws a cycle start still pending, so the hold wins, and a
+// hold the cooling client took becomes the operator's.
+void gflaser_operator_hold (void);
+
+// The alarm-3 raises this module made itself (a refused or canceled arm,
+// the alarm owed after a standstill reset, the emission witness), since
+// the process started. Published in grbl.state.
+unsigned gflaser_alarm3_count (void);
 
 // The gate every cycle start passes on its way to the core. A held
 // laser job whose armed window has closed re-arms first: the press is
