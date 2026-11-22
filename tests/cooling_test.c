@@ -14,7 +14,7 @@
   process. This test includes the client source, publishes verdicts into
   a temporary file the way the engine does, and drives gfcool_poll():
 
-  - inside an open armed window, a verdict named FIRE, CRASH, AIRFLOW or
+  - inside an open armed window, a verdict named FIRE, CRASH, EMISSION, AIRFLOW or
     CRITICAL is the fail tier (the laser module is told to end the job),
     and every other fire_ok=false verdict, and a stale one, is the pause
     tier (the job is held, said once, and the latch is never written);
@@ -527,8 +527,8 @@ int main (void)
     CHECK(hold_ours && pause_said, "COLD is the pause tier");
 
     /* The fail tier, by name. */
-    static const char *fail_names[] = { "FIRE", "CRASH", "AIRFLOW", "CRITICAL" };
-    for(int i = 0; i < 4; i++) {
+    static const char *fail_names[] = { "FIRE", "CRASH", "EMISSION", "AIRFLOW", "CRITICAL" };
+    for(int i = 0; i < 5; i++) {
         reset_state();
         armed_val = true;
         laser_on_window = true;

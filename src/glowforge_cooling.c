@@ -566,7 +566,7 @@ static bool verdict_fresh (void)
  * else with fire_ok=false, and a stale verdict, is a pause. */
 static bool verdict_fail_tier (const char *name)
 {
-    return !strcmp(name, "FIRE") || !strcmp(name, "CRASH") ||
+    return !strcmp(name, "FIRE") || !strcmp(name, "CRASH") || !strcmp(name, "EMISSION") ||
            !strcmp(name, "AIRFLOW") || !strcmp(name, "CRITICAL");
 }
 

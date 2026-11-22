@@ -336,9 +336,24 @@ void fflog (int prio, const char *fmt, ...) { (void)prio; (void)fmt; }
 int  fflog_level (void) { return LOG_DEBUG; }
 
 /* --- driver source under test ---------------------------------------- */
+#define ship_pass ship_pass_under_test
 #include "../src/stepper_stream.c"
+#undef ship_pass
 
 grbl_hal_t hal;
+
+/* The producer as these cases model it: no producer thread runs, and the
+ * case maps the events itself, so the producer counts as ahead of every
+ * slot the shipper reaches (its covered cursor past them all), unless a
+ * case stalls it and sets the cursor itself. */
+static bool producer_stalled;
+
+static void ship_pass (void)
+{
+    if(!producer_stalled)
+        atomic_store(&gf.covered, UINT64_MAX);
+    ship_pass_under_test();
+}
 
 /* --- test driver ----------------------------------------------------- */
 
@@ -1253,6 +1268,125 @@ int main (void)
     ship_pass();
     relit = lit_ticks(t0 + 100, t0 + 150, &ticks);
     CHECK(ticks == 50 && relit == 50, "a run that ran out on the producer keeps the wanted fire for the rest of its block");
+    ring_close();
+
+    /* A producer kept off the CPU past the lead and the depth: the shipper
+     * reaches slots the producer has not covered. FIRE rides only the
+     * slots below its covered cursor; the ones past it ship dark (the head
+     * may have stopped there), with the fire request and the gate open. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf_stream_laser(100, true);
+    gf_stream_wakeup();
+    ship_pass();                        /* the preload: the depth's pads, dark */
+    producer_stalled = true;
+    /* The producer's cursor as its advance publishes it, stalled just
+     * short of its next fire at slot 20: the slot that fire's step will
+     * land in is not covered. */
+    gf.vticks = 20 * VTICKS_PER_BYTE;
+    gf.period_latched = VTICKS_PER_BYTE - 1;
+    producer_advance();
+    gf.period_latched = VTICKS_PER_BYTE;    /* the default, for the cases after */
+    gf.ship_t0 -= 0.05;                 /* 50 ticks due past the base */
+    ship_pass();
+    producer_stalled = false;
+    int past_ticks;
+    int covered_lit = lit_ticks(100, 120, &ticks);
+    int past_lit = lit_ticks(120, 150, &past_ticks);
+    CHECK(ticks == 20 && covered_lit == 20 && past_ticks == 30 && past_lit == 0,
+          "a stalled producer: FIRE on the 20 slots it covered, none on the next fire's slot or past it");
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
+    ring_close();
+
+    /* A new stream's base below the last stream's cursor (a fresh stream's
+     * index space starts over): the wakeup takes the cursor back to the new
+     * base, so a producer that stalls at the run's start leaves every slot
+     * past the base dark. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    producer_stalled = true;
+    atomic_store(&gf.covered, 100000);  /* the last stream's producer, far along */
+    gf_stream_laser(100, true);
+    gf_stream_wakeup();
+    ship_pass();
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    producer_stalled = false;
+    past_lit = lit_ticks(100, 150, &past_ticks);
+    CHECK(past_ticks == 50 && past_lit == 0, "a new stream's stalled start: no FIRE past its base");
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
+    ring_close();
+
+    printf("the stream's fire masks, each alone:\n");
+
+    /* The enqueue mask: a laser-on the core sends while a stream runs is
+     * queued dark with the window closed (or under a jog), however open
+     * the per-tick gate is. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&fire_gate, true);
+    gf_stream_wakeup();
+    ship_pass();
+    gf_stream_laser(100, true);         /* in the stream, at its base */
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    relit = lit_ticks(100, 150, &ticks);
+    CHECK(ticks == 50 && relit == 0, "a laser-on with the window closed and the gate open is queued dark");
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
+    ring_close();
+
+    /* The per-tick gate: a fire the core asked for inside the armed window
+     * ships dark on every tick the gate stands closed. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    gf.gate_seen = false;               /* closed from the start: no falling edge */
+    gf_stream_wakeup();
+    ship_pass();
+    gf_stream_laser(100, true);
+    gf.ship_t0 -= 0.05;
+    ship_pass();
+    relit = lit_ticks(100, 150, &ticks);
+    CHECK(ticks == 50 && relit == 0, "an armed fire under a closed gate ships dark");
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
+    ring_close();
+
+    /* The gate's falling edge: it clears the fire in flight, so a gate
+     * that opens again lights nothing until the core asserts fire again. */
+    reset_state();
+    ring_open();
+    gf.dith_period = 0;
+    atomic_store(&laser_armed, true);
+    atomic_store(&fire_gate, true);
+    gf.gate_seen = true;
+    gf_stream_wakeup();
+    ship_pass();
+    gf_stream_laser(100, true);
+    gf.ship_t0 -= 0.02;
+    ship_pass();                        /* 20 ticks lit */
+    atomic_store(&fire_gate, false);
+    ship_pass();                        /* the edge, on a pass that ships nothing */
+    atomic_store(&fire_gate, true);
+    gf.ship_t0 -= 0.03;
+    ship_pass();
+    int before_edge = lit_ticks(100, 120, &ticks);
+    relit = lit_ticks(120, 150, &past_ticks);
+    CHECK(before_edge == 20 && past_ticks == 30 && relit == 0,
+          "a gate that closed and opened again: dark until the core asserts fire again");
+    gf_stream_go_idle(false, 0, 0);
+    ship_pass();
     ring_close();
 
     printf("the dropped backlog:\n");

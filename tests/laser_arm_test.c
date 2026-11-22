@@ -867,6 +867,13 @@ int main(void)
     decel_lit_val = false;
     verdict_fire_ok_val = true;
     atomic_store(&suppressed, Suppress_None);
+    /* The window's own mask, alone: a fresh fire_ok, the window closed. */
+    laser_ok = false;
+    spindleUpdatePWM(NULL, 60);
+    CHECK(!stream_fire_last && atomic_load(&suppressed) == Suppress_Unarmed,
+          "with the window closed a fresh fire_ok strips the segment's fire too");
+    laser_ok = true;
+    atomic_store(&suppressed, Suppress_None);
     on_producer = false;
 
     printf("a window does not outlive its job, and the next job is prompted:\n");
@@ -1788,6 +1795,23 @@ int main(void)
     gflaser_poll();
     CHECK(alarms_raised == 2 && latch_writes == 2,
           "emission with the window closed: the latch relocked and an alarm");
+    /* The witness reads nothing inside the window, nor within 3 s of a
+       disarm: the sample window lags the disarm. */
+    laser_ok = true;
+    clock_skip(1.0);
+    gflaser_poll();
+    CHECK(alarms_raised == 2 && latch_writes == 2, "a count with the window open: nothing");
+    laser_ok = false;
+    clock_skip(1.0);
+    disarmed_at = wall_s() - 2.0;
+    gflaser_poll();
+    CHECK(alarms_raised == 2 && latch_writes == 2, "a count 2 s after the disarm: nothing");
+    clock_skip(1.0);
+    disarmed_at = wall_s() - 4.0;
+    gflaser_poll();
+    CHECK(alarms_raised == 3 && latch_writes == 3, "4 s after it: the latch relocked and an alarm");
+    disarmed_at = 0.0;
+    rd_emission = "0";
 
     printf("the cooling verdict's tiers under an open window:\n");
 

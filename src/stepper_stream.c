@@ -136,6 +136,14 @@
  * 1000 x the machine tick, so this is exact. */
 #define VTICKS_PER_BYTE 1000
 
+/* The producer's covered cursor after an advance to @vticks: the slot the
+ * next fire's events map to, so every slot below it holds all of its own.
+ * The shipper sets FIRE only below it. */
+static inline uint64_t covered_cursor (uint64_t base, uint64_t vticks)
+{
+    return base + vticks / VTICKS_PER_BYTE;
+}
+
 /* Producer pacing: run interrupt callbacks while virtual time is less than
  * wall + SLACK; sleep in PACE_SLICE steps while ahead. */
 #define PACE_SLICE_NS 1000000   /* 1 ms */
@@ -326,6 +334,11 @@ static struct {
 
     /* Producer state: vticks/period written only under the core lock. */
     uint64_t vticks;          /* virtual step-clock time since wakeup epoch */
+    /* The producer's covered cursor: every slot below it holds every step
+     * and laser event the core will put there (a later one is late, and
+     * clamps). Stored by the producer after each advance and by the wakeup,
+     * read by the shipper, which sets FIRE only below it. */
+    _Atomic uint64_t covered;
     double wall_epoch;        /* wall time of the wakeup epoch */
     uint32_t period_latched;  /* current cycles_per_tick; persists across jobs
                                  (the core's own cache does too - wake_up must
@@ -1012,6 +1025,9 @@ void gf_stream_wakeup (void)
             }
         }
         gf.base = gf.produced;
+        /* Nothing past the epoch is covered until the producer's first
+         * advance; everything before it is the last stream's, or pads. */
+        atomic_store_explicit(&gf.covered, gf.base, memory_order_release);
 
         /* Re-assert the core's laser state at the first byte of the run.
          * Without this a change made across the idle gap is lost: a
@@ -1103,6 +1119,17 @@ void gf_stream_go_idle (bool reset, uint8_t step_bits, uint8_t dir_bits)
 
 /* --- producer thread ----------------------------------------------------- */
 
+/* The advance after one virtual timer fire: virtual time moves on by the
+ * latched period (the interval after this fire), and the covered cursor
+ * follows it, since every event of the fire just made maps below the new
+ * slot. Called under the core lock. */
+static inline void producer_advance (void)
+{
+    gf.vticks += gf.period_latched;
+    atomic_store_explicit(&gf.covered, covered_cursor(gf.base, gf.vticks),
+                          memory_order_release);
+}
+
 static void *producer_thread (void *arg)
 {
     (void)arg;
@@ -1147,8 +1174,7 @@ static void *producer_thread (void *arg)
              * the interval after this fire, matching hardware timer reload
              * semantics), or go idle (buffer drained / job done). */
             hal.stepper.interrupt_callback();
-            uint64_t period = gf.period_latched;
-            gf.vticks += period;
+            producer_advance();
             double vtime = (double)gf.vticks / (double)gf_stream_vclk();
             double epoch = gf.wall_epoch;
             gf_core_unlock();
@@ -1775,11 +1801,16 @@ static void ship_pass (void)
             uint32_t slot = gf.shipped & RING_MASK;
             uint8_t b = gf.ring[slot];
             gf.ring[slot] = 0;           /* re-zero for the next lap */
-            /* The core's fire request, masked twice, never sourced: the
-             * gate (armed window and cooling verdict) withholds it as
-             * permission, the density model withholds ticks of it as
-             * dose. Emission stays exactly where the core commanded it. */
-            if(gf.cur_fire && gate && (!gf.dith_period || dither_tick())) {
+            /* The core's fire request, masked three times, never sourced:
+             * the gate (armed window and cooling verdict) withholds it as
+             * permission, the producer's covered cursor withholds it from a
+             * slot the producer has not reached (a producer kept off the
+             * CPU past the lead and the depth: the head may have stopped
+             * there, and the clamp faults at its first late event), and the
+             * density model withholds ticks of it as dose. Emission stays
+             * exactly where the core commanded it. */
+            bool covered = gf.shipped < atomic_load_explicit(&gf.covered, memory_order_acquire);
+            if(gf.cur_fire && gate && covered && (!gf.dith_period || dither_tick())) {
                 b |= 0x10;
                 lit_shipped++;
             }
