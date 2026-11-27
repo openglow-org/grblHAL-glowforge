@@ -1463,8 +1463,8 @@ static void rearm_complete (void)
      * with its sender gone. The window closes before the cycle start, and
      * the job stays held. */
     if(open && serial_client_generation() != rearm_client_gen) {
-        gflaser_disarm();
-        rearm_end(false);
+        gflaser_disarm();               /* window_poll's sender change check also closes it, at the next poll */
+        rearm_end(false);               /* gflaser_disarm above has already locked the latch and told the engine */
         report_message("sender changed - the resume is canceled; the job stays held", Message_Warning);
         return;
     }

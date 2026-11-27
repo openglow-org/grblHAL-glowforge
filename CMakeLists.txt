@@ -105,6 +105,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         tests/switch_map_test.c tests/laser_arm_test.c tests/serial_test.c
         tests/lens_home_test.c tests/xy_scale_test.c
         tests/latch_test.c tests/cooling_test.c tests/switches_test.c
+        tests/ctlport_test.c
         PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
 endif()
 
@@ -196,3 +197,12 @@ target_link_libraries(cooling_test pthread)
 add_executable(switches_test tests/switches_test.c)
 target_include_directories(switches_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(switches_test m)
+
+# Host unit test for the controller port's outstanding line
+# (src/ctlport.c): a sender line that comes behind an injected port line
+# inside an open envelope stays held when that line's status comes back,
+# and a jog whose client hangs up before its status is canceled as it
+# starts. Includes the port source, stands in for the stream's
+# multiplexer and the core; must not link the core.
+add_executable(ctlport_test tests/ctlport_test.c)
+target_include_directories(ctlport_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})

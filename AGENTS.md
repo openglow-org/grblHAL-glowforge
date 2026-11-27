@@ -18,16 +18,17 @@ The site page is
 ```sh
 cmake -B build && cmake --build build
 for t in switch_map_test laser_arm_test latch_test cooling_test switches_test \
-         serial_test lens_home_test xy_scale_test; do ./build/$t; done
+         serial_test lens_home_test xy_scale_test ctlport_test; do ./build/$t; done
 ```
 
 On a host without `GFSINK` the driver runs the real core, planner and stream
 code against a **null sink**, which is what makes the laser path testable
-without hardware. The eight tests include the driver source they test and
+without hardware. The nine tests include the driver source they test and
 stub the rest: `laser_arm_test` (the arm flow and the verdict's tiers),
 `latch_test` (the latch writer and the kernel run requests), `cooling_test` (the verdict client),
 `switches_test` (a lid cancel with the switch device gone), `serial_test`
-(the RX ring, the banner, the TX stall bound).
+(the RX ring, the banner, the TX stall bound), `ctlport_test` (the controller
+port's outstanding line: the open envelope's hold, a gone client's jog).
 
 Eleven harnesses drive the null-sink build over TCP. They live in the
 `forgefirm` repository, under `scripts/bench/`, and run on a build configured

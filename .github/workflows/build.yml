@@ -37,6 +37,8 @@ jobs:
         run: ./build/cooling_test
       - name: Lid cancel under a failed switch read
         run: ./build/switches_test
+      - name: Controller port's outstanding line (the open envelope's hold, a gone client's jog)
+        run: ./build/ctlport_test
       # The safety harnesses live in the forgefirm repo (scripts/bench/)
       # and drive the null-sink build over TCP - no hardware, no root. They
       # come from forgefirm's master (its next in a run on next) at the
@@ -102,7 +104,7 @@ jobs:
       - name: Build
         run: cmake --build build-armhf -j"$(nproc)"
 
-  # The eight unit tests under AddressSanitizer and UndefinedBehaviorSanitizer:
+  # The nine unit tests under AddressSanitizer and UndefinedBehaviorSanitizer:
   # a report fails the test.
   sanitizers:
     runs-on: ubuntu-latest
@@ -119,9 +121,9 @@ jobs:
       - name: Build the unit tests
         run: >-
           cmake --build build-san -j"$(nproc)" --target switch_map_test laser_arm_test serial_test
-          lens_home_test xy_scale_test latch_test cooling_test switches_test
+          lens_home_test xy_scale_test latch_test cooling_test switches_test ctlport_test
       - name: The unit tests under the sanitizers
         run: |
-          for t in switch_map_test laser_arm_test serial_test lens_home_test xy_scale_test latch_test cooling_test switches_test; do
+          for t in switch_map_test laser_arm_test serial_test lens_home_test xy_scale_test latch_test cooling_test switches_test ctlport_test; do
             ./build-san/$t
           done
